@@ -1,20 +1,7 @@
 (ns kotoba.verifier
   {:kotoba/export [*call-results* guest-integer? max-expression-nodes max-functions max-lowered-nodes native-export-codec-types native-float-boundary-types target-contracts verify-artifact!]}
   
-  (:require [kotoba.bytes :as kbytes] [kotoba.form :as form] [kotoba.lang.coll :as set] [kotoba.artifact.core :as artifact] [kotoba.native.aarch64 :as aarch64] [kotoba.native.x86-64 :as x86-64] [kotoba.kir.compatibility :as compatibility-profile] [kotoba.kir :as ir] [kotoba.kir.target :as target-profile] [kotoba.kir.cljs-i64 :as i64]) )
- [kotoba.artifact.core :as artifact] [kotoba.form :as form]
-;; amu-refactor: positional access.  Host: what [a b] destructuring does; Kotoba: Form child, nil-form past the end.
-#?(:kotoba
-   (defn- fe-nth [f [:ref :form/r] i :i64] [:ref :form/r] (form/nth-of f i))
-   :default
-   (defn- fe-nth [c i] (nth c i nil)))
-
-;; amu-refactor: keyword lookup.  Host: `get`; Kotoba: form-get with a keyword Form.
-#?(:kotoba
-   (defn- fe-get [m [:ref :form/r] k :keyword] [:ref :form/r] (form/form-get m (form/keyword-form k)))
-   :default
-   (defn- fe-get [m k] (get m k)))
-
+  (:require [kotoba.bytes :as kbytes]))
 
 ;; memwidth: the checked-memory surface, four transfer widths by four window
 ;; tiers plus the element-indexed slice family (amu ADR 0285).
@@ -186,6 +173,23 @@
   passes through unchanged so the caller's own type check still decides."
   [value]
   )
+
+(defn- host-gas-schedule
+  "The program with its `:gas-schedule` weights as HOST numbers, for
+  re-emission. kotoba-native's charge-gas repeats a debit `weight` times and
+  validates the weights with `integer?`; a weight read back out of an
+  artifact is a bigint on cljs, which `repeat` and `integer?` both refuse.
+  Every admitted weight is a small natural number, so `guest-index`'s
+  narrowing is exact. The sealed program itself is left as it is."
+  [program]
+  (if-let [schedule (:gas-schedule program)]
+    (assoc program :gas-schedule
+           (-> schedule
+               (update :gas-schedule/version guest-index)
+               (update :default guest-index)
+               (update :call guest-index)
+               (update :weights #(into {} (map (fn [[k v]] [k (guest-index v)])) %))))
+    program))
 
 (defn- guest=
   "Structural equality between a re-derived value and a sealed one, across the
@@ -583,6 +587,9 @@
 
 (declare native-scalar-record-type?)
 (declare native-word-value-type?)
+(declare native-handle-type?)
+
+(declare record-reference?)
 
 (defn- native-scalar-record-type?
   ([type] (native-scalar-record-type? type 0))
@@ -590,7 +597,9 @@
    (and (< depth max-record-nesting-depth)
         (vector? type) (= 3 (count type)) (= :record (first type))
         (keyword? (second type)) (some? (namespace (second type)))
-        (vector? (nth type 2)) (seq (nth type 2))
+        ;; No fields is admitted: `{}` passed as an options map, the empty
+        ;; pair chain (amu ADR 0353 floor :options-map-argument).
+        (vector? (nth type 2))
         (<= (count (nth type 2)) max-record-fields)
         (every? (fn [field]
                   (and (vector? field) (= 2 (count field)) (keyword? (first field))
@@ -601,6 +610,20 @@
                            ;; An `[:option T]`/`[:result T E]` field already
                            ;; travels as ONE word (the pair handle).
                            (native-word-value-type? (second field))
+                           ;; A declared record reference is the one-word
+                           ;; pair-chain handle a call returns (amu ADR 0353
+                           ;; floor :native-handles): `(assoc (mk) :x (mt))`.
+                           (record-reference? (second field))
+                           ;; A vector-arena handle is one word too (amu ADR
+                           ;; 0353 floor :native-vector-field). Such a record
+                           ;; stays internal: `native-boundary-type?` refuses it.
+                           (= :vector-i64 (second field))
+                           ;; A `[:list T]` of one-word items is the same
+                           ;; arena handle (amu ADR 0353 floor
+                           ;; :record-list-sequence: browser.input's
+                           ;; `:surface/windows`, a list of window records).
+                           (and (vector? (second field)) (= :list (first (second field)))
+                                (native-handle-type? (second field)))
                            (native-scalar-record-type? (second field) (inc depth)))))
                 (nth type 2))
         (= (count (nth type 2))
@@ -686,6 +709,8 @@
    (and (<= depth max-handle-depth)
         (or (native-word-value-type? type)
             (native-scalar-record-type? type)
+            ;; a vector-arena handle, one word (amu ADR 0353 :native-vector-field)
+            (= :vector-i64 type)
             (and (vector? type) (seq type)
                  (case (first type)
                    :ref (and (= 2 (count type)) (keyword? (second type))
@@ -696,12 +721,36 @@
                    :vector (and (= 2 (count type)) (vector? (second type))
                                 (<= 1 (count (second type)) max-handle-members)
                                 (every? #(native-handle-type? % (inc depth)) (second type)))
+                   ;; `[:option :bytes]` (root ADR-2610092310 S4): what
+                   ;; document-bytes-value / document-link-value answer; the
+                   ;; option is a pair over one vector-arena word. Only the
+                   ;; option is widened, not `:bytes` itself.
                    :option (and (= 2 (count type))
-                                (native-handle-type? (second type) (inc depth)))
+                                (or (= :bytes (second type))
+                                    (native-handle-type? (second type) (inc depth))))
+                   ;; amu ADR 0353 floor :native-handles: a vector-arena
+                   ;; handle whose items are one-word handles.
+                   :list (and (= 2 (count type))
+                              (native-handle-type? (second type) (inc depth)))
+                   ;; amu ADR 0353 floor :native-hiccup-node: the same arena,
+                   ;; keys and values interleaved; a key is a scalar native
+                   ;; code compares by content.
+                   :map (and (= 3 (count type))
+                             (contains? #{:i64 :bool :string :keyword} (second type))
+                             (native-handle-type? (nth type 2) (inc depth)))
                    :result (and (= 3 (count type))
                                 (native-handle-type? (second type) (inc depth))
                                 (native-handle-type? (nth type 2) (inc depth)))
                    false))))))
+
+(def ^:private typed-map-operations
+  "The typed-map heads qualified natively, with their arity (nil: a literal,
+  the type then key/value pairs)."
+  '{typed-map-new nil typed-map-count 2 typed-map-contains 3 typed-map-get 3
+    typed-map-assoc 4 typed-map-dissoc 3})
+
+;; `kotoba.kir.value/typed-map-entry-limit`.
+(def ^:private max-typed-map-entries 31)
 
 (defn- handle-of? [head type]
   (and (vector? type) (= head (first type)) (native-handle-type? type)))
@@ -752,8 +801,13 @@
     (seq? form)
     (let [[op & args] form]
       (cond
-        (contains? '#{record-new variant-new hetero-vector-new hetero-vector-assoc} op)
+        (contains? '#{record-new record-assoc variant-new hetero-vector-new hetero-vector-assoc} op)
         (first args)
+
+        (and (= op 'let) (= 2 (count args)) (vector? (first args)))
+        (handle-type-of (second args)
+                        (reduce (fn [env [name value]] (assoc env name (handle-type-of value env)))
+                                locals (partition 2 (first args))))
 
         (= op 'hetero-vector-at)
         (let [[type _ index] args]
@@ -764,7 +818,12 @@
         (= op 'record-get)
         (let [[type _ field] args]
           (when (handle-of? :record type)
-            (some (fn [dd__39157_1] (let [name (fe-nth dd__39157_1 0) field-type (fe-nth dd__39157_1 1)] (when (= name field) field-type))) (nth type 2))))
+            (some (fn [[name field-type]] (when (= name field) field-type)) (nth type 2))))
+
+        ;; An item of a `[:list T]` is a T (amu ADR 0353 floor :native-handles).
+        (= op 'typed-list-nth)
+        (let [[type] args]
+          (when (handle-of? :list type) (second type)))
 
         (= op 'if)
         (let [then-type (handle-type-of (nth form 2 nil) locals)]
@@ -862,9 +921,7 @@
     (and (seq? form) (= 'variant-match (first form)))
     (let [[_ _type value branches] form]
       (bounded-sum (list* 1 (lowered-cost value env)
-                          (map (fn [dd__44218_1] (let [_tag (fe-nth dd__44218_1 0)
-                                                              binder (fe-nth dd__44218_1 1)
-                                                              body (fe-nth dd__44218_1 2)] (lowered-cost body (assoc env binder 1))))
+                          (map (fn [[_tag binder body]] (lowered-cost body (assoc env binder 1)))
                                branches))))
     (and (seq? form) (= 'typed-cap-call (first form)))
     (let [[_ _cap-id _request-type _result-type request] form]
@@ -879,6 +936,18 @@
     (let [[_ _type value item] form]
       (bounded-sum [1 (lowered-cost value env) (lowered-cost item env)]))
     (and (seq? form) (contains? '#{typed-set-count typed-set-nth} (first form)))
+    (let [[_ _type & rest] form]
+      (bounded-sum (cons 1 (map #(lowered-cost % env) rest))))
+    (and (seq? form) (= 'typed-list-new (first form)))
+    (let [[_ _type & items] form]
+      (bounded-sum (cons 1 (map #(lowered-cost % env) items))))
+    (and (seq? form) (= 'typed-list-nth (first form)))
+    (let [[_ _type & rest] form]
+      (bounded-sum (cons 1 (map #(lowered-cost % env) rest))))
+    (and (seq? form) (= 'typed-list-conj (first form)))
+    (let [[_ _type value item] form]
+      (bounded-sum [1 (lowered-cost value env) (lowered-cost item env)]))
+    (and (seq? form) (contains? typed-map-operations (first form)))
     (let [[_ _type & rest] form]
       (bounded-sum (cons 1 (map #(lowered-cost % env) rest))))
     (and (seq? form)
@@ -907,9 +976,8 @@
     (let [[op & args] form]
       (if (= op 'let)
         (let [[bindings body] args
-              env' (reduce (fn [current dd__46468_1]
-                             (let [name (fe-nth dd__46468_1 0) value (fe-nth dd__46468_1 1)]
-                               (assoc current name (lowered-cost value current))))
+              env' (reduce (fn [current [name value]]
+                             (assoc current name (lowered-cost value current)))
                            env (partition 2 bindings))]
           (lowered-cost body env'))
         (bounded-sum (cons 1 (map #(lowered-cost % env) args)))))))
@@ -1071,14 +1139,92 @@
 ;;
 ;; That last case is what makes a chained projection verifiable without the
 ;; intermediate record ever becoming a value.
+(declare let-locals)
+
+(defn- option-of-record?
+  "An `[:option R]` whose R is a record, inline or by reference, held as one
+  word."
+  [type]
+  (and (vector? type) (= :option (first type)) (= 2 (count type))
+       (native-handle-type? type)
+       (vector? (second type))
+       (contains? #{:record :ref} (first (second type)))))
+
+(defn- option-operand-type
+  "The option type FORM is declared with where it says one -- a local's or a
+  record field's type, or a call's result -- else nil."
+  [form locals]
+  (cond
+    (symbol? form) (let [t (get locals form)] (when (and (vector? t) (= :option (first t))) t))
+    (and (seq? form) (= 'record-get (first form)) (= 4 (count form)))
+    (let [[_ type _ field] form]
+      (when (vector? type)
+        (some (fn [[name field-type]] (when (= name field) field-type)) (nth type 2 nil))))
+    (and (seq? form) (simple-symbol? (first form)) (contains? *call-results* (first form)))
+    (get *call-results* (first form))
+    :else nil))
+
 (defn- record-schema-of [form locals]
   (cond
     (and (seq? form) (= 'record-new (first form))) (second form)
     ;; The same exact SROA IF may be projected directly or named by one let.
-    ;; `record-sroa-if-schema` deliberately does not resolve symbols, so this
-    ;; does not turn into general aggregate inference or forwarding.
-    (and (seq? form) (= 'if (first form))) (record-sroa-if-schema form)
+    ;; Beyond it (amu ADR 0353 floor :native-record-operations), an IF whose
+    ;; two arms denote the same record -- `(:a (if c m n))`, a row join --
+    ;; denotes that record: kotoba-native's value lowering merges the two
+    ;; bundles (or handles) with one phi per word, whatever built each arm.
+    (and (seq? form) (= 'if (first form)))
+    (or (record-sroa-if-schema form)
+        (when (= 4 (count form))
+          (let [then-schema (record-schema-of (nth form 2) locals)
+                else-schema (record-schema-of (nth form 3) locals)]
+            ;; A declared record reaches here spelled either way -- a call's
+            ;; `[:ref q]` result, a construction's expanded `[:record q ..]`
+            ;; -- and both name one record (`nominal=`). The expanded
+            ;; spelling is kept when one arm has it.
+            (cond (and then-schema (= then-schema else-schema)) then-schema
+                  (and then-schema (nominal= then-schema else-schema)) then-schema
+                  (and else-schema (nominal= else-schema then-schema)) else-schema))))
+    ;; A LET denotes what its body denotes, its bindings in scope: a row
+    ;; operation elaborates to `(let [receiver m] (record-new T ..))`.
+    (and (seq? form) (= 'let (first form)) (= 3 (count form)))
+    (record-schema-of (nth form 2) (let-locals (second form) locals))
+    ;; An update denotes its own type, which must be its operand's.
+    (and (seq? form) (= 'record-assoc (first form)) (= 5 (count form)))
+    (let [[_ type value] form]
+      (when (nominal= type (record-schema-of value locals)) type))
     (symbol? form) (get locals form)
+    ;; An item of a `[:list T]` whose T is a record is that record, boxed as
+    ;; one word in the list's arena (amu ADR 0353 floor :native-handles).
+    (and (seq? form) (= 'typed-list-nth (first form)) (= 4 (count form))
+         (handle-of? :list (second form))
+         (vector? (second (second form)))
+         (contains? #{:record :ref} (first (second (second form)))))
+    (second (second form))
+    ;; A value read out of a `[:map K V]` whose V is a record, defaulted to
+    ;; that same record, is that record (amu ADR 0353 floor
+    ;; :native-hiccup-node): the map's arena holds it as one word.
+    (and (seq? form) (= 'option-value-of (first form)) (= 4 (count form))
+         (seq? (nth form 2)) (= 'typed-map-get (first (nth form 2)))
+         (handle-of? :map (second (nth form 2)))
+         (vector? (nth (second (nth form 2)) 2))
+         (contains? #{:record :ref} (first (nth (second (nth form 2)) 2)))
+         (let [item (nth (second (nth form 2)) 2)
+               fallback (record-schema-of (nth form 3) locals)]
+           (or (nominal= item fallback) (nominal= fallback item))))
+    (nth (second (nth form 2)) 2)
+    ;; The record an `[:option R]` holds, defaulted to that same record, is
+    ;; that record (amu ADR 0353 floor :native-option-record): the option's
+    ;; payload is the record's one-word handle, and `if-let` over an option
+    ;; field or parameter elaborates to exactly this. The option's own type
+    ;; must be the declared one wherever the operand says it.
+    (and (seq? form) (= 'option-value-of (first form)) (= 4 (count form))
+         (option-of-record? (second form))
+         (let [item (second (second form))
+               fallback (record-schema-of (nth form 3) locals)
+               operand (option-operand-type (nth form 2) locals)]
+           (and (or (nominal= item fallback) (nominal= fallback item))
+                (or (nil? operand) (= operand (second form))))))
+    (second (second form))
     ;; A call whose declared result is a record: the operand arrived boxed.
     (and (seq? form) (simple-symbol? (first form)) (contains? *call-results* (first form)))
     (call-record-schema form)
@@ -1086,7 +1232,9 @@
     (let [[_ type value field] form]
       (when (= type (record-schema-of value locals))
         (let [field-type (second (first (filter #(= field (first %)) (nth type 2))))]
-          (when (native-scalar-record-type? field-type) field-type))))
+          (when (or (native-scalar-record-type? field-type)
+                    (record-reference? field-type))
+            field-type))))
     (and (seq? form) (= 'typed-cap-call (first form)) (= 5 (count form))
          (native-provider-contract? (nth form 1) (nth form 2) (nth form 3))
          (native-scalar-record-type? (nth form 3)))
@@ -1121,6 +1269,16 @@
   (or (record-new-schema value)
       (call-record-schema value)
       (record-sroa-if-schema value)
+      ;; A let, an if or an update whose value is a record: the row operations'
+      ;; elaboration, named by a binding. Resolved in no outer scope, so a
+      ;; bare symbol is still not forwarded. The record an option holds is
+      ;; its one-word handle (floor :native-option-record), and so is an item
+      ;; of a `[:list R]` named by a let -- a search over a list of records
+      ;; binds the item it tests (floor :record-list-sequence).
+      (when (and (seq? value)
+                 (contains? '#{let if record-assoc option-value-of typed-list-nth} (first value)))
+        (let [schema (record-schema-of value {})]
+          (when (or (native-scalar-record-type? schema) (record-reference? schema)) schema)))
       (let [result (provider-result-schema value)]
         (when (native-scalar-record-type? result) result))))
 
@@ -1130,6 +1288,56 @@
                           (variant-sroa-if-schema value)
                           (provider-result-schema value))]
         (variant-local type))))
+
+(def ^:dynamic *record-params*
+  "The current function's record parameters that no enclosing let rebinds.
+  A record parameter is always the one-word handle a caller passed, so a let
+  naming one -- `(let [receiver m] ..)`, which is how kotoba-sema elaborates a
+  row operation on a parameter (amu ADR 0353 floor :native-record-operations)
+  -- binds that handle. A flattened let-bound record is still not forwarded."
+  #{})
+
+(defn- let-bound-names [bindings]
+  (if (and (vector? bindings) (even? (count bindings))) (take-nth 2 bindings) ()))
+
+(defn- param-forward [value env]
+  (when (symbol? value)
+    (let [type (get env value)]
+      (when (or (contains? *record-params* value)
+                ;; A let-bound record local names its record too (amu ADR
+                ;; 0353 floor :native-handles): `(let [m (assoc (mk) :d 4)]
+                ;; (:a (dissoc m :b)))` elaborates to a let naming `m`.
+                (native-scalar-record-type? type)
+                (record-reference? type))
+        type))))
+
+;; amu ADR 0353 floor :native-rebound-row-update: a let naming an update of
+;; a record this scope already holds -- a record parameter, or a local a let
+;; already typed -- binds that record. `(let [s (update s :n inc)] (update s
+;; :m inc))` elaborates to `(let [t (record-assoc T s ..)] (record-assoc T t
+;; ..))`; `binding-record-schema` resolves its value in no scope, so the
+;; operand `s` was unknown and the second update was refused. Resolved here in
+;; the binding's own scope, with the update's type held to its operand's
+;; (`record-schema-of`'s record-assoc clause), so nothing is coerced.
+(defn- update-forward [value env]
+  (when (and (seq? value) (= 'record-assoc (first value)) (= 5 (count value)))
+    (let [schema (record-schema-of value env)]
+      (when (or (native-scalar-record-type? schema) (record-reference? schema))
+        schema))))
+
+(defn- let-locals
+  "The locals a let's BINDINGS put in scope over LOCALS, as `verify-bindings!`
+  derives them -- without verifying, which `verify-expr!` does separately."
+  [bindings locals]
+  (if (and (vector? bindings) (even? (count bindings)))
+    (binding [*record-params* (apply disj *record-params* (let-bound-names bindings))]
+      (reduce (fn [env [name value]]
+                (assoc env name (or (binding-local value)
+                                    (param-forward value env)
+                                    (update-forward value env)
+                                    (when *boxed-aggregates?* (handle-type-of value env)))))
+              locals (partition 2 bindings)))
+    locals))
 
 (defn- verify-bindings! [bindings locals signatures depth nodes facts]
   (when-not (and (vector? bindings) (even? (count bindings))
@@ -1145,6 +1353,8 @@
           (reject! "runtime KIR local name rejected" {:name name}))
         (verify-expr! value env signatures (inc depth) nodes facts)
         (recur (next pairs) (assoc env name (or (binding-local value)
+                                                 (param-forward value env)
+                                                 (update-forward value env)
                                                  (when *boxed-aggregates?*
                                                    (handle-type-of value env))))))
       env)))
@@ -1162,7 +1372,10 @@
     document-vector-drop 2 document-vector-remove 2 document-vector-sort 1
     document-assoc 3 document-dissoc 2 document-merge :some
     document-string-value 1 document-keyword-value 1 document-symbol-value 1
-    document-bool-value 1 document-i64-value 1})
+    document-bool-value 1 document-i64-value 1
+    ;; :bytes and :link (root ADR-2610092310 S4): kotoba-native writes them
+    ;; as the EDN tagged literals `#kotoba/bytes` / `#kotoba/cid` in the text.
+    document-bytes 1 document-bytes-value 1 document-link 1 document-link-value 1})
 
 (defn- verify-expr! [form locals signatures depth nodes facts]
   (when (> (vswap! nodes inc) max-expression-nodes)
@@ -1210,9 +1423,11 @@
         (let [[bindings & body] args]
           (when-not (= 1 (count body))
             (reject! "runtime KIR let arity rejected" {}))
-          (verify-expr! (first body)
-                        (verify-bindings! bindings locals signatures depth nodes facts)
-                        signatures (inc depth) nodes facts))
+          ;; A name this let binds is no longer the parameter it may shadow.
+          (binding [*record-params* (apply disj *record-params* (let-bound-names bindings))]
+            (verify-expr! (first body)
+                          (verify-bindings! bindings locals signatures depth nodes facts)
+                          signatures (inc depth) nodes facts)))
 
         (= op 'if)
         (do
@@ -1359,15 +1574,32 @@
             (reject! "runtime KIR record projection rejected" {:operation op}))
           (verify-expr! value locals signatures (inc depth) nodes facts))
 
+        ;; amu ADR 0353 floor :native-record-operations: an update of one
+        ;; field. Held to `record-get`'s discipline -- a well-formed record
+        ;; type, a field it declares, and an operand that IS that record -- so
+        ;; the result is the operand's type and nothing is coerced.
+        (= op 'record-assoc)
+        (let [[type value field replacement] args
+              declared (or (record-schema-of value locals)
+                           (when *boxed-aggregates?* (handle-type-of value locals)))]
+          (when-not (and (= 4 (count args))
+                         (or (native-scalar-record-type? type)
+                             (and *boxed-aggregates?* (handle-of? :record type)))
+                         (keyword? field)
+                         (some #(= field (first %)) (nth type 2))
+                         (nominal= type declared))
+            (reject! "runtime KIR record update rejected" {:operation op}))
+          (verify-expr! value locals signatures (inc depth) nodes facts)
+          (verify-expr! replacement locals signatures (inc depth) nodes facts))
+
         ;; ADR 0063, mirroring `record-new` immediately above: the tag must
         ;; be one of the type's own declared cases.
         (= op 'variant-new)
         (let [[type tag payload] args
               case-type (when (or (native-scalar-variant-type? type)
                                   (boxed-payload-variant-type? type))
-                          (some (fn [dd__70392_1]
-                                  (let [case-tag (fe-nth dd__70392_1 0) payload-type (fe-nth dd__70392_1 1)]
-                                    (when (= case-tag tag) payload-type)))
+                          (some (fn [[case-tag payload-type]]
+                                  (when (= case-tag tag) payload-type))
                                 (nth type 2)))]
           (when-not (and (= 3 (count args)) case-type)
             (reject! "runtime KIR variant construction rejected" {:operation op}))
@@ -1602,6 +1834,51 @@
                          (native-word-value-type? type)
                          (seq rest))
             (reject! "runtime KIR typed-set operation rejected" {:operation op}))
+          (doseq [arg rest]
+            (verify-expr! arg locals signatures (inc depth) nodes facts)))
+
+        ;; `[:list T]` (amu ADR 0353 floor :native-handles) is the typed set's
+        ;; word arena: new and nth over one-word item handles, re-derived here.
+        (= op 'typed-list-new)
+        (let [[type & items] args]
+          (when-not (handle-of? :list type)
+            (reject! "runtime KIR typed-list constructor rejected" {:operation op}))
+          (when (> (count items) max-vector-literal-items)
+            (reject! "runtime KIR typed-list literal exceeds the item limit"
+                     {:operation op :items (count items)
+                      :limit max-vector-literal-items}))
+          (doseq [item items]
+            (verify-expr! item locals signatures (inc depth) nodes facts)))
+
+        (= op 'typed-list-nth)
+        (let [[type & rest] args]
+          (when-not (and (= 3 (count args)) (handle-of? :list type))
+            (reject! "runtime KIR typed-list nth rejected" {:operation op}))
+          (doseq [arg rest]
+            (verify-expr! arg locals signatures (inc depth) nodes facts)))
+
+        ;; The list builder (amu ADR 0353 floor :empty-vector-field): conj onto
+        ;; the arena, as `typed-set-conj` is.
+        (= op 'typed-list-conj)
+        (let [[type value item] args]
+          (when-not (and (= 3 (count args)) (handle-of? :list type))
+            (reject! "runtime KIR typed-list conj rejected" {:operation op}))
+          (verify-expr! value locals signatures (inc depth) nodes facts)
+          (verify-expr! item locals signatures (inc depth) nodes facts))
+
+        ;; `[:map K V]` (amu ADR 0353 floor :native-hiccup-node): the same
+        ;; arena, keys and values interleaved. No `typed-map-equal`, entry-at,
+        ;; keys or vals: equality over a map handle stays refused.
+        (contains? typed-map-operations op)
+        (let [[type & rest] args
+              arity (get typed-map-operations op)]
+          (when-not (and (handle-of? :map type)
+                         (if arity (= arity (count args)) (odd? (count args))))
+            (reject! "runtime KIR typed-map operation rejected" {:operation op}))
+          (when (and (nil? arity) (> (count rest) (* 2 max-typed-map-entries)))
+            (reject! "runtime KIR typed-map literal exceeds the entry limit"
+                     {:operation op :entries (quot (count rest) 2)
+                      :limit max-typed-map-entries}))
           (doseq [arg rest]
             (verify-expr! arg locals signatures (inc depth) nodes facts)))
 
@@ -1921,15 +2198,10 @@
     :else (reject! "runtime KIR value type rejected" {:value form})))
 
 (defn- infer-effects [direct]
-  (loop [inferred (into {} (map (fn [dd__103183_1] (let [name (fe-nth dd__103183_1 0)
-                                                         facts (fe-nth dd__103183_1 1)] [name (:effects facts)])) direct))]
+  (loop [inferred (into {} (map (fn [[name facts]] [name (:effects facts)]) direct))]
     (let [next-effects
-          (into {} (map (fn [dd__103284_1]
-                          (let [name (fe-nth dd__103284_1 0)
-                                dd__103284_2 (fe-nth dd__103284_1 1)
-                                effects (fe-get dd__103284_2 :effects)
-                                calls (fe-get dd__103284_2 :calls)]
-                            [name (reduce set/union effects (map #(get inferred % #{}) calls))]))
+          (into {} (map (fn [[name {:keys [effects calls]}]]
+                          [name (reduce set/union effects (map #(get inferred % #{}) calls))])
                         direct))]
       (if (= inferred next-effects) inferred (recur next-effects)))))
 
@@ -2070,8 +2342,20 @@
 ;; and the caller checks that first -- nor were `:bool` record fields or
 ;; `[:option :bool]`, which reach admission by recursion rather than through the
 ;; removed guard.
+(defn- holds-private-handle?
+  "True when a record field, at any nesting, is a context-owned vector handle:
+  the kexe loader has no wire form for one inside a record."
+  [type]
+  (and (vector? type) (= :record (first type)) (vector? (nth type 2 nil))
+       (boolean (some (fn [[_ field-type]]
+                        (or (= :vector-i64 field-type)
+                            (holds-private-handle? field-type)))
+                      (nth type 2)))))
+
 (defn- native-boundary-type? [type]
-  (or (contains? native-word-field-types type)
+  (and
+   (not (holds-private-handle? type))
+   (or (contains? native-word-field-types type)
       (contains? native-float-boundary-types type)
       ;; `:bool` reaches admission through the first two clauses --
       ;; `native-word-field-types` and `native-word-value-type?` have both
@@ -2081,7 +2365,7 @@
       (native-scalar-record-type? type)
       (native-scalar-variant-boundary-type? type)
       (and (vector? type) (= 2 (count type)) (= :ref (first type))
-           (keyword? (second type)) (some? (namespace (second type))))))
+           (keyword? (second type)) (some? (namespace (second type)))))))
 
 (defn- native-private-handle-type? [type]
   ;; The native context owns these handles. Machine code can forward one
@@ -2163,27 +2447,62 @@
                  false)))
            (keys table)))))
 
+(defn- signature-schema-reference?
+  "Independent copy: true when some function's `:param-types` or `:result`
+  -- the one place a reference survives lowering -- names `[:ref q]` for a q
+  TABLE declares."
+  [table functions]
+  (boolean
+   (and (sequential? functions)
+        (some (fn [f]
+                (and (map? f)
+                     (some #(and (vector? %) (= 2 (count %)) (= :ref (first %))
+                                 (contains? table (second %)))
+                           (mapcat #(tree-seq coll? seq %)
+                                   (cond-> (vec (:param-types f)) (:result f) (conj (:result f)))))))
+              functions))))
+
 (def ^:private module-shape-checks
   [[:map (fn [p] (map? p))]
+   ;; `:gas-schedule` (superproject adr-2610092340 D12) is the one other
+   ;; key a program may carry: present, it is the price table the native
+   ;; code was charged by, and the re-emission below reproduces the debits
+   ;; from it, so a program and its code cannot disagree about it.
    [:keys (fn [p] (contains? #{#{:format :entry :exports :signature :effects :functions}
                                #{:format :entry :exports :signature :effects :functions :schemas}}
-                             (set (keys p))))]
-   ;; ABI v8: a RECURSIVE schema table travels with the program, because a
-   ;; type that names itself cannot be expanded into the signatures that use
-   ;; it. Only a recursive one: re-derived here, so a producer that attached a
-   ;; table it had no need of is refused rather than trusted.
+                             (disj (set (keys p)) :gas-schedule)))]
+   ;; `guest-integer?`, not `integer?`: a schedule read back out of a sealed
+   ;; artifact carries JavaScript bigints on cljs (measured 2026-10-09: an
+   ;; `amu extract-native` of a gas-metered kexe was refused here as a module
+   ;; shape while the same program, still in memory, had been admitted).
+   [:gas-schedule (fn [p] (or (not (contains? p :gas-schedule))
+                              (let [s (:gas-schedule p)
+                                    pos-int? (fn [x] (and (guest-integer? x) (pos? x)))
+                                    nat-int? (fn [x] (and (guest-integer? x) (not (neg? x))))]
+                                (and (map? s) (keyword? (:gas-schedule/id s))
+                                     (nat-int? (:gas-schedule/version s))
+                                     (pos-int? (:default s)) (pos-int? (:call s))
+                                     (map? (:weights s))
+                                     (every? (fn [[k v]] (and (symbol? k) (nat-int? v)))
+                                             (:weights s))))))]
+   ;; ABI v8: a schema table travels with the program when the oracle needs
+   ;; it to resolve a `[:ref q]` -- a RECURSIVE table (a type that names
+   ;; itself cannot be expanded into the signatures that use it), or a
+   ;; reference a function signature names (a declared record crossing a
+   ;; function boundary, amu ADR 0353 floor :native-record-boundary). Only
+   ;; then: re-derived here, so a producer that attached a table it had no
+   ;; need of is refused rather than trusted.
    [:schemas (fn [p] (or (not (contains? p :schemas))
                          (let [table (:schemas p)]
                            (and (map? table) (<= 1 (count table) max-schema-table-entries)
                                 (every? #(and (keyword? %) (some? (namespace %))) (keys table))
-                                (every? (fn [dd__117363_1]
-                                          (let [name (fe-nth dd__117363_1 0)
-                                                descriptor (fe-nth dd__117363_1 1)]
-                                            (and (native-handle-type? descriptor)
+                                (every? (fn [[name descriptor]]
+                                          (and (native-handle-type? descriptor)
                                                (vector? descriptor)
-                                               (= name (second descriptor)))))
+                                               (= name (second descriptor))))
                                         table)
-                                (recursive-schema-table? table)))))]
+                                (or (recursive-schema-table? table)
+                                    (signature-schema-reference? table (:functions p)))))))]
    [:format (fn [p] (contains? #{:kotoba.kir/v3 :kotoba.kir/v4} (:format p)))]
    ;; A module either has an entry -- `main`, zero-arity, host-readable result
    ;; -- or it is a LIBRARY: no entry, no signature, and an export list that
@@ -2285,10 +2604,9 @@
     (let [[op & args] form]
       (cond
         (and (= op 'let) (= 2 (count args)) (vector? (first args)))
-        (let [env (reduce (fn [env dd__122978_1]
-                            (let [binding (fe-nth dd__122978_1 0) value (fe-nth dd__122978_1 1)]
-                              (assoc env binding
-                                   (if (region-scalar-shaped? value env) :i64 :other))))
+        (let [env (reduce (fn [env [binding value]]
+                            (assoc env binding
+                                   (if (region-scalar-shaped? value env) :i64 :other)))
                           env (partition 2 (first args)))]
           (region-scalar-shaped? (second args) env))
         (and (= op 'if) (= 3 (count args)))
@@ -2323,11 +2641,10 @@
                                    {:function (:name function) :body (first args)}))
                         (walk (first args) env))
                     (and (= op 'let) (= 2 (count args)) (vector? (first args)))
-                    (let [env (reduce (fn [env dd__124807_1]
-                                        (let [binding (fe-nth dd__124807_1 0) value (fe-nth dd__124807_1 1)]
-                                          (walk value env)
+                    (let [env (reduce (fn [env [binding value]]
+                                        (walk value env)
                                         (assoc env binding
-                                               (if (region-scalar-shaped? value env) :i64 :other))))
+                                               (if (region-scalar-shaped? value env) :i64 :other)))
                                       env (partition 2 (first args)))]
                       (walk (second args) env))
                     :else (doseq [a args] (walk a env))))))]
@@ -2436,8 +2753,15 @@
                          ;; requires the projected schema to EQUAL the declared
                          ;; one. Every other parameter stays nil, as before: a
                          ;; plain word has no schema to carry.
-                         (verify-expr! (:body function) (aggregate-param-locals function)
-                                       signatures 0 nodes facts)
+                         (let [params (aggregate-param-locals function)]
+                           (binding [*record-params*
+                                     (set (keep (fn [[param t]]
+                                                  (when (or (native-scalar-record-type? t)
+                                                            (record-reference? t))
+                                                    param))
+                                                params))]
+                             (verify-expr! (:body function) params
+                                           signatures 0 nodes facts)))
                          (verify-arena-scopes! function)
                          [(:name function) @facts])))
                 functions)
@@ -2445,8 +2769,7 @@
           declared (into {} (map (juxt :name :effects) functions))
           ;; the capability part is re-derived; a declared pure ability is
           ;; carried over, and it reaches the module row like any member
-          declared-capabilities (into {} (map (fn [dd__132656_1] (let [n (fe-nth dd__132656_1 0)
-                                                                e (fe-nth dd__132656_1 1)] [n (set/difference e pure-ability-effects)])))
+          declared-capabilities (into {} (map (fn [[n e]] [n (set/difference e pure-ability-effects)]))
                                       declared)
           pure-abilities (into #{} (mapcat #(filter pure-ability-effects %)) (vals declared))
           total (into (reduce set/union #{} (vals inferred)) pure-abilities)
@@ -2721,18 +3044,14 @@
                    (let [ps (vec (:params (get by-name name)))]
                      (first (keep-indexed #(when (= sym %2) %1) ps))))
         direct (into {}
-                     (map (fn [dd__148952_1]
-                            (let [name (fe-get dd__148952_1 :name)
-                                  params (fe-get dd__148952_1 :params)
-                                  body (fe-get dd__148952_1 :body)]
-                              (let [ps (set params)]
+                     (map (fn [{:keys [name params body]}]
+                            (let [ps (set params)]
                               [name (into #{}
-                                          (keep (fn [dd__149130_1]
-                                                  (let [args (fe-nth dd__149130_1 1)]
-                                                    (let [b (first args)]
+                                          (keep (fn [[_ args]]
+                                                  (let [b (first args)]
                                                     (when (and (symbol? b) (contains? ps b))
-                                                      (index-of name b))))))
-                                          (region-calls body))]))))
+                                                      (index-of name b)))))
+                                          (region-calls body))])))
                      ;; NOTE: `direct` deliberately keys on the PARAMETER set
                      ;; rather than on `traceable-locals`. A tainted position
                      ;; is a parameter INDEX, so a local -- which has no index
@@ -2742,11 +3061,8 @@
     (loop [tainted direct]
       (let [next-tainted
             (reduce
-             (fn [acc dd__149933_1]
-               (let [name (fe-get dd__149933_1 :name)
-                     params (fe-get dd__149933_1 :params)
-                     body (fe-get dd__149933_1 :body)]
-                 (let [ps (set params)]
+             (fn [acc {:keys [name params body]}]
+               (let [ps (set params)]
                  (reduce
                   (fn [acc form]
                     (if (and (seq? form) (contains? by-name (first form)))
@@ -2762,7 +3078,7 @@
                                 (get tainted callee #{})))
                       acc))
                   acc
-                  (tree-seq coll? seq body)))))
+                  (tree-seq coll? seq body))))
              tainted
              functions)]
         (if (= next-tainted tainted) tainted (recur next-tainted))))))
@@ -2841,8 +3157,7 @@
 
                  (coll? form) (some #(scan known %) (seq form))
                  :else nil))]
-    (some (fn [dd__154938_1] (let [params (fe-get dd__154938_1 :params)
-                                            body (fe-get dd__154938_1 :body)] (scan (set params) body))) functions)))
+    (some (fn [{:keys [params body]}] (scan (set params) body)) functions)))
 
 (defn- verify-runtime! [{:keys [target program code exports lowering limits fuel-abi context-abi]
                          profile-value :target-profile}]
@@ -3070,7 +3385,7 @@
       (reject! "native artifact requires runtime KIR v3 or v4"
                {:target target :program-format (:format program)}))
     (verify-program! program)
-    (let [expected (try (emit program)
+    (let [expected (try (emit (host-gas-schedule program))
                         (catch  e
                           (reject! "runtime KIR cannot be safely lowered"
                                    {:target target :cause (ex-message e)})))]
@@ -3161,7 +3476,15 @@
                             ;; many small vectors run out of entries first, one
                             ;; growing vector runs out of elements first.
                             :vector-capacity 4096
-                            :vector-item-capacity 65536}]
+                            :vector-item-capacity 65536}
+          ;; Version 12 (2026-10-09, superproject adr-2610092340 D12): the
+          ;; consensus GAS word at 384. Only a gas-metered program names it
+          ;; -- its code decrements 384 after checking the version is 12, and
+          ;; on a v11 host 384 is host state -- so an unmetered program stays
+          ;; exactly v11 and a metered one must say v12.
+          expected-context (cond-> expected-context
+                             (contains? program :gas-schedule)
+                             (assoc :version 12 :gas-offset 384))]
       (when-not (guest= expected-fuel-abi fuel-abi)
         (reject! "fuel ABI is not admitted" {:target target :fuel-abi fuel-abi}))
       (when-not (guest= expected-limits limits)

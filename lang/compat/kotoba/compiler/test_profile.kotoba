@@ -5,7 +5,7 @@
   pass only when they return i64 1. `test-handler(cap-id,value)` is an optional
   Kotoba-defined deterministic ability handler used by every target. The same
   checked KIR is executed by the JVM oracle, restricted ESM, and Wasm."
-  {:kotoba/export [run-source targets]}
+  {:kotoba/export [call-source node-run run-source targets]}
   (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
             [kotoba.compiler.process-wire :as process-wire]
             ;; process/spawn (catalog wire 20; superproject adr-2609242330
@@ -15,8 +15,9 @@
             [kotoba.artifact.core :as artifact]
             [kotoba.compiler.core :as compiler]
             [kotoba.compiler.effect-row :as effect-row]
+            [kotoba.compiler.host-integer :as host-integer]
             [kotoba.sema :as sema]
-            [kotoba.kir :as ir]  [kotoba.compiler.nbb.host.process :as process] [kotoba.compiler.host-integer :as host-integer]))
+            [kotoba.kir :as ir]))
 
 (def targets [:jvm-kir :js :wasm])
 
@@ -79,7 +80,34 @@
                 {:test test-name :ok false :error (or (ex-message error) "test trap")})))
           tests)))
 
-(defn- node-run [target program]
+(def ^:private payload-chunk-chars
+  "Linux refuses any ONE argv string longer than MAX_ARG_STRLEN (32 pages,
+  131072 bytes) with E2BIG; macOS has no per-string limit. Measured
+  2026-10-10: the doseq conformance case compiles to 103,548 bytes of Wasm,
+  138,064 base64 characters, so inlined into `-e` it passed on macOS and
+  failed on the Linux CI as \"Kotoba target test process failed\"."
+  65536)
+
+(defn- payload-chunks [payload]
+  (when payload
+    (mapv (fn [at] (subs payload at (min (count payload) (+ at payload-chunk-chars))))
+          (range 0 (count payload) payload-chunk-chars))))
+
+(defn node-run
+  "Run PROGRAM (an ES module text) in a child node and answer the JSON it
+  printed on stdout, keywordized. TARGET names the caller in the refusal
+  when the child exits non-zero. Also `kotoba.compiler.manifest-native`'s
+  route to `bin/amu` (root ADR-2610092330 C1).
+
+  PAYLOAD, a base64 text, travels as argv strings of at most
+  `payload-chunk-chars` each, never inside PROGRAM, and PROGRAM reads it back
+  as the constant `PAYLOAD`."
+  ([target program] (node-run target program nil))
+  ([target program payload]
+  (let [program (if payload
+                  (str "const PAYLOAD=process.argv.slice(1).join('');" program)
+                  program)
+        argv (into ["--input-type=module" "-e" program] (payload-chunks payload))]
   ;; The js and wasm targets are executed by a CHILD node -- on both hosts.
   ;; Under nbb that is the same binary the compiler runs on; under the JVM it
   ;; is whatever `node` is on PATH. Either way the probe is a separate
@@ -89,7 +117,7 @@
     (when-not (zero? (:exit result))
       (throw (ex-info "Kotoba target test process failed"
                       {:phase :test :target target :stderr (:err result)})))
-    (json/read-str (:out result) {:key-fn keyword})))
+    (json/read-str (:out result) {:key-fn keyword})))))
 
 (defn- base64
   "Pure-Clojure base64 over a byte-seq (0..255 per element). Verified over 500 random byte strings before the JVM API was
@@ -113,13 +141,32 @@
        sort
        vec))
 
+(def ^:private probe-import
+  "Bind `m` to the js-kotoba-v1 module PAYLOAD carries, loaded from a file.
+  Not `import('data:text/javascript;base64,'+PAYLOAD)`: under `node -e` the
+  module loads through the synchronous loader, whose data-URL decoder
+  (node:internal/data_url `isomorphicDecode`) overflows the stack on a large
+  module before a line of it runs. Measured 2026-10-10 on Node 26.0.0: the
+  473,815-byte module of kotoba-lang's lang/conformance/control/doseq.kotoba
+  died `RangeError: Maximum call stack size exceeded` there. The directory is
+  removed once the module is linked; a module's code stays in memory."
+  (str "const {mkdtempSync,writeFileSync,rmSync}=await import('node:fs');"
+       "const {tmpdir}=await import('node:os');"
+       "const {join}=await import('node:path');"
+       "const {pathToFileURL}=await import('node:url');"
+       "const probeDir=mkdtempSync(join(tmpdir(),'kotoba-js-probe-'));"
+       "let m;"
+       "try{const file=join(probeDir,'module.mjs');"
+       "writeFileSync(file,Buffer.from(PAYLOAD,'base64'));"
+       "m=await import(pathToFileURL(file).href);}"
+       "finally{rmSync(probeDir,{recursive:true,force:true});}"))
+
 (defn- js-results [source tests cap-ids]
-  (let [encoded (encoded-text source)
-        names (json/write-str (mapv name tests))
+  (let [names (json/write-str (mapv name tests))
         ids (json/write-str cap-ids)]
     (node-run :javascript
      (str "const names=" names ",ids=" ids ";"
-          "const m=await import('data:text/javascript;base64," encoded "');"
+          probe-import
           "let x;"
           "const grants=Object.fromEntries(ids.map(id=>[id,value=>"
           "x['test-handler'](BigInt(id),value)]));"
@@ -140,16 +187,16 @@
           "const pass=v=>v===true||v===1n;"
           "const out=names.map(name=>{try{return {test:name,ok:pass(fresh()[name]())}}"
           "catch(e){return {test:name,ok:false,error:'test trap'}}});"
-          "console.log(JSON.stringify(out));"))))
+          "console.log(JSON.stringify(out));")
+     (encoded-text source))))
 
 (defn- wasm-results [bytes tests cap-ids]
-  (let [encoded (base64 bytes)
-        names (json/write-str (mapv name tests))
+  (let [names (json/write-str (mapv name tests))
         ids (json/write-str cap-ids)]
     (node-run
      :wasm
      (str "const names=" names ",ids=" ids ";"
-          "const bytes=Uint8Array.from(Buffer.from('" encoded "','base64'));"
+          "const bytes=Uint8Array.from(Buffer.from(PAYLOAD,'base64'));"
           "const host=await import('./runtime/browser-host.mjs');"
           "let instance;"
           ;; one instance per test, for the reason js-results gives. The ids
@@ -164,7 +211,8 @@
           "const out=[];"
           "for(const name of names){try{const i=await fresh();out.push({test:name,ok:pass(i.exports[name]())})}"
           "catch(e){out.push({test:name,ok:false,error:'test trap'})}}"
-          "console.log(JSON.stringify(out));"))))
+          "console.log(JSON.stringify(out));")
+     (base64 bytes))))
 
 (defn run-source
   "Run one Kotoba source's exported `test-*` definitions on all semantic
@@ -213,3 +261,142 @@
      :targets targets
      :results results
      :failed failed})))
+
+;; --- value calls (`amu test --manifest`, root ADR-2610092330 C0) -----------
+;;
+;; A conformance case is not a predicate: it names a function, its arguments
+;; and the value it must answer. `call-source` runs that one call on the same
+;; three targets, through the same emitters and the same child-node probes as
+;; `run-source`, and answers the VALUE each target produced (or why it could
+;; not produce one), so the caller can compare it with the case's :expect and
+;; print what it got. Targets are independent: one emitter refusing a case
+;; does not hide what the other two answer.
+
+(defn- integer-like? [x]
+  (or (integer? x) (host-integer/bigint? x)))
+
+(def ^:private probe-encode
+  ;; A value crosses the probe's stdout as JSON, which has no i64; tag it.
+  (str "const enc=v=>typeof v==='bigint'?{t:'i64',v:v.toString()}"
+       ":typeof v==='boolean'?{t:'bool',v}"
+       ":typeof v==='string'?{t:'string',v}"
+       ":typeof v==='number'?{t:'number',v:String(v)}"
+       ":{t:'other',v:String(v)};"
+       "const why=e=>String((e&&e.message)||e).slice(0,400);"))
+
+(defn- decode-value [{:keys [t v]}]
+  (case t
+    "i64" (host-integer/exact v)
+    "number" (host-integer/exact v)
+    "bool" (boolean v)
+    "string" v
+    {:unsupported-value-type t :text v}))
+
+(defn- decoded [answer]
+  (if (contains? answer :value)
+    {:value (decode-value (:value answer))}
+    {:error (or (:error answer) "the probe answered neither a value nor an error")
+     :phase :run}))
+
+(defn- js-call [source function args cap-ids]
+  (decoded
+   (node-run
+    :javascript
+    (str probe-encode
+         "const fname=" (json/write-str function) ",args=" (json/write-str (mapv str args))
+         ",ids=" (json/write-str cap-ids) ";"
+         probe-import
+         "let x;"
+         "const grants=Object.fromEntries(ids.map(id=>[id,value=>"
+         "x['test-handler'](BigInt(id),value)]));"
+         "let out;"
+         "try{x=m.instantiateKotoba(grants);"
+         "if(typeof x[fname]!=='function')out={error:'function '+fname+' is not exported by the js-kotoba-v1 module'};"
+         "else out={value:enc(x[fname](...args.map(BigInt)))}}"
+         "catch(e){out={error:why(e)}}"
+         "console.log(JSON.stringify(out));")
+    (encoded-text source))))
+
+(defn- wasm-call [bytes function args cap-ids]
+  (decoded
+   (node-run
+    :wasm
+    (str probe-encode
+         "const fname=" (json/write-str function) ",args=" (json/write-str (mapv str args))
+         ",ids=" (json/write-str cap-ids) ";"
+         "const bytes=Uint8Array.from(Buffer.from(PAYLOAD,'base64'));"
+         "const host=await import('./runtime/browser-host.mjs');"
+         "let instance,out;"
+         "try{const loaded=await host.instantiateKotoba(bytes,{allowCapabilities:ids.map(Number),"
+         "capCall:(id,value)=>instance.exports['test-handler'](BigInt(id),value)});"
+         "instance=loaded.instance;"
+         "if(typeof instance.exports[fname]!=='function')out={error:'function '+fname+' is not exported by the wasm32-kotoba-v1 module'};"
+         "else out={value:enc(instance.exports[fname](...args.map(BigInt)))}}"
+         "catch(e){out={error:why(e)}}"
+         "console.log(JSON.stringify(out));")
+    (base64 bytes))))
+
+(defn- attempt
+  "Run THUNK; a throw becomes `{:error message :phase phase}` so one target's
+  refusal is that target's row and not the whole case's."
+  [phase thunk]
+  (try (thunk)
+       (catch  error
+         {:error (or (ex-message error) (str error)) :phase phase})))
+
+(defn call-source
+  "Call FUNCTION (a symbol or name) with ARGS (i64 integers) in SOURCE on each
+  of TARGETS (a subset of `targets`; default all three). Answers
+  `{target {:value v} | {:error message :phase :compile|:run}}`.
+
+  `opts`: `:fuel` (per-instance budget, as `run-source`),
+  `:admit-linked-synthetics?` (a linked unit), `:targets`."
+  ([source function args] (call-source source function args {}))
+  ([source function args {:keys [fuel admit-linked-synthetics?] :as opts}]
+   (let [wanted (set (or (:targets opts) targets))
+         fname (name function)
+         analyze-opts (cond-> {} admit-linked-synthetics? (assoc :admit-linked-synthetics? true))
+         bad-args (remove integer-like? args)]
+     (if (seq bad-args)
+       (into {} (for [t wanted]
+                  [t {:error (str "only i64 arguments are supported, got " (pr-str (vec bad-args)))
+                      :phase :usage}]))
+       (let [prepared (attempt :compile
+                               #(let [source (harness-source source analyze-opts)
+                                      hir (sema/analyze source analyze-opts)]
+                                  {:source source :hir hir
+                                   :policy (test-policy {:hir hir} fuel)}))]
+         (if (:error prepared)
+           (into {} (for [t wanted] [t prepared]))
+           (let [{:keys [source policy]} prepared
+                 kir-fuel (some-> fuel host-integer/narrow)
+                 kir (attempt :compile
+                              #(let [checked (compiler/check-source source policy analyze-opts)]
+                                 {:kir (ir/lower (:hir checked))}))
+                 cap-ids (if (:kir kir) (capability-ids (:kir kir)) [])]
+             (cond-> {}
+               (contains? wanted :jvm-kir)
+               (assoc :jvm-kir
+                      (if (:error kir)
+                        kir
+                        (attempt :run
+                                 #(let [k (:kir kir)
+                                        handler (fn [cap-id value]
+                                                  (ir/execute k 'test-handler [cap-id value]))]
+                                    {:value (ir/execute k (symbol fname) (vec args)
+                                                        (cond-> {:cap-call handler}
+                                                          kir-fuel (assoc :fuel kir-fuel)))}))))
+               (contains? wanted :js)
+               (assoc :js
+                      (let [js (attempt :compile
+                                        #(compiler/compile-source source :js-kotoba-v1 policy analyze-opts))]
+                        (if (:error js)
+                          js
+                          (attempt :run #(js-call (:source js) fname args cap-ids)))))
+               (contains? wanted :wasm)
+               (assoc :wasm
+                      (let [wasm (attempt :compile
+                                          #(compiler/compile-source source :wasm32-kotoba-v1 policy analyze-opts))]
+                        (if (:error wasm)
+                          wasm
+                          (attempt :run #(wasm-call (:bytes wasm) fname args cap-ids)))))))))))))

@@ -1,6 +1,8 @@
 (ns kotoba.compiler.packaging.pe32plus
   {:kotoba/export [align le package-efi package-embedded-kernel]}
-  (:require [kotoba.artifact.core :as artifact] [kotoba.native.image-scratch :as image-scratch] [kotoba.object.pe32plus :as pe]))
+  (:require [kotoba.artifact.core :as artifact]
+            [kotoba.native.image-scratch :as image-scratch]
+            [kotoba.object.pe32plus :as pe]))
 
 (def ^:private firmware-target :x86_64-aiueos-uefi-v1)
 (def ^:private file-alignment 0x200)
@@ -445,7 +447,7 @@
    ;; Keep the physical diagnostic visible. Returning EFI_LOAD_ERROR made the
    ;; K16 immediately retry PXE and erase STATUS before it could be recorded.
    [0xfa 0xf4 0xeb 0xfd]))
-(def ^:private kernel-scratch-pages 14)
+(def ^:private kernel-scratch-pages 15)
 
 
 
@@ -530,14 +532,20 @@
   ([kernel payload options [:record :pe32plus/options [[:k16-preflight? :bool] [:k16-note :string]]]]
   (let [kernel (vec kernel)
         payload (vec payload)
+        ;; Fail closed on the option this packager never implemented: a caller
+        ;; must not be able to request a resident loader and receive the
+        ;; ordinary transition loader under a success receipt.
+        _ (when (true? (:resident? options))
+            (throw (ex-info "the resident loader mode is not implemented"
+                            {:reason :resident-mode-not-implemented})))
         k16-preflight? (true? (:k16-preflight? options))
         k16-note (or (:k16-note options) "")]
     ;; These two are refusals of the CALLER's input, so they carry a phase:
     ;; without one the CLI reports "internal compiler error" (exit 70) for a
     ;; kernel OBJECT handed to a packager that wants an ET_EXEC image --
     ;; measured on the first `package-aiueos-boot` the Node route ever ran.
-    (when (> (count payload) 16384)
-      (throw (ex-info "embedded RT payload exceeds 16 KiB"
+    (when (> (count payload) 524288)
+      (throw (ex-info "embedded AIUEOS payload exceeds 512 KiB"
                       {:phase :verify :bytes (count payload)})))
     (when-not (and (>= (count kernel) 64)
                    (= [0x7f 0x45 0x4c 0x46] (subvec kernel 0 4))
@@ -621,11 +629,11 @@
                                 {:reason :k16-tender-sealed-fuel-unreadable
                                  :context-address context-address
                                  :sealed-fuel sealed-fuel})))
-            ;; Two loader-private segment destinations precede boot-info.
-            ;; Boot-info v4 is 96 bytes without a payload: the original
-            ;; firmware-map and W^X fields followed by a loader-owned scratch
-            ;; address/page count. An optional payload pointer/length follows.
-            variables-size (if payload? 128 112)
+            ;; Boot-info v5 is a fixed 160-byte prefix after the two
+            ;; loader-private segment destinations. It carries the firmware
+            ;; map, W^X bounds, scratch, optional payload pointer/length and
+            ;; the GOP framebuffer descriptor.
+            variables-size 176
             memory-map-offset (align variables-size 16)
             memory-map-capacity 16384
             embedded-offset (align (+ memory-map-offset memory-map-capacity) 16)
@@ -676,6 +684,11 @@
             ;; never shown the thing that refills it.
             tender-slot-offset (align (+ build-message-offset
                                          (count build-message)) 16)
+            post-kernel-end (if k16-preflight?
+                              (+ tender-slot-offset 16)
+                              (+ kernel-offset (count kernel)))
+            gop-guid-offset (align post-kernel-end 8)
+            gop-interface-offset (+ gop-guid-offset 16)
             ;; Build once with provisional external RVAs; instruction length is
             ;; independent of displacement values.
             segment-tokens (mapcat (fn [index segment]
@@ -683,6 +696,32 @@
                                       (quot (+ (:memsz segment) 4095) 4096)
                                       (keyword (str "segment" index)) (:filesz segment)))
                                    (range) segments)
+            gop-tokens
+            [;; EFI_BOOT_SERVICES.LocateProtocol(GOP_GUID, nil, &interface).
+             ;; The protocol remains firmware-owned; the loader copies only
+             ;; scalar mode metadata into boot-info.
+             0x48 0x8d 0x0d (rip :gop-guid)
+             0x31 0xd2
+             0x4c 0x8d 0x05 (rip :gop-interface)
+             0x41 0xff 0x96 0x40 0x01 0x00 0x00
+             0x48 0x85 0xc0 0x0f 0x85 (rip :gop-done)
+             ;; Interface -> Mode -> framebuffer and mode information.
+             0x48 0x8b 0x05 (rip :gop-interface)
+             0x48 0x85 0xc0 0x0f 0x84 (rip :gop-done)
+             0x48 0x8b 0x50 0x18
+             0x48 0x85 0xd2 0x0f 0x84 (rip :gop-done)
+             0x48 0x8b 0x42 0x18
+             0x48 0x89 0x05 (rip :gop-base)
+             0x48 0x8b 0x42 0x20
+             0x48 0x89 0x05 (rip :gop-size)
+             0x48 0x8b 0x42 0x08
+             0x48 0x85 0xc0 0x0f 0x84 (rip :gop-done)
+             ;; EFI_GRAPHICS_OUTPUT_MODE_INFORMATION fields.
+             0x8b 0x48 0x04 0x89 0x0d (rip :gop-width)
+             0x8b 0x50 0x08 0x89 0x15 (rip :gop-height)
+             0x8b 0x48 0x0c 0x89 0x0d (rip :gop-format)
+             0x8b 0x50 0x20 0x89 0x15 (rip :gop-stride)
+             (label :gop-done)]
             tokens (vec (concat
                     [0x41 0x54 0x41 0x55 0x41 0x56 0x41 0x57
                      0x48 0x83 0xec 0x28 0x49 0x89 0xcc 0x49 0x89 0xd5
@@ -694,6 +733,7 @@
                        ;; Before anything can hang: say which artifact this is.
                        (uefi-output-string-tokens :build-message
                                                   :build-message-return)))
+                    gop-tokens
                     segment-tokens
                     ;; AllocateAnyPages/EfiLoaderData. The returned physical
                     ;; address is explicit boot authority, so no fixed low-RAM
@@ -711,7 +751,7 @@
                     ;; The bounded memory map is part of the loader image's RW
                     ;; section, immediately after boot-info. This makes the
                     ;; handoff one compiler-owned region: the kernel derives
-                    ;; boot+64 instead of trusting a pointer read from firmware
+                    ;; boot+160 instead of trusting a pointer read from firmware
                     ;; data as a new memory authority. GetMemoryMap fails closed
                     ;; when 16 KiB is insufficient.
                     [0x48 0x8d 0x05] [(rip :memory-map)]
@@ -742,7 +782,7 @@
             data-address (align (+ text-rva text-size) section-alignment)
             data (vec (concat (mapcat #(le (:paddr %) 8) segments)
                               (le 0x544f4f4245554941 8)
-                              (le 4 8)
+                              (le 5 8)
                               ;; map pointer/size/key/descriptor fields are
                               ;; populated by the loader before handoff.
                               (repeat 40 0)
@@ -751,7 +791,13 @@
                               (le rw-end 8)
                               (repeat 8 0)
                               (le kernel-scratch-pages 8)
-                              (when payload? (repeat 16 0))
+                              ;; Stable payload slots exist even when the
+                              ;; image has no sidecar data.
+                              (repeat 16 0)
+                              ;; GOP descriptor: base, size, width, height,
+                              ;; stride and pixel format. Scalar fields are
+                              ;; zero-extended u64 slots in boot-info.
+                              (repeat 48 0)
                               (repeat (- memory-map-offset variables-size) 0)
                               (repeat memory-map-capacity 0)
                               (repeat (- embedded-offset
@@ -780,7 +826,13 @@
                                  (repeat (- tender-slot-offset
                                             (+ build-message-offset
                                                (count build-message))) 0)
-                                 (repeat 16 0)))))
+                                 (repeat 16 0)))
+                              (repeat (- gop-guid-offset post-kernel-end) 0)
+                              ;; EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID in memory
+                              ;; order, followed by LocateProtocol's out slot.
+                              [0xde 0xa9 0x42 0x90 0xdc 0x23 0x38 0x4a
+                               0x96 0xfb 0x7a 0xde 0xd0 0x80 0x51 0x6a]
+                              (repeat 8 0)))
             data-raw-size (align (count data) file-alignment)
             reloc-address (align (+ data-address (count data)) section-alignment)
             labels (merge {:address0 (+ data-address (nth data-addresses 0))
@@ -798,6 +850,14 @@
                            :memory-map (+ data-address memory-map-offset)
                            :payload-pointer (+ data-address 112)
                            :payload-length (+ data-address 120)
+                           :gop-base (+ data-address 128)
+                           :gop-size (+ data-address 136)
+                           :gop-width (+ data-address 144)
+                           :gop-height (+ data-address 148)
+                           :gop-stride (+ data-address 152)
+                           :gop-format (+ data-address 156)
+                           :gop-guid (+ data-address gop-guid-offset)
+                           :gop-interface (+ data-address gop-interface-offset)
                            :payload (+ data-address payload-offset)}
                           (when k16-preflight?
                             {:tender-fuel (+ data-address tender-slot-offset)
@@ -851,7 +911,13 @@
                              :rw-end-offset 72
                              :kernel-scratch-address-offset 80
                              :kernel-scratch-pages-offset 88
-                             :kernel-scratch-pages kernel-scratch-pages}
+                             :kernel-scratch-pages kernel-scratch-pages
+                             :framebuffer-base-offset 112
+                             :framebuffer-size-offset 120
+                             :framebuffer-width-offset 128
+                             :framebuffer-height-offset 132
+                             :framebuffer-stride-offset 136
+                             :framebuffer-format-offset 140}
                              payload?
                              (assoc :payload-offset (- payload-offset 16)
                                     :payload-bytes (count payload)))

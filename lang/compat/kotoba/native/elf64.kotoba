@@ -1,15 +1,18 @@
 (ns kotoba.native.elf64
-  
-  {:kotoba/export [max-object-fuel package-kernel package-kernel-aarch64 package-kernel-object package-user pinned-image-addresses]}
-    (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str] [kotoba.artifact.core :as artifact] [kotoba.native.interrupt-abi :as interrupt-abi] [kotoba.object.elf64 :as object-elf])
-)
+  {:kotoba/export [max-object-fuel package-kernel package-kernel-rt package-kernel-desktop package-kernel-aarch64 package-kernel-object package-user pinned-image-addresses]}
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.native.interrupt-abi :as interrupt-abi]
+            [kotoba.object.elf64 :as object-elf]
+            ))
 
 ;; Mirrors `kotoba.native.aarch64`'s helper of the same name: `.getBytes` is
 ;; JVM-only and cljs has no `String`/`Charset`, so `TextEncoder` is the
 ;; UTF-8-safe peer. Every string this is applied to here is an ASCII
 ;; section-name or symbol-name table, so the two agree byte for byte.
-(defn- utf8-bytes [s]
-  )
+(defn- utf8-bytes [s :string]
+  :vector-i64
+  (kbytes/utf8-encode s))
 
 (def ^:private kernel-target :x86_64-aiueos-kernel-v1)
 (def ^:private user-target :x86_64-aiueos-user-v1)
@@ -17,28 +20,44 @@
 (def ^:private image-base 0x100000)
 (def ^:private text-offset page-size)
 
-(def pinned-image-addresses
-  "The two addresses this packager PINS, whatever the text's size: the ELF
-  header page at `image-base` (the kernel's guard page) and the first text
-  page at `image-base + text-offset`. Same set as the JVM twin's."
-  #{image-base (+ image-base text-offset)})
+(defn pinned-image-addresses [] [:list :i64]
+     ;; A Kotoba `#{...}` literal is a keyword/string set and an exported
+     ;; constant is a function; the two addresses come back as a list.
+     [image-base (+ image-base text-offset)])
 
-(def ^:private data-offset (* 16 page-size)) ;; JUN-145: room for user text; loader.c agrees
+(def ^:private data-offset
+  ;; JUN-145, measured 2026-10-20: the user text room was one page and
+  ;; kaikei_journal exceeded it ("ELF region exceeds its allocation").
+  ;; 16 pages of text room; the aiueos loader pins the same value
+  ;; (ELF_DATA_OFFSET in kernel/loader.c) and moves with it.
+  (* 16 page-size))
 (def ^:private kernel-data-offset (* 8 page-size))
 (def ^:private x86-kernel-data-offset (* 16 page-size))
 (def ^:private context-size 80)
 (def ^:private kernel-image-context-size 88)
-;; The x86-64 kernel image's RW segment in this twin: the bare 88-byte
-;; context, extended to cover the canned handlers' slot block
-;; (`interrupt-abi/context-slot-block-offset` .. +size). The configurators
-;; emitted by both x86-64 twins store r9-relative into that block, so a
-;; segment that stopped at 88 bytes would leave the stores landing past the
-;; RW segment the loader mapped. NOTE: this twin lays no GDT at
-;; `context-gdt-offset`, so the canned HANDLERS (which derive the context
-;; from the GDTR) take their fail-closed path in an image it packs; the JVM
-;; packager (`elf64.clj`) is the one that lays the GDT/TSS/stack.
-(def ^:private x86-kernel-data-size
-  (+ interrupt-abi/context-slot-block-offset interrupt-abi/context-slot-block-size))
+(def ^:private minimum-kernel-data-offset (* 8 page-size))
+;; A constant is evaluated before any function, and the Kotoba twin of
+;; interrupt-abi exports its offsets as functions, so the Kotoba reading spells
+;; the values out: 0x60 (context-gdt-offset), 0x98 (context-gdtr-offset).
+(def ^:private kernel-gdt-offset 0x60)
+(def ^:private kernel-gdtr-offset 0x98)
+(def ^:private kernel-tss-offset 168)
+(def ^:private kernel-current-domain-offset 0x110)
+(def ^:private kernel-saved-rsp-offset 0x118)
+(def ^:private kernel-saved-rip-offset 0x120)
+(def ^:private kernel-saved-rflags-offset 0x128)
+(def ^:private kernel-request-pointer-offset 0x130)
+(def ^:private kernel-request-offset 0x200)
+(def ^:private kernel-capability-table-offset 0x1000)
+(def ^:private kernel-arena-offset 0x2000)
+(def ^:private kernel-stack-offset 0x3000)
+(def ^:private kernel-stack-bytes 65536)
+(def ^:private kernel-runtime-data-size (+ kernel-stack-offset kernel-stack-bytes))
+(def ^:private kernel-rt-state-size page-size)
+nil
+(def ^:private live-boot-shim-size 144)
+(def ^:private live-syscall-shim-size 192)
+(def ^:private desktop-kernel-data-size 0x1e0)
 (def ^:private user-context-size 88)
 (def ^:private user-image-base 0x1e0000)
 
@@ -424,7 +443,7 @@
    ;; the same padded block. The object's contract asserts that with a vector.
    ;;
    ;; SHA-256 is inlined rather than required from `aiueos.sha256`: a namespace
-   ;; that declares `` is a multi-module project and
+   ;; that declares `(:require ...)` is a multi-module project and
    ;; `amu compile` will not package one for this target at all (measured
    ;; 2026-09-02 against amu b1fdaad2), which is why `cid-v1-admit.kotoba` has
    ;; no committed `.o` beside it.
@@ -827,9 +846,173 @@
     :size size
     :alignment alignment}))
 
-(defn- entry-shim [main-address context-address]
-  ;; Preserve the loader's SysV rdi boot-info pointer in context+80, then
-  ;; initialize r9 and call the zero-arity Kotoba entry.
+(defn- align16 [n] (* 16 (quot (+ n 15) 16)))
+
+(defn- kernel-data-offset-for [text-size]
+  (max minimum-kernel-data-offset
+       (* page-size (quot (+ text-offset text-size (dec page-size)) page-size))))
+
+(defn- tss-descriptor [base]
+  (let [limit 103]
+    [(bit-and limit 255) (bit-and (quot limit 256) 255)
+     (bit-and base 255) (bit-and (quot base 256) 255)
+     (bit-and (quot base 65536) 255) 0x89 0
+     (bit-and (quot base 16777216) 255)
+     (bit-and (quot base 4294967296) 255)
+     (bit-and (quot base 1099511627776) 255)
+     (bit-and (quot base 281474976710656) 255)
+     (bit-and (quot base 72057594037927936) 255) 0 0 0 0]))
+
+(defn- kernel-runtime-data [fuel context-address isr-base]
+  (let [gdt-address (+ context-address kernel-gdt-offset)
+        tss-address (+ context-address kernel-tss-offset)
+        stack-top (+ context-address kernel-runtime-data-size)
+        context (vec (concat (repeat 8 0) (le fuel 8)
+                             (repeat (- kernel-image-context-size 16) 0)))
+        gdt (vec (concat (le 0 8)
+                         (le 0x00af9a000000ffff 8)
+                         (le 0x00cf92000000ffff 8)
+                         (le 0x00cff2000000ffff 8)
+                         (le 0x00affa000000ffff 8)
+                         (tss-descriptor tss-address)))
+        gdtr (vec (concat (le (dec (count gdt)) 2) (le gdt-address 8)))
+        tss (vec (concat (repeat 4 0) (le stack-top 8)
+                         (repeat (- 102 12) 0) (le 104 2)))]
+    (-> context
+        (padded kernel-gdt-offset)
+        (into gdt)
+        (padded kernel-gdtr-offset)
+        (into gdtr)
+        (padded kernel-tss-offset)
+        (into tss)
+        (padded interrupt-abi/context-entry-base-offset)
+        (into (le (or isr-base 0) 8))
+        (padded kernel-runtime-data-size))))
+
+(defn- interrupt-entry-region [isr-base artifact-address context-address exports]
+  (vec (mapcat
+        (fn [vector]
+          (if-let [export (get exports vector)]
+            (let [address (+ isr-base (* vector interrupt-abi/entry-stride))
+                  ctx-field (+ address (interrupt-abi/context-displacement-offset vector))
+                  call-field (+ address (interrupt-abi/call-displacement-offset vector))
+                  bytes (interrupt-abi/entry-bytes
+                         {:vector vector
+                          :fuel interrupt-abi/entry-fuel
+                          :context-displacement (- context-address (+ ctx-field 4))
+                          :call-displacement (- (+ artifact-address (:offset export))
+                                                (+ call-field 4))})]
+              (when-not (= interrupt-abi/body-arity (:arity export))
+                (throw (ex-info "Kotoba kernel interrupt entry body has an invalid SysV arity"
+                                {:reason :isr-body-arity
+                                 :vector vector :arity (:arity export)
+                                 :expected interrupt-abi/body-arity})))
+              (into bytes (repeat (- interrupt-abi/entry-stride (count bytes)) 0xcc)))
+            (interrupt-abi/absent-entry-bytes-for vector)))
+        (range interrupt-abi/vector-limit))))
+
+(defn- entry-shim [main-address context-address syscall-address]
+  ;; Enter on an image-owned stack, install the GDT/TSS, reload segment
+  ;; selectors, preserve the loader's boot-info pointer, then call Kotoba.
+  (let [shim-address (+ image-base text-offset)
+        stack-top (+ context-address kernel-runtime-data-size)
+        gdtr-address (+ context-address kernel-gdtr-offset)
+        prefix (vec (concat [0xfa
+                  0x48 0x8d 0x25] (le (- stack-top (+ shim-address 8)) 4)
+                 [0x48 0x83 0xe4 0xf0
+                  0x0f 0x01 0x15] (le (- gdtr-address (+ shim-address 19)) 4)
+                 [0x6a 0x08
+                  0x48 0x8d 0x05] (le 3 4)
+                 [0x50 0x48 0xcb
+                  0x66 0xb8 0x10 0x00
+                  0x8e 0xd8 0x8e 0xc0 0x8e 0xd0
+                  0x31 0xc0 0x8e 0xe0 0x8e 0xe8
+                  0x66 0xb8 0x28 0x00 0x0f 0x00 0xd8
+                  0x48 0x89 0x3d] (le (- (+ context-address 80) (+ shim-address 61)) 4)
+                 [0x4c 0x8d 0x0d] (le (- context-address (+ shim-address 68)) 4)))
+        msrs (when syscall-address
+               (vec (concat
+                     ;; IA32_EFER.SCE, STAR, LSTAR and FMASK. STAR selects
+                     ;; kernel CS 0x08 and SYSRET user SS/CS 0x1b/0x23.
+                     [0xb9 0x80 0x00 0x00 0xc0 0x0f 0x32 0x83 0xc8 0x01 0x0f 0x30
+                      0xb9 0x81 0x00 0x00 0xc0 0x31 0xc0
+                      0xba 0x08 0x00 0x10 0x00 0x0f 0x30
+                      0xb9 0x82 0x00 0x00 0xc0 0xb8]
+                     (le (bit-and syscall-address 0xffffffff) 4)
+                     [0xba] (le (quot syscall-address 4294967296) 4)
+                     [0x0f 0x30
+                      0xb9 0x84 0x00 0x00 0xc0
+                      ;; Mask TF/IF/DF, IOPL, NT and AC in kernel RFLAGS.
+                      0xb8 0x00 0x77 0x04 0x00 0x31 0xd2 0x0f 0x30])))
+        before-call (vec (concat prefix msrs))
+        call-site (+ shim-address (count before-call))
+        bytes (vec (concat before-call [0xe8]
+                           (le (- main-address (+ call-site 5)) 4)
+                           [0xfa 0xf4 0xeb 0xfd]))]
+    (if syscall-address (padded bytes live-boot-shim-size) bytes)))
+
+(defn- live-syscall-shim
+  [shim-address context-address planner-address runtime-entry-address]
+  ;; SYSCALL leaves the user RIP/RFLAGS in RCX/R11 and does not switch RSP.
+  ;; Save its untrusted state before selecting the image-owned stack. Kotoba's
+  ;; planner admits the complete envelope and return state before the bounded
+  ;; entry receives any pointer.
+  (let [slot (fn [offset next-ip]
+               (le (- (+ context-address offset) next-ip) 4))
+        stack-top (+ context-address kernel-runtime-data-size)
+        arena (+ context-address kernel-arena-offset)
+        request (+ context-address kernel-request-offset)
+        cap-table (+ context-address kernel-capability-table-offset)
+        prefix (vec
+                (concat
+                 [0x48 0x89 0x25] (slot kernel-saved-rsp-offset (+ shim-address 7))
+                 [0x48 0x89 0x0d] (slot kernel-saved-rip-offset (+ shim-address 14))
+                 [0x4c 0x89 0x1d] (slot kernel-saved-rflags-offset (+ shim-address 21))
+                 [0x48 0x89 0x3d] (slot kernel-request-pointer-offset (+ shim-address 28))
+                 [0x48 0x8d 0x25] (le (- stack-top (+ shim-address 35)) 4)
+                 [0x48 0x83 0xe4 0xf0
+                  0x49 0xb9] (le context-address 8)
+                 [0x48 0x89 0xc7
+                  0x41 0x8b 0xb1 0x10 0x01 0x00 0x00
+                  0x49 0x8b 0x91 0x30 0x01 0x00 0x00
+                  0x49 0x8b 0x89 0x20 0x01 0x00 0x00
+                  0x4d 0x8b 0x81 0x18 0x01 0x00 0x00]))
+        planner-call-site (+ shim-address (count prefix))
+        through-plan (vec
+                      (concat prefix [0xe8]
+                              (le (- planner-address (+ planner-call-site 5)) 4)
+                              [0x48 0x85 0xc0
+                               ;; accepted is seven bytes after the branch.
+                               0x0f 0x85 0x07 0x00 0x00 0x00
+                               0x31 0xc0
+                               ;; Skip the 52-byte accepted-call sequence.
+                               0xe9 0x34 0x00 0x00 0x00
+                               0x48 0x89 0xc6
+                               0x48 0xbf] (le arena 8)
+                              [0x49 0x8b 0x91 0x30 0x01 0x00 0x00
+                               0x48 0x81 0xe2 0x00 0xf0 0xff 0xff
+                               0x48 0xb9] (le request 8)
+                              [0x49 0xb8] (le cap-table 8)))
+        entry-call-site (+ shim-address (count through-plan))
+        bytes (vec
+               (concat through-plan [0xe8]
+                       (le (- runtime-entry-address (+ entry-call-site 5)) 4)
+                       [0x49 0x8b 0x89 0x20 0x01 0x00 0x00
+                        0x4d 0x8b 0x99 0x28 0x01 0x00 0x00
+                        ;; Whitelist arithmetic flags plus IF and force bit 1;
+                        ;; IOPL/NT/RF/VM/AC never reach SYSRET.
+                        0x41 0x81 0xe3 0xd5 0x0a 0x00 0x00
+                        0x41 0x83 0xcb 0x02
+                        0x49 0x8b 0xa1 0x18 0x01 0x00 0x00
+                        0x48 0x0f 0x07]))]
+    (when (> (count bytes) live-syscall-shim-size)
+      (throw (ex-info "ValueRuntime SYSCALL shim exceeds its sealed slot"
+                      {:bytes (count bytes) :maximum live-syscall-shim-size})))
+    (padded bytes live-syscall-shim-size)))
+
+(defn- desktop-entry-shim [main-address context-address]
+  ;; The resident browser shell intentionally keeps its tiny UEFI handoff:
+  ;; it does not install an IDT or use the full kernel's GDT/TSS runtime.
   (let [shim-address (+ image-base text-offset)
         after-store (+ shim-address 7)
         after-lea (+ shim-address 14)
@@ -926,9 +1109,117 @@
                      (concat (rest queue) (filter by-name called))))))
         false))))
 
+(defn- package-kernel-with-minimum-data-offset
+  [artifact minimum-data-offset extra-data-size]
+  (when-not (artifact/valid-seal? artifact)
+    (throw (ex-info "ELF64 kernel packaging requires a sealed artifact" {})))
+  (when-not (= kernel-target (:target artifact))
+    (throw (ex-info "ELF64 kernel packaging requires the aiueos kernel target"
+                    {:target (:target artifact)})))
+  (when-not (and (= :none (get-in artifact [:target-profile :runtime]))
+                 (false? (get-in artifact [:target-profile :ambient-syscalls])))
+    (throw (ex-info "ELF64 kernel packaging requires a freestanding profile"
+                    {:target-profile (:target-profile artifact)})))
+  (let [source-entry (get-in artifact [:program :entry])
+        export (get-in artifact [:exports source-entry])
+        planner (get-in artifact [:exports 'aiueos-value-runtime-syscall-plan])
+        runtime-entry (get-in artifact [:exports 'aiueos-value-runtime-entry])]
+    (when-not export
+      (throw (ex-info "Kotoba kernel entry is not exported" {:entry source-entry})))
+    (when (and planner runtime-entry
+               (not= [5 5] [(:arity planner) (:arity runtime-entry)]))
+      (throw (ex-info "ValueRuntime kernel syscall exports have invalid arity"
+                      {:planner (:arity planner) :entry (:arity runtime-entry)})))
+    (let [live? (boolean (and planner runtime-entry))
+          runtime-data-size (+ kernel-runtime-data-size extra-data-size)
+          entry-address (+ image-base text-offset)
+          boot-size (if live? live-boot-shim-size 77)
+          syscall-size (if live? live-syscall-shim-size 0)
+          prefix-size (+ boot-size syscall-size)
+          artifact-address (+ entry-address prefix-size)
+          isr-exports (interrupt-entry-exports artifact)
+          isr-offset (align16 (+ prefix-size (count (:code artifact))))
+          isr-region-size (if (seq isr-exports)
+                            (* interrupt-abi/vector-limit interrupt-abi/entry-stride)
+                            0)
+          isr-base (when (seq isr-exports) (+ entry-address isr-offset))
+          data-offset (max minimum-data-offset
+                           (kernel-data-offset-for (+ isr-offset isr-region-size)))
+          context-address (+ image-base data-offset)
+          syscall-address (when live? (+ entry-address boot-size))
+          boot (entry-shim (+ artifact-address (:offset export))
+                           context-address syscall-address)
+          syscall (when live?
+                    (live-syscall-shim
+                     syscall-address context-address
+                     (+ artifact-address (:offset planner))
+                     (+ artifact-address (:offset runtime-entry))))
+          isr-region (when isr-base
+                       (interrupt-entry-region isr-base artifact-address
+                                               context-address isr-exports))
+          text (vec (concat boot syscall (:code artifact)
+                            (repeat (- isr-offset prefix-size
+                                       (count (:code artifact))) 0xcc)
+                            isr-region))
+          context (vec (concat (kernel-runtime-data (artifact-fuel artifact)
+                                                    context-address isr-base)
+                               (repeat extra-data-size 0)))
+          names (mapv int (utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
+          names-offset (+ data-offset runtime-data-size)
+          section-offset (+ names-offset (count names)
+                            (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
+          sections [(vec (repeat 64 0))
+                    (section-header 1 1 0x6 entry-address text-offset (count text) 16)
+                    (section-header 7 1 0x3 context-address data-offset runtime-data-size 4096)
+                    (section-header 13 3 0 0 names-offset (count names) 1)]
+          header (elf-header entry-address 2 section-offset (count sections))
+          phdrs (concat (program-header 0x5 text-offset entry-address (count text) (count text))
+                        (program-header 0x6 data-offset context-address
+                                        runtime-data-size runtime-data-size))
+          before-text (padded (concat header phdrs) text-offset)
+          before-data (padded (concat before-text text) data-offset)
+          before-sections (padded (concat before-data context names) section-offset)
+          bytes (vec (concat before-sections (mapcat identity sections)))]
+      {:format :elf64/v1
+       :target kernel-target
+       :entry :aiueos_kernel_entry
+       :source-entry source-entry
+       :entry-address entry-address
+       :context-address context-address
+       :rt-state-address (when (pos? extra-data-size)
+                           (+ context-address kernel-runtime-data-size))
+       :rt-state-size extra-data-size
+       :context-slot-block [(+ context-address interrupt-abi/context-slot-block-offset)
+                            (+ context-address interrupt-abi/context-slot-block-offset
+                               interrupt-abi/context-slot-block-size)]
+       :syscall-entry-address syscall-address
+       :value-runtime-live? live?
+       :interrupt-entry-base isr-base
+       :interrupt-entry-stride interrupt-abi/entry-stride
+       :interrupt-entries (into (sorted-map)
+                                (map (fn [[v _]] [v (+ isr-base (* v interrupt-abi/entry-stride))]))
+                                isr-exports)
+       :sections [:text :data :shstrtab]
+       :imports []
+       :interpreter nil
+       :bytes bytes})))
+
 (defn package-kernel
-  "Package a sealed aiueos kernel artifact as a freestanding ELF64 ET_EXEC.
-  The returned byte vector has no interpreter, dynamic section, or host imports."
+  "Package a sealed AIUEOS kernel as freestanding ELF64 ET_EXEC with the
+  smallest safe page-aligned RW context address."
+  [artifact]
+  (package-kernel-with-minimum-data-offset artifact minimum-kernel-data-offset 0))
+
+(defn package-kernel-rt
+  "Package an AIUEOS RT image with its fixed state page at 0x110000.
+  Larger text still moves the RW segment forward when necessary."
+  [artifact]
+  (package-kernel-with-minimum-data-offset artifact x86-kernel-data-offset
+                                           kernel-rt-state-size))
+
+(defn package-kernel-desktop
+  "Package the bounded resident browser shell with its compact UEFI handoff.
+  This profile has no ISR entries and does not install the full kernel GDT/TSS."
   [artifact]
   (when-not (artifact/valid-seal? artifact)
     (throw (ex-info "ELF64 kernel packaging requires a sealed artifact" {})))
@@ -943,51 +1234,33 @@
         export (get-in artifact [:exports source-entry])]
     (when-not export
       (throw (ex-info "Kotoba kernel entry is not exported" {:entry source-entry})))
-    ;; isr: this twin's x86-64 kernel IMAGE lays a bare 88-byte context and no
-    ;; GDT/TSS/stack -- kotoba-native ADR-0036 keeps the two files apart on
-    ;; purpose, and `kotoba.compiler.nbb.native-package` already refuses this
-    ;; route rather than serving a materially different image. The interrupt
-    ;; entry region needs a context slot at 0x148, which is past the end of
-    ;; the context this route builds.
-    ;;
-    ;; Refused rather than emitted with the base omitted. An image whose
-    ;; entries exist but whose base slot reads zero installs gate descriptors
-    ;; pointing into the first page: it boots, and the first interrupt
-    ;; triple-faults. Saying so here costs a compile and saves that.
     (when (seq (interrupt-entry-exports artifact))
-      (throw (ex-info "the portable elf64 twin's kernel image has no interrupt entry region"
-                      {:reason :isr-image-needs-the-jvm-packager
-                       :vectors (vec (sort (keys (interrupt-entry-exports artifact))))
-                       :context-bytes kernel-image-context-size
-                       :required-slot interrupt-abi/context-entry-base-offset})))
+      (throw (ex-info "the resident desktop profile does not admit kernel interrupt entries"
+                      {:reason :desktop-profile-has-no-isr-runtime})))
     (let [entry-address (+ image-base text-offset)
           context-address (+ image-base x86-kernel-data-offset)
-          shim (entry-shim (+ entry-address 23 (:offset export)) context-address)
+          shim (desktop-entry-shim (+ entry-address 23 (:offset export)) context-address)
           text (into shim (:code artifact))
-          ;; This twin's data offset is FIXED. A text that reaches it would put
-          ;; the RW context inside RX text -- the defect the slot block was
-          ;; introduced to end -- so refuse rather than pack it.
           _ (when (> (+ text-offset (count text)) x86-kernel-data-offset)
-              (throw (ex-info "the portable elf64 twin's text reaches its fixed kernel data offset"
+              (throw (ex-info "the resident desktop text reaches its fixed data offset"
                               {:reason :text-reaches-kernel-data
                                :text-end (+ text-offset (count text))
-                               :data-offset x86-kernel-data-offset
-                               :use :the-jvm-packager})))
+                               :data-offset x86-kernel-data-offset})))
           context (into (vec (repeat 8 0))
                         (concat (le (artifact-fuel artifact) 8)
-                                (repeat (- x86-kernel-data-size 16) 0)))
+                                (repeat (- desktop-kernel-data-size 16) 0)))
           names (mapv int (utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
-          names-offset (+ x86-kernel-data-offset x86-kernel-data-size)
+          names-offset (+ x86-kernel-data-offset desktop-kernel-data-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
           sections [(vec (repeat 64 0))
                     (section-header 1 1 0x6 entry-address text-offset (count text) 16)
-                    (section-header 7 1 0x3 context-address x86-kernel-data-offset x86-kernel-data-size 8)
+                    (section-header 7 1 0x3 context-address x86-kernel-data-offset desktop-kernel-data-size 8)
                     (section-header 13 3 0 0 names-offset (count names) 1)]
           header (elf-header entry-address 2 section-offset (count sections))
           phdrs (concat (program-header 0x5 text-offset entry-address (count text) (count text))
                         (program-header 0x6 x86-kernel-data-offset context-address
-                                        x86-kernel-data-size x86-kernel-data-size))
+                                        desktop-kernel-data-size desktop-kernel-data-size))
           before-text (padded (concat header phdrs) text-offset)
           before-data (padded (concat before-text text) x86-kernel-data-offset)
           before-sections (padded (concat before-data context names) section-offset)
@@ -1146,21 +1419,7 @@
     :value value
     :size size}))
 
-(def ^:private admitted-entry-prefix
-  "The prefix every `kernel-object-entries` key carries, checked against the
-  table rather than merely written down beside it. `package-kernel-object`
-  uses it to decide whether a source is claiming a kernel object identity, so
-  an entry added under a different prefix must not silently widen what gets a
-  symbol without being in the table -- this throws at load instead."
-  (let [prefix "aiueos-"
-        offenders (->> (keys kernel-object-entries)
-                       (map name)
-                       (remove #(str/starts-with? % prefix))
-                       sort vec)]
-    (when (seq offenders)
-      (throw (ex-info "kernel-object-entries keys must all carry the admitted prefix"
-                      {:prefix prefix :offenders offenders})))
-    prefix))
+(def ^:private admitted-entry-prefix "aiueos-")
 
 (defn- reloc-section-header [name type flags offset size link info alignment entry-size]
   (object-elf/encode-section-header
