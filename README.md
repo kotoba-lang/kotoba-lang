@@ -495,7 +495,7 @@ authoritative in machine-readable contracts and qualification evidence.
 - [Naming, Lisp punctuation, field paths, subjects and whitespace](docs/lang/naming.md)
 - [Library publication authority](lang/library-publication.edn)
 - [Public library catalog](https://kotoba-lang.org/libraries/)
-- [Kotoba extension registry: skills and MCP](https://github.com/kotoba-lang/kotoba-registry)
+- [Kotoba extension registry: skills and MCP](https://github.com/kotoba-lang/kotoba/tree/main/lib/kotoba.kotobaRegistry)
 - [Extension registry ownership and consumption](docs/adr/ADR-kotoba-extension-registry-reference.md)
 - [Maturity by axis](docs/maturity.md)
 - [Architecture decisions](docs/adr/)
