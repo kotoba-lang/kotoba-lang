@@ -100,8 +100,9 @@ effectful code.
 
 ## 5. Know the compatibility boundary
 
-Kotoba is Clojure-shaped, not a promise that arbitrary JVM Clojure or
-ClojureScript runs unchanged. Check the current classification before relying
+Kotoba's canonical form is an S-expression IPLD core, with Clojure and EDN
+(cljk, edn) as compatible surfaces. That is not a promise that arbitrary JVM
+Clojure or ClojureScript runs unchanged. Check the current classification before relying
 on a form:
 
 - human overview: [language surface matrix](lang/surface-matrix.md)

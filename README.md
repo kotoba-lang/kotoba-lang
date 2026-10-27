@@ -139,7 +139,7 @@ make the boundary deterministic even when the author is an agent.
 
 **Where Lisp's mind and GP 2's graph rewriting meet Rust's discipline.**
 
-Kotoba keeps a small, data-oriented, Clojure-shaped language. Its design draws
+Kotoba keeps a small, data-oriented language whose canonical form is S-expression IPLD data; Clojure and EDN (cljk, edn) are compatible surfaces. Its design draws
 on Lisp's code-as-data tradition and
 [GP 2's rule-based graph rewriting](https://uoycs-plasma.github.io/GP2/):
 immutable values, ordinary functions, explicit data, and a composable syntax
