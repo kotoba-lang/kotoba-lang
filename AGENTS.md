@@ -3,7 +3,7 @@
 ## Extension discovery
 
 Discover published Kotoba skills and MCP definitions through
-https://github.com/kotoba-lang/kotoba-registry and its `index.json`/`llms.txt`.
+https://github.com/kotoba-lang/kotoba/tree/main/lib/kotoba.kotobaRegistry and its `index.json`/`llms.txt`.
 Read a pinned entry and verify its checksum before installation. The extension
 catalog is separate from signed CID language package admission; runtime tools
 and west pins retain their owning repository's authority. See
