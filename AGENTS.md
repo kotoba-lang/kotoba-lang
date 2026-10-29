@@ -21,8 +21,13 @@ hosted runtime permissions in the earlier whole-component Q9 contract.
 - Keep native mechanisms behind explicit capability/provider imports. Do not
   shrink the component to avoid a missing language or backend feature; mark
   that migration blocked.
-- Final source is canonical `.kotoba`. CLJK syntax sugar, CLJC/CLJS source
-  and host adapters are migration inputs to port and retire.
+- Final source is canonical `.kotoba`. CLJC/CLJS source and host adapters
+  are migration inputs to port and retire. CLJK and EDN are retained as
+  reader syntax sugar (owner decision 2026-10-29, JUN-579; supersedes the
+  2026-10-22 "CLJK is not retained" wording): each sugar spelling must
+  desugar to the same canonical Kotoba form and mint the same Definition CID
+  as its pure `.kotoba` spelling. Equivalence is asserted by
+  `lang/surface-equivalence-corpus.edn`, with a negative control per pair.
 - Every target uses the qualified Amu selfhost-built Kotoba and Amu CLI for
   source checks, project builds, packaging and execution. `--jvm-free` alone
   does not qualify the compiler or exclude Node/NBB/C.
