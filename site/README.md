@@ -1,9 +1,12 @@
 # site — kotoba-lang.org
 
-The language's public static site. It has no third-party runtime dependency.
-Small inline scripts filter the generated reference index and run the Play
-surface; Play fetches only the same-origin, digest-bound Wasm artifact. Queries
-stay in the browser and no telemetry is emitted.
+The language's public static site. Small inline scripts filter the generated
+reference index in the browser and run the Play surface. Play fetches its
+digest-bound Wasm artifact from the same origin. For visits with a `bfcid` URL
+parameter or cookie, the page also loads the Freebuff tag from `freebuff.com`;
+after a successful Play run, the page queues a `trial_started` conversion when
+`window.freebuff` is present. The tag's own network behavior and data handling
+are outside the local generator code and are not established by this description.
 
 ## What makes this page different from a README
 
