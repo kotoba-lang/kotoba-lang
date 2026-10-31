@@ -1,6 +1,12 @@
 # ADR — kotoba-lang foundational horizontal stdlib layer
 
 - **Status**: Accepted — **implemented**: 12 foundational + 3 composite libs shipped at v0.1.0 / M6
+- **Superseded in part (2026-10-31, KOTOBA-174)**: Wasm is not the premise or
+  foundation. The foundation is the Amu selfhost (native) compiler and the
+  default compile target is the host native target (`lang/cli.edn` `:native`);
+  Wasm is one explicitly selected build target among others. Statements below
+  that call Wasm the premise or first execution target are kept as the
+  historical record.
 - **Date**: 2026-06-30 (decision) · updated 2026-07-01 (completion + positioning)
 - **Artifacts**: `docs/lang/coverage.edn` `:stdlib` track; `docs/lang/stdlib-versioning.md` (M6 policy); `docs/lang/stdlib-gates.md` (M4 gate set); repos `kotoba-lang/{coll,spec,json,wit,async,time,fs,http,io,test,fmt,lsp,scheduler,store,lint}`
 - **Related**: `ADR-kotoba-lang-profile.md`, `ADR-safe-capability-language.md`

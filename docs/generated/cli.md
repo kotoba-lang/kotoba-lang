@@ -54,7 +54,7 @@ Positionals:
 
 Options:
 
-- **`--target`** — Compilation target. Type: `enum`; values: `web`, `wasm`; default: `wasm`.
+- **`--target`** — Compilation target. `native` (the default when `--target` is omitted) is the host's native target as the Amu selfhost compiler names it (`<isa>-<os>`, such as `x86_64-linux` or `aarch64-macos`); an unknown host is refused by name. `web` and `wasm` are explicit targets; Wasm is one target, not the foundation. Type: `enum`; values: `native`, `web`, `wasm`; default: `native`.
 - **`--prelude`** — Explicit portable source prelude prepended before the entry source. No prelude is loaded implicitly. Type: `path`.
 - **`-o`, `--output`** — Output artifact path. Type: `path`.
 - **`--json`** — Emit machine-readable diagnostics. Type: `boolean`.

@@ -1,6 +1,12 @@
 # ADR: Reliability T6.1 — primary standalone run = wasmtime on wasm32
 
 - Status: Accepted
+- Superseded in part (2026-10-31, KOTOBA-174): the Amu selfhost native target
+  is the foundation and the default `kotoba compile` target (`lang/cli.edn`
+  `:native`); wasm32 + wasmtime is one explicitly selected path for hosts where
+  native cannot run, not the primary. Item 4 is replaced: native is the
+  pure-product required backend (`:native-host`, evidence pending). The text
+  below is kept as written.
 - Date: 2026-07-28
 - WBS: T6.1
 

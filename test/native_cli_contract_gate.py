@@ -49,7 +49,13 @@ for name, text, expected in [
     ('changed-flag', original.replace('"--principal"', '"--obsolete-principal"', 1), 15),
     ('duplicate-command', original.replace(':id :id', ':id :run', 1), 10),
     ('hosted-runtime', original.replace(':values [:kotoba] :default :kotoba', ':values [:kotoba :sci] :default :kotoba', 1), 16),
+    # KOTOBA-174: a compile target value that is not declared is refused, and
+    # so is a default that is not the host native target.
+    ('undeclared-target', original.replace(':values [:native :web :wasm] :default :native', ':values [:native :web :wasm :jvm] :default :native', 1), 16),
+    ('wasm-default', original.replace(':values [:native :web :wasm] :default :native', ':values [:native :web :wasm] :default :wasm', 1), 16),
+    ('no-native-target', original.replace(':values [:native :web :wasm] :default :native', ':values [:web :wasm] :default :wasm', 1), 16),
 ]:
+    assert text != original, name
     candidate = out / (name + '.edn')
     candidate.write_text(text)
     run('refuse-' + name, [out / 'reader.elf', candidate, 'cli'], expected)

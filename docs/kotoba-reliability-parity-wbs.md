@@ -51,6 +51,11 @@ compiler / KIR / wasm / native / legacy path skew.
 
 **Exit:** One failing backend fails the language gate; no “works on KIR only” silent pass for pure-product surface.
 
+> KOTOBA-174 (2026-10-31): the required pair is now **KIR + `:native-host`** (the
+> host native target built by the Amu selfhost compiler); `wasm32-kotoba-v1` is
+> an optional, explicitly selected backend. The T1.3 row above records the
+> Wasm-era pilot. No runner drives `:native-host` over the manifest yet.
+
 ---
 
 ### T2 — Surface / profile CI enforcement

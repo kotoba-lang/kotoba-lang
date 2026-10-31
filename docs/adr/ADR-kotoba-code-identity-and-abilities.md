@@ -1,6 +1,12 @@
 # ADR — Unison-inspired code identity and typed abilities
 
 - **Status**: Accepted — CI1–CI7 implemented (2026-08-03); see lang/code-identity.edn for per-stage evidence and residual risks. 2026-09-02: definition identity covers every checked definition, effectful included — the effect row is a sealed input and `:definition-cid :scope` is `:closed-deterministic-checked-definition`; compiler-inferred `[:cap/call id]` rows are not yet hashable (`:effect-row-vocabulary`, not-yet-bridged).
+- **Superseded in part (2026-10-31, KOTOBA-174)**: Wasm is not the premise or
+  foundation. The foundation is the Amu selfhost (native) compiler and the
+  default compile target is the host native target (`lang/cli.edn` `:native`);
+  Wasm is one explicitly selected build target among others. Statements below
+  that call Wasm the premise or first execution target are kept as the
+  historical record.
 - **Date**: 2026-07-25
 - **Artifacts**: `lang/code-identity.edn`, `docs/lang/capability-values.md`,
   `lang/package.edn`
