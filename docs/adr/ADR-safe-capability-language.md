@@ -1,6 +1,9 @@
 # ADR — kotoba 言語の安全性設計まとめ直し: capability-confinement を一次原理にする
 
 Status: **Accepted・実装進行中** — gating 層は実装完了（capability/per-cid・subset 全 spec・effect interprocedural・S1b literal 型チェック・`:memory-pages` 強制・least-privilege tooling、実 cell で end-to-end 検証）。borrow checker（S2）は capability 値限定の narrow slice として実装済み（2026-07-08、`kotoba-lang/kotoba` `cap-affine-problems`、汎用 ownership システムではない）。残務は型システム本体（typed HIR）・capability 値渡し S4b・supply chain S5。詳細は §0「実装状況サマリ」と §9 ロードマップ。
+
+Superseded in part（2026-10-31, KOTOBA-174）: Wasm は前提・基盤ではない。基盤は Amu selfhost（native）コンパイラで、`kotoba compile` の既定 target は host native（`lang/cli.edn` の `:native`）。Wasm は明示的に選ぶ build target の一つ。以下で Wasm を前提とする記述は当時の記録として残す。
+
 Date: 2026-06-25（設計）/ 実装更新: 2026-06-26
 Implemented（歴史的）: `crates/kotoba-clj` は kotoba#259 `604896171` の Rust workspace 撤去で削除済み。本文中の `*.rs` 証拠パス（`policy.rs` / `subset.rs` / `effects.rs` / `ty.rs` / `cli.rs`、safe-mode tests 約 200 を含む全件）は**当時の実測の歴史的記録**であり、現行 tree には存在しない
 Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lattice`（runtime 側 enforcement）

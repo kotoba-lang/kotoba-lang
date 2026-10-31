@@ -1,6 +1,12 @@
 # ADR: Reliability T1.2 — conformance required-backends matrix
 
 - Status: Accepted
+- Superseded in part (2026-10-31, KOTOBA-174): the pure-product bar is now
+  `#{:kir :native-host}` — KIR plus the host native target built by the Amu
+  selfhost compiler. `:wasm32-kotoba-v1` is an optional, explicitly selected
+  backend. `:native-host` has no runner yet; recorded cases carry a dated
+  `:unexecuted-backends` entry for it, not a pass. The text below is the
+  2026-07-28 decision and is kept as written.
 - Date: 2026-07-28
 - WBS: T1.2 (`docs/kotoba-reliability-parity-wbs.md`)
 

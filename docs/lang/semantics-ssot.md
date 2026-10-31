@@ -193,7 +193,9 @@ floats cross a native module boundary as their bit pattern, and
 - **No** `:capabilities` / `cap-call`  
 - **Empty** effect set after analysis  
 - Control sugar + string ops listed in the profile must execute on product KIR
-  (`:wasm32-kotoba-v1` → `kotoba.kir/execute`)  
+  (`kotoba.kir/execute`) and on the host native target (`:native-host`, built by
+  the Amu selfhost compiler); `:wasm32-kotoba-v1` is one optional, explicitly
+  selected target (KOTOBA-174)  
 - Compiler flag: `:language-profile :pure-product` (see compiler admission)
 
 ---
@@ -275,7 +277,8 @@ a case class:
 | Backend | Role |
 |---|---|
 | KIR (`kotoba.kir/execute`) | Product pure oracle runner (murakumo pattern) |
-| `wasm32-kotoba-v1` | Portable wasm bytes + same KIR semantics |
+| `native-host` | Host native target (`<isa>-<os>`) built by the Amu selfhost compiler; required for pure-product next to KIR (KOTOBA-174; evidence pending) |
+| `wasm32-kotoba-v1` | Portable wasm bytes + same KIR semantics; optional, explicitly selected target |
 | `js-kotoba-v1` / `cljs-kotoba-v1` | Web/script targets for typed subset |
 | native x86_64 / aarch64 | Pure i64/string/option subset (expanding) |
 
@@ -283,7 +286,9 @@ a case class:
 language gate — no silent “works on KIR only” for the pure-product surface (T1.3).
 
 Conformance ownership: `lang/conformance/manifest.edn` **v2** — required-backends matrix
-per case class (T1.2 landed). Dual-backend execution runner is T1.3.
+per case class (T1.2 landed); the pure-product required set is `#{:kir :native-host}`
+since KOTOBA-174 (2026-10-31). Dual-backend execution runner is T1.3; no runner drives
+`:native-host` yet.
 
 ---
 
