@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare native complete native English article pages from pinned sources."""
+"""Compare native complete native multilingual article pages from pinned sources."""
 import argparse
 import hashlib
 import json
@@ -11,8 +11,10 @@ import shutil
 import subprocess
 from check_source_concat import REFS
 from check_footers import Tree, normalize
+from concurrent.futures import ThreadPoolExecutor
 ROOT = Path(__file__).resolve().parents[2]
 PINS = ROOT / 'site/native/css-source-dependencies.json'
+TAGS = 'en ar arz bn de es fr hi id ja ko mr pcm pt ru ur zh-Hans'.split()
 FILES = [('resources/jp_go_dds/dds.css','dds.css'), ('resources/jp_go_dds/components/language-selector.css','language.css'), ('resources/jp_go_dds/components/menu-list-box.css','box.css'), ('resources/jp_go_dds/components/menu-list.css','menu.css'), ('src/jp_go_dds/behavior.cljk','behavior.cljk'), ('src/jp_go_dds/core.cljk','core.cljk'), ('src/jp_go_dds/tokens.cljk','tokens.cljk')]
 
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -41,10 +43,8 @@ def main():
     if any(sha(p) != digest for p, _, digest in extras): raise ValueError('HTML source drift')
     for binary in (compiler, packager):
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(binary)], check=True, capture_output=True, timeout=30)
-    references = []
-    for p in REFS:
-        references.append(p.read_text().replace('site/generate.cljk', 'site/native/article_body.kotoba'))
-    tracked = [*[p for p, _, _ in extras], ROOT / 'site/native/html-dependencies.json', ROOT / 'site/native/header-dependencies.json', ROOT / 'site/native/dds-dependencies.json', ROOT / 'site/i18n/en.json', ROOT / 'site/infra-cost-article.edn', ROOT / 'site/security-article.edn', compiler, packager, sha_source, json_source, theme_json, dds / 'src/jp_go_dds/theme_toggle.cljk', ROOT / 'site/generate.cljk', ROOT / 'site/native/metadata-sources.json', *[p for p, _ in sources], PINS, ROOT / 'site/native/dependencies.json',
+    references = [(tag, route, ROOT / 'site/dist' / ('' if tag == 'en' else tag) / path / 'index.html') for tag in TAGS for route, path in (('infra', 'blog/infra-cost-measured-path'), ('security', 'blog/csf2-attack-graphs'))]
+    tracked = [*[p for p, _, _ in extras], ROOT / 'site/native/html-dependencies.json', ROOT / 'site/native/header-dependencies.json', ROOT / 'site/native/dds-dependencies.json', *[ROOT / 'site/i18n' / (t + '.json') for t in TAGS], *[p for _, _, p in references], ROOT / 'site/infra-cost-article.edn', ROOT / 'site/security-article.edn', compiler, packager, sha_source, json_source, theme_json, dds / 'src/jp_go_dds/theme_toggle.cljk', ROOT / 'site/generate.cljk', ROOT / 'site/native/metadata-sources.json', *[p for p, _ in sources], PINS, ROOT / 'site/native/dependencies.json',
                ROOT / 'site/native/check_source_concat.py', *REFS, Path(__file__).resolve()]
     modules = [(ROOT / 'site/native/dds_base_css.kotoba', 'src/site/native/dds_base_css.kotoba'),
                (ROOT / 'site/native/dds_ext_css.kotoba', 'src/site/native/dds_ext_css.kotoba'),
@@ -70,7 +70,7 @@ def main():
     shutil.copyfile(ROOT / 'site/generate.cljk', out / 'generator.cljk')
     shutil.copyfile(theme_json, out / 'theme.json')
     (out / 'site/i18n').mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(ROOT / 'site/i18n/en.json', out / 'site/i18n/en.json')
+    for tag in TAGS: shutil.copyfile(ROOT / 'site/i18n' / (tag + '.json'), out / 'site/i18n' / (tag + '.json'))
     for name in ('infra-cost-article.edn', 'security-article.edn'): shutil.copyfile(ROOT / 'site' / name, out / 'site' / name)
     lock = out / 'project.ksl'
     lock.write_text('KSL1\nentry /src/site/native/article_page_file.kotoba\nroot /src\n' +
@@ -83,7 +83,7 @@ def main():
             os.dup2(fd, 3)
         def run(image, *args, expected_exit=0):
             p = subprocess.run([str(image), *args], cwd=out, env={'PATH': '/nonexistent', 'LANG': 'C'},
-                               pass_fds=(3,), capture_output=True, timeout=300)
+                               pass_fds=(3,), capture_output=True, timeout=900)
             if p.returncode != expected_exit or p.stderr: raise RuntimeError(('native command', args, p.returncode, p.stderr[-500:]))
             return p.stdout
         run(compiler, 'compile', '/src/site/native/article_page_file.kotoba', '--target', 'aarch64-macos',
@@ -94,24 +94,34 @@ def main():
         run(packager, 'base-unsigned.macho', 'base.raw', 'fs2-cli-stdio-general', m[1].decode())
         binary = out / 'base.macho'; shutil.copyfile(out / 'base-unsigned.macho', binary); binary.chmod(0o700)
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(binary)], check=True, capture_output=True, timeout=30)
-        results = []
-        for route, reference in zip(('infra', 'security'), references):
-            result = run(binary, route, expected_exit=42)
+        def remove_old_freebuff(node):
+            if not isinstance(node, list): return
+            node[2][:] = [item for item in node[2] if not (isinstance(item, list) and item[0] == 'script' and any(isinstance(x, str) and 'window.freebuff' in x for x in item[2]))]
+            for item in node[2]: remove_old_freebuff(item)
+        def check(case):
+            tag, route, reference = case
+            result = run(binary, route, tag, expected_exit=42)
+            if b'freebuff' in result.lower() or b'bfcid' in result.lower(): raise ValueError('telemetry in generated page')
             actual = Tree(); actual.feed(result.decode()); actual.close()
-            expected = Tree(); expected.feed(reference); expected.close()
-            if len(actual.stack) != 1 or normalize(actual.root) != normalize(expected.root): raise ValueError('complete article DOM differs: ' + route)
-            results.append(result)
-        result = b''.join(results)
+            expected = Tree(); expected.feed(reference.read_text().replace('site/generate.cljk', 'site/native/article_body.kotoba')); expected.close()
+            remove_old_freebuff(expected.root)
+            if len(actual.stack) != 1 or normalize(actual.root) != normalize(expected.root): raise ValueError(('complete article DOM differs', route, tag))
+            print(route, tag, 'page pass', flush=True)
+            return {'route': route, 'tag': tag, 'sha256': hashlib.sha256(result).hexdigest()}
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(check, references))
+        run(binary, 'unknown', 'en', expected_exit=7)
+        run(binary, 'infra', '../ja', expected_exit=7)
         original = (out / 'tokens.cljk').read_bytes(); (out / 'tokens.cljk').write_bytes(original + b' ')
-        run(binary, 'infra', expected_exit=7)
+        run(binary, 'infra', 'en', expected_exit=7)
     finally:
         if fd != 3:
             if saved is None: os.close(3)
             else: os.dup2(saved, 3); os.close(saved)
         os.close(fd)
     if any(sha(p) != before[str(p)] for p in tracked): raise ValueError('source changed during gate')
-    receipt = {'status':'PASS_NATIVE_ENGLISH_ARTICLE_PAGE', 'inputs':before, 'binarySha256':sha(binary),
-               'sourceLockSha256':sha(lock), 'outputSha256':hashlib.sha256(result).hexdigest(), 'modifiedInputRefused':True,
+    receipt = {'status':'PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE', 'inputs':before, 'binarySha256':sha(binary),
+               'sourceLockSha256':sha(lock), 'observations': results, 'invalidRouteRefused':True, 'invalidTagRefused':True, 'freebuffAbsent':True, 'modifiedInputRefused':True,
                'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'siteGenerated':False, 'publicationQualified':False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n'); print(receipt['status'])
 if __name__ == '__main__': main()
