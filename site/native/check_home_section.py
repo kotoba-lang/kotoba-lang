@@ -13,7 +13,7 @@ import subprocess
 from check_footers import Tree, normalize, TAGS, ARTICLES
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULES = ['home_section', 'source_concat', 'locale_tree', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']
+MODULES = ['home_section', 'source_concat', 'locale_tree', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders', 'locale_links', 'locale_rebase']
 
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -110,7 +110,7 @@ def main():
             print(tag, which, 'home section pass', flush=True)
             return {'tag': tag, 'section': which, 'sha256': hashlib.sha256(r.stdout).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool:
-            results = list(pool.map(check, [(tag, which) for tag in TAGS for which in ('why', 'what', 'docs', 'roadmap', 'community')]))
+            results = list(pool.map(check, [(tag, which) for tag in TAGS for which in ('why', 'what', 'docs', 'roadmap', 'community', 'cloud')]))
         invoke(image, '../ja', 'why', expected=7)
         invoke(image, 'en', 'unknown', expected=7)
         src = out / 'generator.cljk'; original = src.read_bytes()
@@ -129,7 +129,7 @@ def main():
         os.close(fd)
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source changed during gate')
-    receipt = {'status': 'PASS_NATIVE_HOME_FIVE_SECTIONS', 'inputs': pins, 'sourceLockSha256': sha(lock),
+    receipt = {'status': 'PASS_NATIVE_HOME_SIX_SECTIONS', 'inputs': pins, 'sourceLockSha256': sha(lock),
                'binarySha256': sha(image), 'observations': results, 'invalidTagRefused': True,
                'modifiedSourceRefused': True, 'completeHomepage': False, 'siteGenerated': False,
                'translationQualityQualified': False, 'publicationQualified': False}
