@@ -62,7 +62,9 @@ def main():
     if invoke('en',scratch,head_dir=bad,expected_exit=7) or (scratch/'body.out').exists():raise ValueError('failed child leaked page or ran body')
     occupied_page=out/'occupied-page';occupied_page.mkdir();(occupied_page/'index.html').write_text('preserve')
     if invoke('en',occupied_page,expected_exit=7) or (occupied_page/'index.html').read_text()!='preserve' or (occupied_page/'head.out').exists():raise ValueError('existing page was altered')
+    occupied_temp=out/'occupied-temp';occupied_temp.mkdir();(occupied_temp/'index.part').write_text('preserve')
+    if invoke('en',occupied_temp,expected_exit=7) or (occupied_temp/'index.part').read_text()!='preserve' or (occupied_temp/'head.out').exists() or (occupied_temp/'index.html').exists():raise ValueError('existing staging file was altered')
     if any(sha(p)!=pins[str(p)] for p in tracked):raise ValueError('input drift')
-    receipt={'status':'PASS_NATIVE_BLOG_FILE_CONTROLLER_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'observations':results,'invalidTagAndDigestRefused':True,'existingCapturePreserved':True,'failedChildEmittedNoPage':True,'privateImmutableStageRequired':True,'fullSiteGenerated':False,'linuxQualified':False,'publicationQualified':False}
+    receipt={'status':'PASS_NATIVE_BLOG_FILE_CONTROLLER_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'observations':results,'invalidTagAndDigestRefused':True,'existingCapturePreserved':True,'failedChildEmittedNoPage':True,'privateImmutableStageRequired':True,'renameAfterSuccessfulWrite':True,'fullSiteGenerated':False,'linuxQualified':False,'publicationQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':main()
