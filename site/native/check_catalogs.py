@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stage native Amu catalog checks; this is not a site generation gate.
 
-The current catalog reader admits a bounded JSON string-object subset and
-rejects Unicode escapes. Python stages raw input, locks and observations; the
+The catalog reader admits a bounded JSON string-object subset with unescaped
+lowercase hash keys. Python stages raw input, locks and observations; the
 native Kotoba executable performs parsing and comparison. Large raw argv is
 used only for this Mac-host diagnostic; a portable file-capability host remains
 required for a complete native site build.
@@ -70,11 +70,13 @@ def main():
     amu = args.amu.resolve(strict=True)
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
+    tracked = (amu, CATALOG, PLACEHOLDERS, TEST, ARGV)
+    identities = {str(path): digest(path.read_bytes()) for path in tracked}
     test_ns = 'site.native.locale-catalog-test'
     positive = compile_native(amu, out, 'catalog-test', TEST, test_ns, CATALOG)
     observe(positive, [], b'42\n')
     text = CATALOG.read_text()
-    needle = '(and (= (vector-at s 0) 0) (= (vector-at t 0) 0) (> (vector-at s 1) 0)\n         (every-entry? source s target t))'
+    needle = '(and (= (vector-at s 0) 0) (= (vector-at t 0) 0) (>= (vector-at s 1) minimum) (> minimum 0)\n         (every-entry? source s target t))'
     if text.count(needle) != 1:
         raise ValueError('negative-control mutation anchor changed')
     mutated = out / 'negative.kotoba'
@@ -92,9 +94,15 @@ def main():
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         observations = list(pool.map(check, TAGS))
-    receipt = {'status': 'PASS_NATIVE_CURRENT_CATALOG_SUBSET', 'compilerCliSha256': digest(amu.read_bytes()),
+    if any(digest(path.read_bytes()) != identities[str(path)] for path in tracked):
+        raise ValueError('compiler or source changed during native catalog gate')
+    receipt = {'status': 'PASS_NATIVE_CURRENT_CATALOG_SUBSET', 'compilerCliSha256': identities[str(amu)],
+               'catalogReaderSha256': identities[str(CATALOG)],
+               'placeholderReaderSha256': identities[str(PLACEHOLDERS)],
+               'testSha256': identities[str(TEST)], 'argvEntrySha256': identities[str(ARGV)],
                'sourceSha256': digest(source), 'catalogs': observations,
-               'unitAndMutationControls': True, 'unicodeEscapeSupport': False,
+               'unitAndMutationControls': True, 'unicodeEscapedValues': True,
+               'escapedKeysSupported': False,
                'nativeFileHostQualified': False, 'renderedPagesValidated': False, 'siteGenerated': False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'], flush=True)

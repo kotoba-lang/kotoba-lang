@@ -39,6 +39,7 @@ def main():
     compiler, packager = args.compiler.resolve(strict=True), args.packager.resolve(strict=True)
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
+    compiler_hash, packager_hash = sha(compiler), sha(packager)
     for path in (compiler, packager):
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(path)],
                        check=True, capture_output=True, timeout=30)
@@ -108,6 +109,16 @@ def main():
             invoke(program, 'ja', expected=7)
         finally:
             target.write_bytes(original)
+        source_file = out / 'site/i18n/en.json'
+        source_original = source_file.read_bytes()
+        small = b'{"' + b'a' * 64 + b'":"translated"}\n'
+        try:
+            source_file.write_bytes(small)
+            target.write_bytes(small)
+            invoke(program, 'ja', expected=7)
+        finally:
+            source_file.write_bytes(source_original)
+            target.write_bytes(original)
     finally:
         if fd != 3:
             if saved is None:
@@ -117,10 +128,15 @@ def main():
                 os.close(saved)
         os.close(fd)
 
-    receipt = {'status': 'PASS_NATIVE_FILE_CATALOG_SUBSET', 'compilerSha256': sha(compiler),
-               'packagerSha256': sha(packager), 'programSha256': sha(program),
+    if sha(compiler) != compiler_hash or sha(packager) != packager_hash:
+        raise ValueError('native toolchain changed during catalog gate')
+    receipt = {'status': 'PASS_NATIVE_FILE_CATALOG_SUBSET', 'compilerSha256': compiler_hash,
+               'packagerSha256': packager_hash, 'programSha256': sha(program),
+               'sourceLockSha256': sha(lock), 'sourceFiles': {virtual: sha(path) for virtual, path in staged},
                'sourceSha256': sha(out / 'site/i18n/en.json'), 'catalogs': observations,
-               'invalidPathRefused': True, 'missingKeysRefused': True, 'unicodeEscapeSupport': False,
+               'invalidPathRefused': True, 'missingKeysRefused': True, 'smallSourceRefused': True,
+               'unicodeEscapedValues': True,
+               'escapedKeysSupported': False,
                'renderedPagesValidated': False, 'siteGenerated': False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'], flush=True)

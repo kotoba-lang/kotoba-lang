@@ -1,10 +1,9 @@
 (ns site.native.locale-catalog
-  (:export [catalogs-match?])
+  (:export [catalogs-match? catalogs-meet-minimum?])
   (:require [site.native.locale-placeholders :as placeholders]))
 
-;; The current catalogs are JSON objects from lowercase SHA-256 keys to
-;; strings. This first reader fails closed on \u escapes; it is intentionally
-;; a bounded subset until Unicode escape decoding has its own native gate.
+;; Catalogs are JSON objects from unescaped lowercase SHA-256 keys to strings.
+;; JSON string escapes, including valid Unicode surrogate pairs, are decoded.
 (defn- cp-width [cp :i64] :i64
   (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
 
@@ -24,7 +23,33 @@
 (defn- escape? [cp :i64] :bool
   (or (= cp 34) (= cp 92) (= cp 47) (= cp 98) (= cp 102) (= cp 110) (= cp 114) (= cp 116)))
 
-;; Exclusive offset after a JSON string; -1 means malformed or unsupported.
+(defn- hex-any [cp :i64] :i64
+  (cond (and (>= cp 48) (<= cp 57)) (- cp 48)
+        (and (>= cp 97) (<= cp 102)) (- cp 87)
+        (and (>= cp 65) (<= cp 70)) (- cp 55)
+        :else -1))
+
+(defn- unicode-unit [text :string start :i64 limit :i64] :i64
+  (if (> (+ start 4) limit) -1
+    (loop [i 0 value 0]
+      (if (= i 4) value
+        (let [v (hex-any (string-code-point-at text (+ start i)))]
+          (if (< v 0) -1 (recur (+ i 1) (+ (* value 16) v))))))))
+
+;; Exclusive offset following one Unicode escape, or -1 for an invalid pair.
+(defn- unicode-end [text :string slash :i64 limit :i64] :i64
+  (let [unit (unicode-unit text (+ slash 2) limit)]
+    (cond (< unit 0) -1
+          (and (>= unit 56320) (<= unit 57343)) -1
+          (and (>= unit 55296) (<= unit 56319))
+          (let [next (+ slash 6)]
+            (if (or (> (+ next 6) limit) (not (= (string-code-point-at text next) 92))
+                    (not (= (string-code-point-at text (+ next 1)) 117))) -1
+              (let [low (unicode-unit text (+ next 2) limit)]
+                (if (and (>= low 56320) (<= low 57343)) (+ next 6) -1))))
+          :else (+ slash 6))))
+
+;; Exclusive offset after a JSON string; -1 means malformed.
 (defn- string-end [text :string start :i64] :i64
   (let [length (string-byte-length text)]
     (if (or (>= start length) (not (= (string-code-point-at text start) 34))) -1
@@ -33,11 +58,63 @@
           (let [cp (string-code-point-at text i)]
             (cond (= cp 34) (+ i 1)
                   (< cp 32) -1
-                  (= cp 92) (if (and (< (+ i 1) length) (escape? (string-code-point-at text (+ i 1))))
-                              (recur (+ i 2)) -1)
+                  (= cp 92) (if (>= (+ i 1) length) -1
+                              (let [kind (string-code-point-at text (+ i 1))]
+                                (cond (= kind 117) (let [end (unicode-end text i length)]
+                                                     (if (< end 0) -1 (recur end)))
+                                      (escape? kind) (recur (+ i 2))
+                                      :else -1)))
                   :else (recur (+ i (cp-width cp))))))))))
 
+(defn- has-unicode-escape? [text :string start :i64 end :i64] :bool
+  (loop [i start]
+    (if (>= i end) false
+      (let [cp (string-code-point-at text i)]
+        (if (= cp 92)
+          (if (= (string-code-point-at text (+ i 1)) 117) true (recur (+ i 2)))
+          (recur (+ i (cp-width cp))))))))
+
+(defn- append-utf8 [out :vector-i64 cp :i64] :vector-i64
+  (cond (< cp 128) (vector-conj out cp)
+        (< cp 2048) (vector-conj (vector-conj out (bit-or 192 (u64-shift-right cp 6)))
+                                 (bit-or 128 (bit-and cp 63)))
+        (< cp 65536) (vector-conj (vector-conj (vector-conj out (bit-or 224 (u64-shift-right cp 12)))
+                                               (bit-or 128 (bit-and (u64-shift-right cp 6) 63)))
+                                  (bit-or 128 (bit-and cp 63)))
+        :else (vector-conj (vector-conj (vector-conj (vector-conj out (bit-or 240 (u64-shift-right cp 18)))
+                                                   (bit-or 128 (bit-and (u64-shift-right cp 12) 63)))
+                                        (bit-or 128 (bit-and (u64-shift-right cp 6) 63)))
+                           (bit-or 128 (bit-and cp 63)))))
+
+(defn- decoded-escape [kind :i64] :i64
+  (cond (= kind 98) 8 (= kind 102) 12 (= kind 110) 10 (= kind 114) 13 (= kind 116) 9 :else kind))
+
+;; Called only for strings that passed string-end. Construct the decoded UTF-8
+;; view only when a Unicode escape could affect placeholder or blank checks.
+(defn- decode-value [text :string start :i64 end :i64] :string
+  (let [bytes (loop [i start out (vector-alloc 0)]
+                (if (>= i end) out
+                  (let [cp (string-code-point-at text i)]
+                    (if (not (= cp 92))
+                      (recur (+ i (cp-width cp)) (append-utf8 out cp))
+                      (let [kind (string-code-point-at text (+ i 1))]
+                        (if (not (= kind 117))
+                          (recur (+ i 2) (append-utf8 out (decoded-escape kind)))
+                          (let [unit (unicode-unit text (+ i 2) end)]
+                            (if (and (>= unit 55296) (<= unit 56319))
+                              (let [low (unicode-unit text (+ i 8) end)
+                                    scalar (+ 65536 (* (- unit 55296) 1024) (- low 56320))]
+                                (recur (+ i 12) (append-utf8 out scalar)))
+                              (recur (+ i 6) (append-utf8 out unit))))))))))]
+    (string-from-utf8 (bytes-from-vector-i64 bytes))))
+
+(defn- value-view [text :string start :i64 end :i64] :string
+  (if (has-unicode-escape? text start end) (decode-value text start end)
+    (string-substring text start end)))
+
 (defn- blank-value? [text :string start :i64 end :i64] :bool
+  (if (has-unicode-escape? text start end)
+    (let [decoded (decode-value text start end)] (blank-decoded? decoded))
   (loop [i start]
     (if (>= i end) true
       (let [cp (string-code-point-at text i)]
@@ -45,7 +122,13 @@
           (let [escaped (string-code-point-at text (+ i 1))]
             (if (or (= escaped 110) (= escaped 114) (= escaped 116) (= escaped 102))
               (recur (+ i 2)) false))
-          (if (blank-cp? cp) (recur (+ i (cp-width cp))) false))))))
+          (if (blank-cp? cp) (recur (+ i (cp-width cp))) false)))))))
+
+(defn- blank-decoded? [text :string] :bool
+  (loop [i 0]
+    (if (>= i (string-byte-length text)) true
+      (let [cp (string-code-point-at text i)]
+        (if (blank-cp? cp) (recur (+ i (cp-width cp))) false)))))
 
 (defn- hex-digit [cp :i64] :i64
   (cond (and (>= cp 48) (<= cp 57)) (- cp 48)
@@ -125,11 +208,14 @@
               (let [source-start (vector-at source-table (+ slot 1)) source-end (vector-at source-table (+ slot 2))
                     target-start (vector-at target-table (+ found 1)) target-end (vector-at target-table (+ found 2))]
                 (if (or (blank-value? source source-start source-end) (blank-value? target target-start target-end)) false
-                  (if (placeholders/placeholders-match? (string-substring source source-start source-end)
-                                                        (string-substring target target-start target-end))
+                  (if (placeholders/placeholders-match? (value-view source source-start source-end)
+                                                        (value-view target target-start target-end))
                     (recur (+ slot 3)) false))))))))))
 
-(defn catalogs-match? [source :string target :string] :bool
+(defn catalogs-meet-minimum? [source :string target :string minimum :i64] :bool
   (let [s (parse-catalog source) t (parse-catalog target)]
-    (and (= (vector-at s 0) 0) (= (vector-at t 0) 0) (> (vector-at s 1) 0)
+    (and (= (vector-at s 0) 0) (= (vector-at t 0) 0) (>= (vector-at s 1) minimum) (> minimum 0)
          (every-entry? source s target t))))
+
+(defn catalogs-match? [source :string target :string] :bool
+  (catalogs-meet-minimum? source target 1))
