@@ -83,6 +83,7 @@ def main():
     with ThreadPoolExecutor(max_workers=3) as pool: results=list(pool.map(check,zip(TAGS,refs)))
     run(image,'../ja',expected=7)
     target=out/'compile-benchmark.json';target.write_bytes(target.read_bytes()+b' ');run(image,'en',expected=7)
+    target.write_text('[' * 128);run(image,'en',expected=7)
     if any(sha(p)!=pins[str(p)] for p in tracked):raise ValueError('input drift')
     receipt={'status':'PASS_BOUNDED_COMPILE_BENCHMARK_TABLE','inputs':pins,'locales':results,'siteGenerated':False,'fullBenchmarkSection':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
