@@ -21,6 +21,9 @@ from reference_translation import reference_title
 ROOT = Path(__file__).resolve().parents[2]
 PINS = ROOT / 'site/native/css-source-dependencies.json'
 TAGS = 'en ar arz bn de es fr hi id ja ko mr pcm pt ru ur zh-Hans'.split()
+BILINGUAL = {'parity': ('embench-c-parity-article.edn', 'blog/embench-c-parity-20261015'),
+             'progress': ('embench-progress-article.edn', 'blog/embench-progress-20261012'),
+             'usage': ('usage-article.edn', 'blog/kotoba-murakumo-how-to-use-20261015')}
 FILES = [('resources/jp_go_dds/dds.css','dds.css'), ('resources/jp_go_dds/components/language-selector.css','language.css'), ('resources/jp_go_dds/components/menu-list-box.css','box.css'), ('resources/jp_go_dds/components/menu-list.css','menu.css'), ('src/jp_go_dds/behavior.cljk','behavior.cljk'), ('src/jp_go_dds/core.cljk','core.cljk'), ('src/jp_go_dds/tokens.cljk','tokens.cljk')]
 
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -72,7 +75,7 @@ def main():
     modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['home_try_prefix_page', 'home_try_prefix', 'home_start', 'home_code_play', 'home_highlight', 'home_play', 'home_closing_page', 'home_closing_chapter', 'home_opening_page', 'home_opening_chapters', 'home_contents', 'home_section', 'home_deliberate', 'site_command', 'sitemap_page', 'sitemap', 'article_page', 'article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
     authorities = [ROOT / 'lang' / name for name in ('stack-architecture.edn', 'typed-eval.edn', 'product-defaults.edn', 'surface-status.edn', 'docs-release.edn', 'wasm-component-platform.edn', 'elaboration-pipeline.edn')] + [ROOT / 'site/sponsorship.edn']
     tracked += [grammar, tokenizer, ROOT / 'site/native/highlight-source-dependencies.json', ROOT / 'site/src/kotoba/site/locales.cljk', ROOT / 'site/assets/play/double-21.kotoba', ROOT / 'site/assets/play/double-21.wasm', ROOT / 'site/assets/play/double-21.wasm.provenance.edn', ROOT / 'site/native/check_home_try_prefix.py', ROOT / 'site/native/check_home_start.py', ROOT / 'site/native/check_home_code_play.py']
-    tracked += [p for p, _ in modules] + authorities + [ROOT / 'site/native/check_home_opening_chapters.py', ROOT / 'site/native/check_home_closing_chapter.py']
+    tracked += [p for p, _ in modules] + authorities + [ROOT / 'site' / name for name, _ in BILINGUAL.values()] + [ROOT / 'site/native/check_home_opening_chapters.py', ROOT / 'site/native/check_home_closing_chapter.py']
     pages = sorted((ROOT / 'site/dist').rglob('*.html'))
     tracked += pages + [ROOT / 'site/dist/sitemap.xml']
     before = {str(p): sha(p) for p in tracked}
@@ -87,7 +90,7 @@ def main():
     for src, name in ((grammar, 'grammar.edn'), (tokenizer, 'highlight.cljk'), (ROOT / 'site/src/kotoba/site/locales.cljk', 'locales.cljk'), (ROOT / 'site/assets/play/double-21.kotoba', 'play.kotoba'), (ROOT / 'site/assets/play/double-21.wasm', 'play.wasm'), (ROOT / 'site/assets/play/double-21.wasm.provenance.edn', 'provenance.edn')): shutil.copyfile(src, out / name)
     (out / 'site/i18n').mkdir(parents=True, exist_ok=True)
     for tag in TAGS: shutil.copyfile(ROOT / 'site/i18n' / (tag + '.json'), out / 'site/i18n' / (tag + '.json'))
-    for name in ('infra-cost-article.edn', 'security-article.edn', 'org-identity-article.edn'): shutil.copyfile(ROOT / 'site' / name, out / 'site' / name)
+    for name in ('infra-cost-article.edn', 'security-article.edn', 'org-identity-article.edn', *[x[0] for x in BILINGUAL.values()]): shutil.copyfile(ROOT / 'site' / name, out / 'site' / name)
     lock = out / 'project.ksl'
     lock.write_text('KSL1\nentry /src/site/native/article_page_file.kotoba\nroot /src\n' +
                     ''.join('file ' + sha(out / name) + ' /' + name + '\n' for _, name in sorted(modules, key=lambda x: x[1])))
@@ -126,6 +129,35 @@ def main():
             return {'route': route, 'tag': tag, 'sha256': hashlib.sha256(result).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(check, references))
+        def article_node(html):
+            tree = Tree(); tree.feed(html); tree.close(); found = []
+            def walk(node):
+                if not isinstance(node, list): return
+                if node[0] == 'article' and 'kot-blog-entry' in dict(node[1]).get('class', '').split():
+                    found.append(normalize(node)); return
+                for child in node[2]: walk(child)
+            walk(tree.root)
+            if len(tree.stack) != 1 or len(found) != 1: raise ValueError('expected one bilingual article')
+            return found[0]
+        for route, (_, path) in BILINGUAL.items():
+            base = '/' + path + '/'
+            for tag in ('en', 'ja'):
+                raw = run(binary, route, tag, expected_exit=42)
+                ref = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / path / 'index.html'
+                text = raw.decode()
+                if article_node(text) != article_node(ref.read_text()) or 'href="' + base + '"' not in text or 'href="/ja' + base + '"' not in text or '/ja/ja/' in text or 'freebuf' in text.lower():
+                    raise ValueError(('bilingual page mismatch', route, tag))
+                tree = Tree(); tree.feed(text); tree.close(); html = [n for n in tree.root[2] if isinstance(n, list) and n[0] == 'html']
+                heads = [n for n in html[0][2] if isinstance(n, list) and n[0] == 'head'] if len(html) == 1 else []
+                if len(tree.stack) != 1 or len(html) != 1 or dict(html[0][1]).get('lang') != tag or len(heads) != 1: raise ValueError(('bilingual page structure', route, tag))
+                links = [dict(n[1]) for n in heads[0][2] if isinstance(n, list) and n[0] == 'link']
+                canonical = [x.get('href') for x in links if x.get('rel') == 'canonical']
+                alternates = {(x.get('hreflang'), x.get('href')) for x in links if x.get('rel') == 'alternate' and x.get('hreflang')}
+                origin = 'https://kotoba-lang.org'
+                if canonical != [origin + ('' if tag == 'en' else '/ja') + base] or alternates != {('en', origin + base), ('ja', origin + '/ja' + base)}:
+                    raise ValueError(('bilingual page metadata', route, tag, canonical, alternates))
+                results.append({'route': route, 'tag': tag, 'sha256': hashlib.sha256(raw).hexdigest()})
+            run(binary, route, 'ar', expected_exit=7)
         opening = run(binary, 'opening', 'en', expected_exit=42)
         if chapters(opening.decode(), True) != chapters((ROOT / 'site/dist/index.html').read_text(), False):
             raise ValueError('shared command opening chapters differ')
@@ -193,6 +225,6 @@ def main():
     if any(sha(p) != before[str(p)] for p in tracked): raise ValueError('source changed during gate')
     receipt = {'status':('PASS_NATIVE_ARTICLE_PAGE_LOCALE' if a.tag else 'PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE'), 'testedLocales':selected_tags, 'inputs':before, 'binarySha256':sha(binary),
                'sourceLockSha256':sha(lock), 'observations': results, 'invalidRouteRefused':True, 'invalidTagRefused':True, 'freebuffAbsent':True, 'modifiedInputRefused':True,
-               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'sharedTryPrefixCommandLocales':try_locales, 'sharedTryPrefixMutatedDemoRefused':True, 'sharedClosingCommandChecked':True, 'sharedOpeningCommandChecked':True, 'englishIdentitySourceChecked':True, 'identityMissingLocaleRefused':True, 'correctedIdentitySitemapChecked':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
+               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'bilingualArticleContentAndLinksChecked':True, 'sharedTryPrefixCommandLocales':try_locales, 'sharedTryPrefixMutatedDemoRefused':True, 'sharedClosingCommandChecked':True, 'sharedOpeningCommandChecked':True, 'englishIdentitySourceChecked':True, 'identityMissingLocaleRefused':True, 'correctedIdentitySitemapChecked':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n'); print(receipt['status'])
 if __name__ == '__main__': main()
