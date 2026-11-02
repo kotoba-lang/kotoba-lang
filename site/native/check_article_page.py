@@ -12,6 +12,7 @@ import subprocess
 from check_source_concat import REFS
 from check_footers import Tree, normalize
 from check_home_opening_chapters import chapters
+from check_home_closing_chapter import chapters as closing_chapter
 from concurrent.futures import ThreadPoolExecutor
 from reference_translation import reference_title
 
@@ -64,9 +65,9 @@ def main():
                               (ROOT / 'test/site/native/article_page_file.kotoba', 'src/site/native/article_page_file.kotoba'),
                (sha_source, 'src/multiformats/sha256.kotoba')]
     modules += [(p, path) for p, path, _ in extras]
-    modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['home_opening_page', 'home_opening_chapters', 'home_contents', 'home_section', 'home_deliberate', 'site_command', 'sitemap_page', 'sitemap', 'article_page', 'article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
-    authorities = [ROOT / 'lang' / name for name in ('stack-architecture.edn', 'typed-eval.edn', 'product-defaults.edn', 'surface-status.edn')]
-    tracked += [p for p, _ in modules] + authorities + [ROOT / 'site/native/check_home_opening_chapters.py']
+    modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['home_closing_page', 'home_closing_chapter', 'home_opening_page', 'home_opening_chapters', 'home_contents', 'home_section', 'home_deliberate', 'site_command', 'sitemap_page', 'sitemap', 'article_page', 'article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
+    authorities = [ROOT / 'lang' / name for name in ('stack-architecture.edn', 'typed-eval.edn', 'product-defaults.edn', 'surface-status.edn', 'docs-release.edn', 'wasm-component-platform.edn', 'elaboration-pipeline.edn')] + [ROOT / 'site/sponsorship.edn']
+    tracked += [p for p, _ in modules] + authorities + [ROOT / 'site/native/check_home_opening_chapters.py', ROOT / 'site/native/check_home_closing_chapter.py']
     pages = sorted((ROOT / 'site/dist').rglob('*.html'))
     tracked += pages + [ROOT / 'site/dist/sitemap.xml']
     before = {str(p): sha(p) for p in tracked}
@@ -123,6 +124,10 @@ def main():
         if chapters(opening.decode(), True) != chapters((ROOT / 'site/dist/index.html').read_text(), False):
             raise ValueError('shared command opening chapters differ')
         run(binary, 'opening', '../ja', expected_exit=7)
+        closing = run(binary, 'closing', 'en', expected_exit=42)
+        if closing_chapter(closing.decode(), True) != closing_chapter((ROOT / 'site/dist/index.html').read_text(), False):
+            raise ValueError('shared command closing chapter differs')
+        run(binary, 'closing', '../ja', expected_exit=7)
         identity = run(binary, 'identity', 'en', expected_exit=42)
         identity_text = identity.decode()
         for required in ('<title>Organization identity and verifiable membership on Kotoba Cloud</title>',
@@ -161,6 +166,6 @@ def main():
     if any(sha(p) != before[str(p)] for p in tracked): raise ValueError('source changed during gate')
     receipt = {'status':('PASS_NATIVE_ARTICLE_PAGE_LOCALE' if a.tag else 'PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE'), 'testedLocales':selected_tags, 'inputs':before, 'binarySha256':sha(binary),
                'sourceLockSha256':sha(lock), 'observations': results, 'invalidRouteRefused':True, 'invalidTagRefused':True, 'freebuffAbsent':True, 'modifiedInputRefused':True,
-               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'sharedOpeningCommandChecked':True, 'englishIdentitySourceChecked':True, 'identityMissingLocaleRefused':True, 'correctedIdentitySitemapChecked':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
+               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'sharedClosingCommandChecked':True, 'sharedOpeningCommandChecked':True, 'englishIdentitySourceChecked':True, 'identityMissingLocaleRefused':True, 'correctedIdentitySitemapChecked':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n'); print(receipt['status'])
 if __name__ == '__main__': main()

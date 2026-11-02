@@ -13,7 +13,7 @@ import subprocess
 from check_footers import Tree, normalize, TAGS, ARTICLES
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULES = ['home_closing_chapter', 'home_contents', 'home_section', 'source_concat', 'locale_tree', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders', 'locale_links', 'locale_rebase']
+MODULES = ['home_closing_page', 'home_closing_chapter', 'home_contents', 'home_section', 'source_concat', 'locale_tree', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders', 'locale_links', 'locale_rebase']
 
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -105,17 +105,17 @@ def main():
         image.chmod(0o700)
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(image)], check=True, capture_output=True, timeout=30)
         def check(tag):
-            r = invoke(image, tag, expected=42)
+            r = invoke(image, 'closing', tag, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'index.html'
             if chapters(r.stdout.decode(), True) != chapters(reference.read_text(), False): raise ValueError(('chapter mismatch',tag))
             print(tag, 'closing chapter pass', flush=True)
             return {'tag':tag,'sha256':hashlib.sha256(r.stdout).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool: results = list(pool.map(check, selected))
-        invoke(image, '../ja', expected=7)
+        invoke(image, 'closing', '../ja', expected=7)
         for name in ['generator.cljk',*[x.name for x in authorities]]:
             src=out/name; original=src.read_bytes()
             try:
-                src.write_bytes(original+b' ');invoke(image, 'en', expected=7)
+                src.write_bytes(original+b' ');invoke(image, 'closing', 'en', expected=7)
             finally: src.write_bytes(original)
     finally:
         if fd != 3:
