@@ -59,7 +59,11 @@ def main():
     if {str(p.relative_to(site)):sha(p) for p in site.rglob('*') if p.is_file()}!=wanted:raise ValueError('existing output changed')
     fresh_private,fresh_site,fresh_m=fixture('fresh-roots');run(fresh_private,fresh_site,fresh_m,42)
     if {str(p.relative_to(fresh_site)):sha(p) for p in fresh_site.rglob('*') if p.is_file()}!=wanted:raise ValueError('fresh locale roots mismatch')
+    occupied_private,occupied_site,occupied_m=fixture('occupied-output');(occupied_site/'ta').mkdir();(occupied_site/'uk').mkdir()
+    sentinel=occupied_site/'ta/index.html';sentinel.write_bytes(b'EXISTING PAGE')
+    run(occupied_private,occupied_site,occupied_m,7)
+    if sentinel.read_bytes()!=b'EXISTING PAGE':raise ValueError('occupied output changed')
     if any(sha(Path(p))!=h for p,h in pins.items()):raise ValueError('input drift')
-    receipt={'status':'PASS_NATIVE_START_CARD_STAGE_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'pages':wanted,'existingAndFreshLocaleRoots':True,'badDigestRefused':True,'failedPartialOutputNotStaged':True,'existingStagePreserved':True,'privateImmutableStageRequired':True,'completeSiteGenerated':False,'publicationQualified':False}
+    receipt={'status':'PASS_NATIVE_START_CARD_STAGE_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'pages':wanted,'existingAndFreshLocaleRoots':True,'occupiedLocalePagePreserved':True,'badDigestRefused':True,'failedPartialOutputNotStaged':True,'existingStagePreserved':True,'privateImmutableStageRequired':True,'completeSiteGenerated':False,'publicationQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':main()
