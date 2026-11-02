@@ -75,6 +75,10 @@ Compile it for WebAssembly:
 kotoba compile hello.kotoba --target wasm --output hello.wasm --json
 ```
 
+Specify the target explicitly. The published v0.7.3 CLI defaults to Wasm when
+`--target` is omitted, while the current CLI contract specifies a native
+default; installed releases can differ from the current contract.
+
 Accept only an `emitted` response. For a host-independent execution check,
 follow the published [AI-agent quickstart](https://kotoba-lang.org/agent-quickstart.md),
 which loads the module, rejects unexpected imports, and calls exported `main`.
