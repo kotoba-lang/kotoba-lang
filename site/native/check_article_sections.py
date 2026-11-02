@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TAGS = 'en ar arz bn de es fr hi id ja ko mr pcm pt ru ur zh-Hans'.split()
 ARTICLES = {'infra': ('infra-cost-article.edn', 'blog/infra-cost-measured-path'),
             'security': ('security-article.edn', 'blog/csf2-attack-graphs')}
-MODULES = ['article_section', 'locale_tree', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']
+MODULES = ['article_section', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']
 TEST = ROOT / 'test/site/native/article_sections_file.kotoba'
 DEPS = ROOT / 'site/native/dependencies.json'
 HTML_DEPS = ROOT / 'site/native/html-dependencies.json'
