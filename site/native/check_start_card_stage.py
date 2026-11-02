@@ -51,7 +51,7 @@ def main():
         tokens.write_bytes(original+b' ');run(private,site,m,7)
         if any(p.is_file() for p in site.rglob('*')):raise ValueError('failed head published partial output')
     finally:tokens.write_bytes(original)
-    private,site,m=fixture('good');run(private,site,m,42)
+    private,site,m=fixture('good');(site/'ta').mkdir();(site/'uk').mkdir();run(private,site,m,42)
     wanted={('start' if tag=='en' else tag)+'/index.html':expected[tag] for tag in ('en','ta','uk')}
     actual={str(p.relative_to(site)):sha(p) for p in site.rglob('*') if p.is_file()}
     if actual!=wanted or any(b'freebuff' in p.read_bytes().lower() for p in site.rglob('*.html')):raise ValueError('output mismatch')
