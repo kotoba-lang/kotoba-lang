@@ -57,7 +57,9 @@ def main():
     if actual!=wanted or any(b'freebuff' in p.read_bytes().lower() for p in site.rglob('*.html')):raise ValueError('output mismatch')
     run(private,site,m,7)
     if {str(p.relative_to(site)):sha(p) for p in site.rglob('*') if p.is_file()}!=wanted:raise ValueError('existing output changed')
+    fresh_private,fresh_site,fresh_m=fixture('fresh-roots');run(fresh_private,fresh_site,fresh_m,42)
+    if {str(p.relative_to(fresh_site)):sha(p) for p in fresh_site.rglob('*') if p.is_file()}!=wanted:raise ValueError('fresh locale roots mismatch')
     if any(sha(Path(p))!=h for p,h in pins.items()):raise ValueError('input drift')
-    receipt={'status':'PASS_NATIVE_START_CARD_STAGE_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'pages':wanted,'badDigestRefused':True,'failedPartialOutputNotStaged':True,'existingStagePreserved':True,'privateImmutableStageRequired':True,'completeSiteGenerated':False,'publicationQualified':False}
+    receipt={'status':'PASS_NATIVE_START_CARD_STAGE_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'pages':wanted,'existingAndFreshLocaleRoots':True,'badDigestRefused':True,'failedPartialOutputNotStaged':True,'existingStagePreserved':True,'privateImmutableStageRequired':True,'completeSiteGenerated':False,'publicationQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':main()
