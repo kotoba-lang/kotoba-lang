@@ -43,7 +43,20 @@ def main():
         parser = HeadScripts(); parser.feed(p.read_text())
         matches = [x for x in parser.scripts if x.startswith('var P=new Uint8Array([')]
         if len(matches) != 1: raise ValueError('missing historical hero script')
-        refs.append(matches[0])
+        # The old page is an oracle for the rest of the script. Apply only
+        # the five intentional shader and blending fixes; each historical token is unique.
+        reference = matches[0]
+        replacements = (
+            ('let c=vec2f(u.ux,u.uy)+vec2f(', 'let c=p+(vec2f(u.ux,u.uy)-vec2f(0.5,0.5))+vec2f('),
+            ("buffers:[{arrayStride:4,attributes:", "buffers:[{arrayStride:4,stepMode:'instance',attributes:"),
+            ('vec2 c=u+vec2(', 'vec2 c=a+(u-vec2(0.5))+vec2('),
+            ('(ndc.y*0.5+0.5)*u.h', '(0.5-ndc.y*0.5)*u.h'),
+            ('gl.useProgram(prog);var buf=', 'gl.useProgram(prog);gl.enable(gl.BLEND);gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);var buf='),
+        )
+        for before, after in replacements:
+            if reference.count(before) != 1: raise ValueError('historical shader form changed')
+            reference = reference.replace(before, after)
+        refs.append(reference)
     if refs[0] != refs[1]: raise ValueError('historical point tables differ')
     hero = ROOT / 'site/src/kotoba/site/hero.cljk'
     if sha(hero) != 'f324125c00d1135da1432bab4eaec186c56ece61f222329ea7de8cee897693fa': raise ValueError('hero source pin mismatch')
