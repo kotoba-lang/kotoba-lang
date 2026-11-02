@@ -20,7 +20,7 @@ def main():
     compiler,packager=(p.resolve(strict=True) for p in (a.compiler,a.packager))
     for p in (compiler,packager):subprocess.run(['/usr/bin/codesign','--verify','--strict',str(p)],check=True,capture_output=True,timeout=30)
     pages=sorted((ROOT/'site/dist').rglob('*.html'));reference=ROOT/'site/dist/sitemap.xml'
-    sources=[(ROOT/'site/native/sitemap.kotoba','src/site/native/sitemap.kotoba'),(ROOT/'test/site/native/sitemap_file.kotoba','src/site/native/sitemap_file.kotoba')]
+    sources=[(ROOT/'site/native/sitemap.kotoba','src/site/native/sitemap.kotoba'),(ROOT/'site/native/sitemap_page.kotoba','src/site/native/sitemap_page.kotoba'),(ROOT/'test/site/native/sitemap_file.kotoba','src/site/native/sitemap_file.kotoba')]
     tracked=[compiler,packager,reference,Path(__file__).resolve(),*[p for p,_ in sources],*pages];pins={str(p):sha(p) for p in tracked}
     out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     for p,dest in sources:
