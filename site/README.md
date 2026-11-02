@@ -7,7 +7,7 @@ stay in the browser and no telemetry is emitted.
 
 ## What makes this page different from a README
 
-`generate.cljs` **derives the language claims from this repository's own authority files**
+`generate.cljk` **derives the language claims from this repository's own authority files**
 rather than restating them in prose. The eight safety claims and their residual
 risks, the deliberately-absent surface, the elaboration pipeline, the deny
 rules, the Component Model / WASI pins and the identity non-goals are all read
@@ -320,7 +320,7 @@ still exactly the file's bytes.
 
 ## The `Fastest` claim on the first screen
 
-`cold-start` in `generate.cljs` derives it once, from
+`cold-start` in `generate.cljk` derives it once, from
 `bench/public-build-scaling/latest.json`. Four of the five public reports
 record a **failed** quiet-host gate and therefore may not rank anything, and
 the page says so next to each of them. The build-scaling report is the
