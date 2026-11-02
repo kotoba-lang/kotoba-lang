@@ -1,5 +1,22 @@
 # Agent rules
 
+## Product introduction and performance evidence
+
+Describe Kotoba as the language at the heart of a modern Lisp machine in
+development: programs as data, composable forms and a system people can
+understand are central to its Lisp heritage. Amu owns compilation, Kototama
+the execution contract and AIUEOS the OS direction. Distinguish aspirations
+such as live system modification from functionality established by code.
+
+The 2026-10-15 Apple M4 Embench observation is 0.80× C execution time over
+19 translated ports for one compiler snapshot and one sample per workload;
+the measured path includes audited algorithm substitutions. It is not a
+released-toolchain result, a certified score or a universal speed ranking.
+Keep those limits beside the comparison and link the audit:
+https://kotoba-lang.org/blog/embench-c-parity-20261015/.
+Do not claim that all targets, the complete machine, or independent-user
+release qualification are ready based on this observation.
+
 ## Extension discovery
 
 Discover published Kotoba skills and MCP definitions through
