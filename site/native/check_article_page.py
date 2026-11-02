@@ -13,6 +13,8 @@ from check_source_concat import REFS
 from check_footers import Tree, normalize
 from check_home_opening_chapters import chapters
 from check_home_closing_chapter import chapters as closing_chapter
+from check_home_try_prefix import chapter_rules, nav as code_nav
+from check_home_start import nav as start_nav
 from concurrent.futures import ThreadPoolExecutor
 from reference_translation import reference_title
 
@@ -24,13 +26,15 @@ FILES = [('resources/jp_go_dds/dds.css','dds.css'), ('resources/jp_go_dds/compon
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    for name in ('compiler', 'packager', 'sha256-source', 'dds-root', 'css-source', 'json-source', 'theme-json', 'html-core', 'html-hiccup', 'dds-button', 'dds-theme', 'dds-selector', 'dds-components', 'dds-table', 'output'):
+    for name in ('compiler', 'packager', 'sha256-source', 'dds-root', 'css-source', 'json-source', 'theme-json', 'html-core', 'html-hiccup', 'dds-button', 'dds-theme', 'dds-selector', 'dds-components', 'dds-table', 'grammar-source', 'tokenizer-source', 'output'):
         ap.add_argument('--' + name, type=Path, required=True)
     ap.add_argument('--tag', choices=TAGS, help='qualify only this locale; default checks all locales')
     a = ap.parse_args()
     selected_tags = [a.tag] if a.tag else TAGS
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'): raise ValueError('requires native macOS ARM64')
-    compiler, packager, sha_source, dds, css_source, json_source, theme_json, html_core, html_hiccup, button, theme, selector, components, table = [p.resolve(strict=True) for p in (a.compiler, a.packager, a.sha256_source, a.dds_root, a.css_source, a.json_source, a.theme_json, a.html_core, a.html_hiccup, a.dds_button, a.dds_theme, a.dds_selector, a.dds_components, a.dds_table)]
+    compiler, packager, sha_source, dds, css_source, json_source, theme_json, html_core, html_hiccup, button, theme, selector, components, table, grammar, tokenizer = [p.resolve(strict=True) for p in (a.compiler, a.packager, a.sha256_source, a.dds_root, a.css_source, a.json_source, a.theme_json, a.html_core, a.html_hiccup, a.dds_button, a.dds_theme, a.dds_selector, a.dds_components, a.dds_table, a.grammar_source, a.tokenizer_source)]
+    grammar_spec = json.loads((ROOT / 'site/native/highlight-source-dependencies.json').read_text())['grammar']
+    if sha(grammar) != grammar_spec['catalogSha256'] or sha(tokenizer) != grammar_spec['tokenizerSha256']: raise ValueError('highlight source drift')
     spec = json.loads(PINS.read_text()); deps = json.loads((ROOT / 'site/native/dependencies.json').read_text())
     sources = [(dds / path, name) for path, name in FILES]
     if (spec['schema'] != 'kotoba.site.native-css-source-dependencies.v1' or
@@ -65,8 +69,9 @@ def main():
                               (ROOT / 'test/site/native/article_page_file.kotoba', 'src/site/native/article_page_file.kotoba'),
                (sha_source, 'src/multiformats/sha256.kotoba')]
     modules += [(p, path) for p, path, _ in extras]
-    modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['home_closing_page', 'home_closing_chapter', 'home_opening_page', 'home_opening_chapters', 'home_contents', 'home_section', 'home_deliberate', 'site_command', 'sitemap_page', 'sitemap', 'article_page', 'article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
+    modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['home_try_prefix_page', 'home_try_prefix', 'home_start', 'home_code_play', 'home_highlight', 'home_play', 'home_closing_page', 'home_closing_chapter', 'home_opening_page', 'home_opening_chapters', 'home_contents', 'home_section', 'home_deliberate', 'site_command', 'sitemap_page', 'sitemap', 'article_page', 'article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
     authorities = [ROOT / 'lang' / name for name in ('stack-architecture.edn', 'typed-eval.edn', 'product-defaults.edn', 'surface-status.edn', 'docs-release.edn', 'wasm-component-platform.edn', 'elaboration-pipeline.edn')] + [ROOT / 'site/sponsorship.edn']
+    tracked += [grammar, tokenizer, ROOT / 'site/native/highlight-source-dependencies.json', ROOT / 'site/src/kotoba/site/locales.cljk', ROOT / 'site/assets/play/double-21.kotoba', ROOT / 'site/assets/play/double-21.wasm', ROOT / 'site/assets/play/double-21.wasm.provenance.edn', ROOT / 'site/native/check_home_try_prefix.py', ROOT / 'site/native/check_home_start.py', ROOT / 'site/native/check_home_code_play.py']
     tracked += [p for p, _ in modules] + authorities + [ROOT / 'site/native/check_home_opening_chapters.py', ROOT / 'site/native/check_home_closing_chapter.py']
     pages = sorted((ROOT / 'site/dist').rglob('*.html'))
     tracked += pages + [ROOT / 'site/dist/sitemap.xml']
@@ -79,6 +84,7 @@ def main():
     shutil.copyfile(ROOT / 'site/generate.cljk', out / 'generator.cljk')
     for authority in authorities: shutil.copyfile(authority, out / authority.name)
     shutil.copyfile(theme_json, out / 'theme.json')
+    for src, name in ((grammar, 'grammar.edn'), (tokenizer, 'highlight.cljk'), (ROOT / 'site/src/kotoba/site/locales.cljk', 'locales.cljk'), (ROOT / 'site/assets/play/double-21.kotoba', 'play.kotoba'), (ROOT / 'site/assets/play/double-21.wasm', 'play.wasm'), (ROOT / 'site/assets/play/double-21.wasm.provenance.edn', 'provenance.edn')): shutil.copyfile(src, out / name)
     (out / 'site/i18n').mkdir(parents=True, exist_ok=True)
     for tag in TAGS: shutil.copyfile(ROOT / 'site/i18n' / (tag + '.json'), out / 'site/i18n' / (tag + '.json'))
     for name in ('infra-cost-article.edn', 'security-article.edn', 'org-identity-article.edn'): shutil.copyfile(ROOT / 'site' / name, out / 'site' / name)
@@ -128,6 +134,23 @@ def main():
         if closing_chapter(closing.decode(), True) != closing_chapter((ROOT / 'site/dist/index.html').read_text(), False):
             raise ValueError('shared command closing chapter differs')
         run(binary, 'closing', '../ja', expected_exit=7)
+        def check_try_prefix(tag):
+            result = run(binary, 'try-prefix', tag, expected_exit=42).decode()
+            reference = (ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'index.html').read_text()
+            cat = json.loads((ROOT / 'site/i18n' / (tag + '.json')).read_text())
+            if chapter_rules(result) != chapter_rules(reference)[3:4] or any(start_nav(result, True, name) != start_nav(reference, False, name) for name in ('start', 'docs')) or code_nav(result, True, 'code', cat) != code_nav(reference, False, 'code', cat):
+                raise ValueError(('shared command try prefix differs', tag))
+            print('try-prefix', tag, 'pass', flush=True)
+            return tag
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            try_locales = list(pool.map(check_try_prefix, TAGS))
+        run(binary, 'try-prefix', '../ja', expected_exit=7)
+        demo = out / 'play.wasm'; original_demo = demo.read_bytes()
+        try:
+            demo.write_bytes(original_demo + b' ')
+            run(binary, 'try-prefix', 'en', expected_exit=7)
+        finally:
+            demo.write_bytes(original_demo)
         identity = run(binary, 'identity', 'en', expected_exit=42)
         identity_text = identity.decode()
         for required in ('<title>Organization identity and verifiable membership on Kotoba Cloud</title>',
@@ -166,6 +189,6 @@ def main():
     if any(sha(p) != before[str(p)] for p in tracked): raise ValueError('source changed during gate')
     receipt = {'status':('PASS_NATIVE_ARTICLE_PAGE_LOCALE' if a.tag else 'PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE'), 'testedLocales':selected_tags, 'inputs':before, 'binarySha256':sha(binary),
                'sourceLockSha256':sha(lock), 'observations': results, 'invalidRouteRefused':True, 'invalidTagRefused':True, 'freebuffAbsent':True, 'modifiedInputRefused':True,
-               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'sharedClosingCommandChecked':True, 'sharedOpeningCommandChecked':True, 'englishIdentitySourceChecked':True, 'identityMissingLocaleRefused':True, 'correctedIdentitySitemapChecked':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
+               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'sharedTryPrefixCommandLocales':try_locales, 'sharedTryPrefixMutatedDemoRefused':True, 'sharedClosingCommandChecked':True, 'sharedOpeningCommandChecked':True, 'englishIdentitySourceChecked':True, 'identityMissingLocaleRefused':True, 'correctedIdentitySitemapChecked':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n'); print(receipt['status'])
 if __name__ == '__main__': main()
