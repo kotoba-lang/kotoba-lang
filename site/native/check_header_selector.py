@@ -114,6 +114,26 @@ def main():
             return {'page': name, 'tag': tag, 'sha256': hashlib.sha256(r.stdout).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(check, [(tag, name) for tag in TAGS for name in ARTICLES]))
+        bilingual = {'parity': '/blog/embench-c-parity-20261015/',
+                     'progress': '/blog/embench-progress-20261012/',
+                     'usage': '/blog/kotoba-murakumo-how-to-use-20261015/'}
+        for name, route in bilingual.items():
+            for tag in ('en', 'ja'):
+                rendered = invoke(image, name, tag, expected=42).stdout.decode()
+                selector_tree = Tree(); selector_tree.feed(rendered); selector_tree.close()
+                if len(selector_tree.stack) != 1: raise ValueError(('invalid bilingual selector', name, tag))
+                def hrefs(node):
+                    found = []
+                    if isinstance(node, list):
+                        if node[0] == 'a':
+                            href = dict(node[1]).get('href', '')
+                            if '/blog/' in href: found.append(href)
+                        for child in node[2]: found.extend(hrefs(child))
+                    return found
+                actual = hrefs(selector_tree.root)
+                if sorted(actual) != sorted([route, '/ja' + route]): raise ValueError(('bilingual links', name, tag, actual))
+                results.append({'page': name, 'tag': tag, 'sha256': hashlib.sha256(rendered.encode()).hexdigest()})
+            invoke(image, name, 'ar', expected=7)
         invoke(image, 'infra', '../ja', expected=7)
         invoke(image, 'unknown', 'en', expected=7)
 
@@ -128,7 +148,7 @@ def main():
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source changed during gate')
     receipt = {'status': 'PASS_NATIVE_HEADER_SELECTOR', 'inputs': pins, 'sourceLockSha256': sha(lock),
-               'binarySha256': sha(image), 'observations': results, 'invalidPathsRefused': True,
+               'binarySha256': sha(image), 'observations': results, 'bilingualSelectorLinksQualified': True, 'invalidPathsRefused': True,
                 'completeHeader': False, 'siteGenerated': False,
                'translationQualityQualified': False, 'publicationQualified': False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
