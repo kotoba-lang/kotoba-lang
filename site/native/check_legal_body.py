@@ -15,7 +15,7 @@ from legal_reference import legal_reference
 from check_footers import Tree, normalize, TAGS, ARTICLES, sections
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULES = ['legal_body', 'legal_main', 'home_section', 'source_concat', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']
+MODULES = ['legal_body_page', 'legal_body', 'legal_main', 'home_section', 'source_concat', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']
 
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()

@@ -40,7 +40,7 @@ def main():
     for p in (compiler,packager): subprocess.run(['/usr/bin/codesign','--verify','--strict',str(p)],check=True,capture_output=True,timeout=30)
     for d,n in ((head_dir,'head.macho'),(body_dir,'nav.macho')):
         if sha(d/n)!=json.loads((d/'receipt.json').read_text())['binarySha256']: raise ValueError('component binary drift')
-    modules=[(ROOT/'site/native/home_document.kotoba','src/site/native/home_document.kotoba'),(ROOT/'test/site/native/legal_document_file.kotoba','src/site/native/legal_document_file.kotoba'),(source,'src/multiformats/sha256.kotoba')]
+    modules=[(ROOT/'site/native/legal_document_page.kotoba','src/site/native/legal_document_page.kotoba'),(ROOT/'site/native/home_document.kotoba','src/site/native/home_document.kotoba'),(ROOT/'test/site/native/legal_document_file.kotoba','src/site/native/legal_document_file.kotoba'),(source,'src/multiformats/sha256.kotoba')]
     tracked=[compiler,packager,ROOT/'site/native/dependencies.json',Path(__file__).resolve(),*[p for p,_ in modules],head_dir/'receipt.json',head_dir/'head.macho',body_dir/'receipt.json',body_dir/'nav.macho']
     pins={str(p):sha(p) for p in tracked};out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     for p,n in modules:
