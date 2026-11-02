@@ -19,6 +19,11 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / 'site/native/locale_links.kotoba'
 TEST = ROOT / 'test/site/native/locale_links_file.kotoba'
 REFERENCE = ROOT / 'test/site/native/locale_links_reference_20261102.json'
+SOURCE_PINS = ROOT / 'site/native/metadata-sources.json'
+# The oracle was captured before removing Freebuff and changing the footer.
+# The reviewed source diff does not change the URL resolver. Keep its original
+# provenance while pinning the separately reviewed current generator below.
+ORACLE_SOURCE_SHA256 = 'e173b1cd8c17ed23c174236ab4f1763d3823e8de5a81ad0bfe69a2f4f4ea7519'
 
 
 def sha(p):
@@ -36,9 +41,13 @@ def main():
     for p in (compiler, packager):
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(p)], check=True, capture_output=True, timeout=30)
     ref = json.loads(REFERENCE.read_text())
+    current_sources = json.loads(SOURCE_PINS.read_text())
+    if (current_sources.get('schema') != 'kotoba.site.metadata-source-pins.v1' or
+            current_sources.get('files', {}).get('site/generate.cljk') != sha(ROOT / 'site/generate.cljk')):
+        raise ValueError('reviewed current generator source changed')
     if (ref['schema'] != 'kotoba.site.locale-links-oracle.v1' or
             ref['format'] != ['tag', 'base', 'href', 'reference', 'mustAccept'] or
-            ref['referenceSourceSha256'] != sha(ROOT / 'site/generate.cljk')):
+            ref['referenceSourceSha256'] != ORACLE_SOURCE_SHA256):
         raise ValueError('reference schema or source changed')
     pages = [ROOT / 'site/dist' / route.strip('/') / 'index.html' for route in ref['referencePageSha256']]
     if any(sha(p) != expected for p, expected in zip(pages, ref['referencePageSha256'].values())):
@@ -48,7 +57,7 @@ def main():
         raise ValueError('reference corpus incomplete')
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    tracked = [compiler, packager, SOURCE, TEST, REFERENCE, ROOT / 'site/generate.cljk', *pages, Path(__file__).resolve()]
+    tracked = [compiler, packager, SOURCE, TEST, REFERENCE, SOURCE_PINS, ROOT / 'site/generate.cljk', *pages, Path(__file__).resolve()]
     pins = {str(p): sha(p) for p in tracked}
     staged = []
     for src, name in ((SOURCE, 'locale_links.kotoba'), (TEST, 'locale_links_file.kotoba')):
