@@ -16,6 +16,8 @@ import re
 import shutil
 import subprocess
 
+from reference_translation import reference_title
+
 ROOT = Path(__file__).resolve().parents[2]
 TAGS = 'en ar arz bn de es fr hi id ja ko mr pcm pt ru ur zh-Hans'.split()
 ARTICLES = {'infra': ('infra-cost-article.edn', 'blog/infra-cost-measured-path'),
@@ -133,7 +135,7 @@ def main():
     articles = [ROOT / 'site' / v[0] for v in ARTICLES.values()]
     references = [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
                   for tag in TAGS for _, route in ARTICLES.values()]
-    tracked = [compiler, packager, DEPS, HTML_DEPS, SOURCE_PINS, *[ROOT / name for name in expected_sources], *[p for p, _ in source],
+    tracked = [ROOT / 'site/native/reference_translation.py', compiler, packager, DEPS, HTML_DEPS, SOURCE_PINS, *[ROOT / name for name in expected_sources], *[p for p, _ in source],
                *catalogs, *articles, *references, Path(__file__).resolve()]
     pins = {str(p): sha(p) for p in tracked}
     for src, relative in source:
@@ -188,7 +190,7 @@ def main():
             r = invoke(image, name, tag, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
             actual_sections = sections(r.stdout.decode('utf-8'), False)
-            reference_sections = sections(reference.read_text(), True)
+            reference_sections = sections(reference_title(reference.read_text(), tag), True)
             if actual_sections != reference_sections:
                 raise ValueError(('metadata mismatch', name, tag))
             output = out / (name + '-' + tag + '.html')

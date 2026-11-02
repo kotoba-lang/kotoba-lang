@@ -12,6 +12,8 @@ import subprocess
 from check_source_concat import REFS
 from check_footers import Tree, normalize
 from concurrent.futures import ThreadPoolExecutor
+from reference_translation import reference_title
+
 ROOT = Path(__file__).resolve().parents[2]
 PINS = ROOT / 'site/native/css-source-dependencies.json'
 TAGS = 'en ar arz bn de es fr hi id ja ko mr pcm pt ru ur zh-Hans'.split()
@@ -44,7 +46,7 @@ def main():
     for binary in (compiler, packager):
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(binary)], check=True, capture_output=True, timeout=30)
     references = [(tag, route, ROOT / 'site/dist' / ('' if tag == 'en' else tag) / path / 'index.html') for tag in TAGS for route, path in (('infra', 'blog/infra-cost-measured-path'), ('security', 'blog/csf2-attack-graphs'))]
-    tracked = [*[p for p, _, _ in extras], ROOT / 'site/native/html-dependencies.json', ROOT / 'site/native/header-dependencies.json', ROOT / 'site/native/dds-dependencies.json', *[ROOT / 'site/i18n' / (t + '.json') for t in TAGS], *[p for _, _, p in references], ROOT / 'site/infra-cost-article.edn', ROOT / 'site/security-article.edn', compiler, packager, sha_source, json_source, theme_json, dds / 'src/jp_go_dds/theme_toggle.cljk', ROOT / 'site/generate.cljk', ROOT / 'site/native/metadata-sources.json', *[p for p, _ in sources], PINS, ROOT / 'site/native/dependencies.json',
+    tracked = [ROOT / 'site/native/reference_translation.py', *[p for p, _, _ in extras], ROOT / 'site/native/html-dependencies.json', ROOT / 'site/native/header-dependencies.json', ROOT / 'site/native/dds-dependencies.json', *[ROOT / 'site/i18n' / (t + '.json') for t in TAGS], *[p for _, _, p in references], ROOT / 'site/infra-cost-article.edn', ROOT / 'site/security-article.edn', compiler, packager, sha_source, json_source, theme_json, dds / 'src/jp_go_dds/theme_toggle.cljk', ROOT / 'site/generate.cljk', ROOT / 'site/native/metadata-sources.json', *[p for p, _ in sources], PINS, ROOT / 'site/native/dependencies.json',
                ROOT / 'site/native/check_source_concat.py', *REFS, Path(__file__).resolve()]
     modules = [(ROOT / 'site/native/dds_base_css.kotoba', 'src/site/native/dds_base_css.kotoba'),
                (ROOT / 'site/native/dds_ext_css.kotoba', 'src/site/native/dds_ext_css.kotoba'),
@@ -103,7 +105,7 @@ def main():
             result = run(binary, route, tag, expected_exit=42)
             if b'freebuff' in result.lower() or b'bfcid' in result.lower(): raise ValueError('telemetry in generated page')
             actual = Tree(); actual.feed(result.decode()); actual.close()
-            expected = Tree(); expected.feed(reference.read_text().replace('site/generate.cljk', 'site/native/article_body.kotoba')); expected.close()
+            expected = Tree(); expected.feed(reference_title(reference.read_text(), tag).replace('site/generate.cljk', 'site/native/article_body.kotoba')); expected.close()
             remove_old_freebuff(expected.root)
             if len(actual.stack) != 1 or normalize(actual.root) != normalize(expected.root): raise ValueError(('complete article DOM differs', route, tag))
             print(route, tag, 'page pass', flush=True)

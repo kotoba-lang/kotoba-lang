@@ -12,6 +12,8 @@ import shutil
 import subprocess
 from check_footers import Tree, normalize, TAGS, ARTICLES
 
+from reference_translation import reference_title
+
 ROOT = Path(__file__).resolve().parents[2]
 MODULES = ['article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']
 
@@ -68,7 +70,7 @@ def main():
     catalogs = [ROOT / 'site/i18n' / (tag + '.json') for tag in TAGS]
     references = [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
                   for tag in TAGS for _, route in ARTICLES.values()]
-    tracked = [compiler, packager, deps, html_deps, button_deps, source_pins, dds_deps, ROOT / 'site/generate.cljk',
+    tracked = [ROOT / 'site/native/reference_translation.py', compiler, packager, deps, html_deps, button_deps, source_pins, dds_deps, ROOT / 'site/generate.cljk',
                *[p for p, _ in source], *catalogs, *articles, *references, Path(__file__).resolve(), ROOT / 'site/native/check_footers.py']
     pins = {str(p): sha(p) for p in tracked}
     for src, relative in source:
@@ -117,7 +119,7 @@ def main():
             _, route = ARTICLES[name]
             r = invoke(image, name, tag, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
-            expected_html = reference.read_text().replace('site/generate.cljk', 'site/native/article_body.kotoba')
+            expected_html = reference_title(reference.read_text(), tag).replace('site/generate.cljk', 'site/native/article_body.kotoba')
             if nav(r.stdout.decode(), True) != nav(expected_html, False):
                 raise ValueError(('navigation DOM mismatch', name, tag))
             print(name, tag, 'navigation pass', flush=True)
