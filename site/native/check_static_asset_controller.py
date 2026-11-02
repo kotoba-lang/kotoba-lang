@@ -39,7 +39,8 @@ def main():
                 ('', 'agent-quickstart.md', assets/'agent-quickstart.md'),
                 ('', 'llms.txt', assets/'llms.txt'), ('', 'llms-full.txt', assets/'llms-full.txt'),
                 ('.well-known', 'security.txt', assets/'security.txt'),
-                ('anatomy', 'light.html', assets/'anatomy/kotoba-murakumo-light.html')]
+                ('anatomy/kotoba-murakumo', 'light.html', assets/'anatomy/kotoba-murakumo-light.html'),
+                ('anatomy/kotoba-murakumo', 'index.html', assets/'anatomy/kotoba-murakumo.html')]
     mappings += [('play', p.name, p) for p in sorted((assets/'play').iterdir()) if p.is_file()]
     mappings += [('ipfs', p.name, p) for p in sorted((assets/'ipfs').iterdir()) if p.is_file()]
     mappings += [('ipfs', 'bafkreiaeohkv2zuo2x4yq745euqm5wijrub5xpkxbbw5gre6tdp3sxzonm', assets/'play/double-21.kotoba')]
@@ -59,12 +60,18 @@ def main():
         ('build-scaling-latest.json','public-build-scaling'),('compile-wasm-latest.json','public-compile-comparison'),
         ('domains-latest.json','public-domain-comparison'),('end-to-end-latest.json','public-end-to-end-comparison'),
         ('runtime-native-latest.json','public-runtime-comparison'))]
+    anatomy_refs=[ROOT/'site/dist/anatomy/kotoba-murakumo'/n for n in ('index.html','light.html')]
+    # Historical generated pages independently fix these two public routes;
+    # their source files are copied by site/generate.cljk, not generated HTML.
+    for name,src in (('index.html',assets/'anatomy/kotoba-murakumo.html'),('light.html',assets/'anatomy/kotoba-murakumo-light.html')):
+        ref=ROOT/'site/dist/anatomy/kotoba-murakumo'/name
+        if sha(src)!=sha(ref):raise ValueError(('anatomy reference drift',name))
     if len({(group, name) for group, name, _ in mappings}) != len(mappings):
         raise ValueError('duplicate destination')
     modules = [(ROOT/'site/native/static_asset_controller.kotoba', 'src/site/native/static_asset_controller.kotoba'),
                (ROOT/'test/site/native/static_asset_controller_file.kotoba', 'src/site/native/static_asset_controller_file.kotoba'),
                (source, 'src/multiformats/sha256.kotoba')]
-    tracked = [compiler, packager, source, stager, stager_dir/'receipt.json', deps, Path(__file__).resolve(), *[p for p, _ in modules], *[p for _, _, p in mappings]]
+    tracked = [compiler, packager, source, stager, stager_dir/'receipt.json', deps, Path(__file__).resolve(), *[p for p, _ in modules], *[p for _, _, p in mappings], *anatomy_refs]
     pins = {str(p): sha(p) for p in tracked}
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=False)
     for p, name in modules:
