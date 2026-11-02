@@ -22,6 +22,9 @@ ROOT = Path(__file__).resolve().parents[2]
 TAGS = 'en ar arz bn de es fr hi id ja ko mr pcm pt ru ur zh-Hans'.split()
 ARTICLES = {'infra': ('infra-cost-article.edn', 'blog/infra-cost-measured-path'),
             'security': ('security-article.edn', 'blog/csf2-attack-graphs')}
+BILINGUAL = {'parity': ('embench-c-parity-article.edn', 'blog/embench-c-parity-20261015'),
+             'progress': ('embench-progress-article.edn', 'blog/embench-progress-20261012'),
+             'usage': ('usage-article.edn', 'blog/kotoba-murakumo-how-to-use-20261015')}
 MODULES = ['page_metadata', 'locale_links', 'locale_message', 'locale_catalog', 'locale_placeholders']
 TEST = ROOT / 'test/site/native/page_metadata_file.kotoba'
 DEPS = ROOT / 'site/native/dependencies.json'
@@ -132,9 +135,11 @@ def main():
     source += [(TEST, 'src/site/native/page_metadata_file.kotoba'), (sha_source, 'src/multiformats/sha256.kotoba'),
                (core, 'src/html_core.kotoba'), (hiccup, 'src/html_hiccup.kotoba')]
     catalogs = [ROOT / 'site/i18n' / (tag + '.json') for tag in TAGS]
-    articles = [ROOT / 'site' / v[0] for v in ARTICLES.values()]
+    articles = [ROOT / 'site' / v[0] for v in (*ARTICLES.values(), *BILINGUAL.values())]
     references = [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
                   for tag in TAGS for _, route in ARTICLES.values()]
+    references += [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
+                   for tag in ('en', 'ja') for _, route in BILINGUAL.values()]
     tracked = [ROOT / 'site/native/reference_translation.py', compiler, packager, DEPS, HTML_DEPS, SOURCE_PINS, *[ROOT / name for name in expected_sources], *[p for p, _ in source],
                *catalogs, *articles, *references, Path(__file__).resolve()]
     pins = {str(p): sha(p) for p in tracked}
@@ -200,6 +205,25 @@ def main():
 
         with ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(check, [(tag, name) for tag in TAGS for name in ARTICLES]))
+        for name, (_, route) in BILINGUAL.items():
+            base = '/' + route + '/'
+            for tag in ('en', 'ja'):
+                raw = invoke(image, name, tag, expected=42).stdout
+                actual = Tree(); actual.feed(raw.decode()); actual.close()
+                reference = Tree(); reference.feed((ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html').read_text()); reference.close()
+                ah, rh = find_head(actual.root), find_head(reference.root)
+                def title(head):
+                    return [''.join(x[2]) for x in head[2] if isinstance(x, list) and x[0] == 'title']
+                def description(head):
+                    return [dict(x[1]).get('content') for x in head[2] if isinstance(x, list) and x[0] == 'meta' and dict(x[1]).get('name') == 'description']
+                links = [dict(x[1]) for x in ah[2] if isinstance(x, list) and x[0] == 'link']
+                canonical = [x.get('href') for x in links if x.get('rel') == 'canonical']
+                alternates = {(x.get('hreflang'), x.get('href')) for x in links if x.get('rel') == 'alternate' and x.get('hreflang')}
+                origin = 'https://kotoba-lang.org'
+                if title(ah) != title(rh) or description(ah) != description(rh) or canonical != [origin + ('' if tag == 'en' else '/ja') + base] or alternates != {('en', origin + base), ('ja', origin + '/ja' + base)}:
+                    raise ValueError(('bilingual metadata mismatch', name, tag, canonical, alternates))
+                results.append({'article': name, 'tag': tag, 'outputSha256': hashlib.sha256(raw).hexdigest()})
+            invoke(image, name, 'ar', expected=7)
         invoke(image, 'infra', '../ja', expected=7)
         article = out / 'site/infra-cost-article.edn'
         original_article = article.read_bytes()
@@ -232,7 +256,7 @@ def main():
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source, catalog, reference or compiler changed during gate')
     receipt = {'status': 'PASS_NATIVE_SOURCE_PAGE_METADATA', 'inputs': pins, 'sourceLockSha256': sha(lock),
-               'binarySha256': sha(image), 'observations': results, 'emptyCatalogRefused': True, 'invalidTagRefused': True, 'sourceTitleMutationDetected': True, 'referenceIsExistingDist': True,
+               'binarySha256': sha(image), 'observations': results, 'bilingualCanonicalAlternatesChecked': True, 'emptyCatalogRefused': True, 'invalidTagRefused': True, 'sourceTitleMutationDetected': True, 'referenceIsExistingDist': True,
                'completeHeadGenerated': False, 'fullPageGenerated': False, 'siteGenerated': False, 'translationQualityQualified': False,
                'publicationQualified': False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
