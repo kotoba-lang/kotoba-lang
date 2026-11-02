@@ -52,9 +52,16 @@ def main():
     pages = [ROOT / 'site/dist' / route.strip('/') / 'index.html' for route in ref['referencePageSha256']]
     if any(sha(p) != expected for p, expected in zip(pages, ref['referencePageSha256'].values())):
         raise ValueError('reference page changed')
-    cases = ref['cases']
+    cases = list(ref['cases'])
     if len(cases) < 1800 or sum(x[4] is False for x in cases) != 9:
         raise ValueError('reference corpus incomplete')
+    # New bilingual-only routes have no corrected legacy reference. Assert
+    # their intended en/ja routing independently, preserving the old corpus.
+    for path in ('/blog/embench-c-parity-20261015/', '/blog/embench-progress-20261012/', '/blog/kotoba-murakumo-how-to-use-20261015/'):
+        cases += [['ja', path, '?x=1', '/ja'+path+'?x=1', True],
+                  ['ja', path, '/legal/', '/ja/legal/', True],
+                  ['ar', path, '#top', '', False],
+                  ['ja', '/blog/', path, path, True]]
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     tracked = [compiler, packager, SOURCE, TEST, REFERENCE, SOURCE_PINS, ROOT / 'site/generate.cljk', *pages, Path(__file__).resolve()]
