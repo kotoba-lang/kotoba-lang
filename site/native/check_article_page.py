@@ -24,7 +24,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ('compiler', 'packager', 'sha256-source', 'dds-root', 'css-source', 'json-source', 'theme-json', 'html-core', 'html-hiccup', 'dds-button', 'dds-theme', 'dds-selector', 'dds-components', 'dds-table', 'output'):
         ap.add_argument('--' + name, type=Path, required=True)
+    ap.add_argument('--tag', choices=TAGS, help='qualify only this locale; default checks all locales')
     a = ap.parse_args()
+    selected_tags = [a.tag] if a.tag else TAGS
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'): raise ValueError('requires native macOS ARM64')
     compiler, packager, sha_source, dds, css_source, json_source, theme_json, html_core, html_hiccup, button, theme, selector, components, table = [p.resolve(strict=True) for p in (a.compiler, a.packager, a.sha256_source, a.dds_root, a.css_source, a.json_source, a.theme_json, a.html_core, a.html_hiccup, a.dds_button, a.dds_theme, a.dds_selector, a.dds_components, a.dds_table)]
     spec = json.loads(PINS.read_text()); deps = json.loads((ROOT / 'site/native/dependencies.json').read_text())
@@ -45,7 +47,7 @@ def main():
     if any(sha(p) != digest for p, _, digest in extras): raise ValueError('HTML source drift')
     for binary in (compiler, packager):
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(binary)], check=True, capture_output=True, timeout=30)
-    references = [(tag, route, ROOT / 'site/dist' / ('' if tag == 'en' else tag) / path / 'index.html') for tag in TAGS for route, path in (('infra', 'blog/infra-cost-measured-path'), ('security', 'blog/csf2-attack-graphs'))]
+    references = [(tag, route, ROOT / 'site/dist' / ('' if tag == 'en' else tag) / path / 'index.html') for tag in selected_tags for route, path in (('infra', 'blog/infra-cost-measured-path'), ('security', 'blog/csf2-attack-graphs'))]
     tracked = [ROOT / 'site/native/reference_translation.py', *[p for p, _, _ in extras], ROOT / 'site/native/html-dependencies.json', ROOT / 'site/native/header-dependencies.json', ROOT / 'site/native/dds-dependencies.json', *[ROOT / 'site/i18n' / (t + '.json') for t in TAGS], *[p for _, _, p in references], ROOT / 'site/infra-cost-article.edn', ROOT / 'site/security-article.edn', compiler, packager, sha_source, json_source, theme_json, dds / 'src/jp_go_dds/theme_toggle.cljk', ROOT / 'site/generate.cljk', ROOT / 'site/native/metadata-sources.json', *[p for p, _ in sources], PINS, ROOT / 'site/native/dependencies.json',
                ROOT / 'site/native/check_source_concat.py', *REFS, Path(__file__).resolve()]
     modules = [(ROOT / 'site/native/dds_base_css.kotoba', 'src/site/native/dds_base_css.kotoba'),
@@ -122,7 +124,7 @@ def main():
             else: os.dup2(saved, 3); os.close(saved)
         os.close(fd)
     if any(sha(p) != before[str(p)] for p in tracked): raise ValueError('source changed during gate')
-    receipt = {'status':'PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE', 'inputs':before, 'binarySha256':sha(binary),
+    receipt = {'status':('PASS_NATIVE_ARTICLE_PAGE_LOCALE' if a.tag else 'PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE'), 'testedLocales':selected_tags, 'inputs':before, 'binarySha256':sha(binary),
                'sourceLockSha256':sha(lock), 'observations': results, 'invalidRouteRefused':True, 'invalidTagRefused':True, 'freebuffAbsent':True, 'modifiedInputRefused':True,
                'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'siteGenerated':False, 'publicationQualified':False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n'); print(receipt['status'])
