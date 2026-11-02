@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare native English article head with existing rendered pages.
+"""Compare native multilingual article head with existing rendered pages.
 
 Python stages files, runs native programs and compares DOM-shaped results. It
 is not a site generator, translation-quality review, or publication gate.
@@ -17,7 +17,7 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
-TAGS = ['en']
+TAGS = 'en ar arz bn de es fr hi id ja ko mr pcm pt ru ur zh-Hans'.split()
 ARTICLES = {'infra': ('infra-cost-article.edn', 'blog/infra-cost-measured-path'),
             'security': ('security-article.edn', 'blog/csf2-attack-graphs')}
 MODULES = ['article_head', 'header_scripts', 'source_concat', 'dds_palette', 'page_metadata', 'locale_links', 'locale_message', 'locale_catalog', 'locale_placeholders']
@@ -87,7 +87,11 @@ def sections(html, reference):
         if not isinstance(item, list): return item
         if item[0] == 'style': return ('style', item[1], ())
         return normalize(item)
-    return tuple(clean(item) for item in head[2])
+    def old_freebuff(item):
+        return (isinstance(item, list) and item[0] == 'script' and
+                any(isinstance(x, str) and 'window.freebuff' in x for x in item[2]))
+    if not reference and any(old_freebuff(x) for x in head[2]): raise ValueError('Freebuff present in generated head')
+    return tuple(clean(item) for item in head[2] if not (reference and old_freebuff(item)))
 
 
 
@@ -181,7 +185,7 @@ def main():
         def check(pair):
             tag, name = pair
             _, route = ARTICLES[name]
-            r = invoke(image, name, expected=42)
+            r = invoke(image, name, tag, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
             actual_sections = sections(r.stdout.decode('utf-8'), False)
             reference_sections = sections(reference.read_text(), True)
@@ -194,12 +198,13 @@ def main():
 
         with ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(check, [(tag, name) for tag in TAGS for name in ARTICLES]))
-        invoke(image, 'bad-route', expected=7)
+        invoke(image, 'bad-route', 'en', expected=7)
+        invoke(image, 'infra', '../ja', expected=7)
         dds_file = out / 'dds.css'
         original = dds_file.read_bytes()
         try:
             dds_file.write_bytes(original + b' ')
-            invoke(image, 'infra', expected=7)
+            invoke(image, 'infra', 'en', expected=7)
         finally:
             dds_file.write_bytes(original)
     finally:
@@ -212,8 +217,8 @@ def main():
         os.close(fd)
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source, catalog, reference or compiler changed during gate')
-    receipt = {'status': 'PASS_NATIVE_ENGLISH_ARTICLE_HEAD_EXCLUDING_STYLE', 'inputs': pins, 'sourceLockSha256': sha(lock),
-               'binarySha256': sha(image), 'observations': results, 'mutatedDdsRefused': True, 'invalidRouteRefused': True, 'referenceIsExistingDist': True,
+    receipt = {'status': 'PASS_NATIVE_MULTILINGUAL_ARTICLE_HEAD_EXCLUDING_STYLE', 'inputs': pins, 'sourceLockSha256': sha(lock),
+               'binarySha256': sha(image), 'observations': results, 'mutatedDdsRefused': True, 'invalidRouteRefused': True, 'invalidTagRefused': True, 'freebuffRemoved': True, 'referenceIsExistingDist': True,
                'completeHeadGenerated': False, 'fullPageGenerated': False, 'siteGenerated': False, 'translationQualityQualified': False,
                'publicationQualified': False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
