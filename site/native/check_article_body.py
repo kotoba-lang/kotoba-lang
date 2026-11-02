@@ -16,6 +16,9 @@ from reference_translation import reference_title
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULES = ['article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']
+BILINGUAL = {'parity': ('embench-c-parity-article.edn', 'blog/embench-c-parity-20261015'),
+             'progress': ('embench-progress-article.edn', 'blog/embench-progress-20261012'),
+             'usage': ('usage-article.edn', 'blog/kotoba-murakumo-how-to-use-20261015')}
 
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -66,10 +69,12 @@ def main():
     source += [(ROOT / 'test/site/native/article_body_file.kotoba', 'src/site/native/article_body_file.kotoba'),
                (sha_source, 'src/multiformats/sha256.kotoba'), (core, 'src/html_core.kotoba'),
                (hiccup, 'src/html_hiccup.kotoba'), (button, 'src/button.kotoba'), (theme, 'src/theme_toggle.kotoba'), (selector, 'src/language_selector.kotoba'), (components, 'src/components.kotoba'), (table, 'src/table.kotoba')]
-    articles = [ROOT / 'site/security-article.edn', ROOT / 'site/infra-cost-article.edn']
+    articles = [ROOT / 'site/security-article.edn', ROOT / 'site/infra-cost-article.edn'] + [ROOT / 'site' / item[0] for item in BILINGUAL.values()]
     catalogs = [ROOT / 'site/i18n' / (tag + '.json') for tag in TAGS]
     references = [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
                   for tag in TAGS for _, route in ARTICLES.values()]
+    references += [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
+                   for tag in ('en', 'ja') for _, route in BILINGUAL.values()]
     tracked = [ROOT / 'site/native/reference_translation.py', compiler, packager, deps, html_deps, button_deps, source_pins, dds_deps, ROOT / 'site/generate.cljk',
                *[p for p, _ in source], *catalogs, *articles, *references, Path(__file__).resolve(), ROOT / 'site/native/check_footers.py']
     pins = {str(p): sha(p) for p in tracked}
@@ -126,6 +131,27 @@ def main():
             return {'page': name, 'tag': tag, 'sha256': hashlib.sha256(r.stdout).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(check, [(tag, name) for tag in TAGS for name in ('infra', 'security')]))
+        def article_node(html):
+            tree = Tree(); tree.feed(html); tree.close()
+            found = []
+            def walk(node):
+                if not isinstance(node, list): return
+                if node[0] == 'article' and 'kot-blog-entry' in dict(node[1]).get('class', '').split():
+                    found.append(normalize(node)); return
+                for child in node[2]: walk(child)
+            walk(tree.root)
+            if len(tree.stack) != 1 or len(found) != 1: raise ValueError('expected one article')
+            return found[0]
+        for name, (_, route) in BILINGUAL.items():
+            for tag in ('en', 'ja'):
+                raw = invoke(image, name, tag, expected=42).stdout
+                ref = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / route / 'index.html'
+                if article_node(raw.decode()) != article_node(ref.read_text()): raise ValueError(('bilingual article content mismatch', name, tag))
+                text = raw.decode()
+                base = '/' + route + '/'
+                if 'href="' + base + '"' not in text or 'href="/ja' + base + '"' not in text or '/ja/ja/' in text: raise ValueError(('bilingual selector mismatch', name, tag))
+                results.append({'page': name, 'tag': tag, 'sha256': hashlib.sha256(raw).hexdigest()})
+            invoke(image, name, 'ar', expected=7)
         invoke(image, 'infra', '../ja', expected=7)
         invoke(image, 'unknown', 'en', expected=7)
         ja = out / 'site/i18n/ja.json'
@@ -147,7 +173,7 @@ def main():
         raise ValueError('source changed during gate')
     receipt = {'status': 'PASS_NATIVE_ARTICLE_BODY', 'inputs': pins, 'sourceLockSha256': sha(lock),
                'binarySha256': sha(image), 'observations': results, 'invalidPathsRefused': True,
-               'emptyCatalogRefused': True, 'completeArticleBody': True, 'siteGenerated': False,
+               'emptyCatalogRefused': True, 'bilingualContentAndLinksChecked': True, 'completeArticleBody': True, 'siteGenerated': False,
                'translationQualityQualified': False, 'publicationQualified': False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'], flush=True)
