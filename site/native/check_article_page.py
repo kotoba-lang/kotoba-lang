@@ -179,8 +179,12 @@ def main():
         if run(binary, 'sitemap', expected_exit=42) != expected_sitemap: raise ValueError('corrected command sitemap differs')
         run(binary, 'unknown', 'en', expected_exit=7)
         run(binary, 'infra', '../ja', expected_exit=7)
-        original = (out / 'tokens.cljk').read_bytes(); (out / 'tokens.cljk').write_bytes(original + b' ')
-        run(binary, 'infra', 'en', expected_exit=7)
+        token_input = out / 'tokens.cljk'; original = token_input.read_bytes()
+        try:
+            token_input.write_bytes(original + b' ')
+            run(binary, 'infra', 'en', expected_exit=7)
+        finally:
+            token_input.write_bytes(original)
     finally:
         if fd != 3:
             if saved is None: os.close(3)
