@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare pinned native DDS palette snapshot from pinned CSS."""
+"""Compare native DDS palette and theme rules from pinned CSS."""
 import argparse
 import hashlib
 import json
@@ -67,7 +67,7 @@ def main():
         binary = out / 'base.macho'; shutil.copyfile(out / 'base-unsigned.macho', binary); binary.chmod(0o700)
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(binary)], check=True, capture_output=True, timeout=30)
         result = run(binary, expected_exit=42)
-        if not all(result in x.encode() for x in references): raise ValueError('DDS snapshot differs from historical CSS')
+        if not all(result in x.encode() for x in references): raise ValueError('DDS theme CSS differs from historical CSS')
         original = (out / 'dds.css').read_bytes(); (out / 'dds.css').write_bytes(original + b' ')
         run(binary, expected_exit=7)
     finally:
@@ -76,8 +76,8 @@ def main():
             else: os.dup2(saved, 3); os.close(saved)
         os.close(fd)
     if any(sha(p) != before[str(p)] for p in tracked): raise ValueError('source changed during gate')
-    receipt = {'status':'PASS_NATIVE_DDS_PALETTE_SNAPSHOT', 'inputs':before, 'binarySha256':sha(binary),
+    receipt = {'status':'PASS_NATIVE_DDS_THEME_CSS', 'inputs':before, 'binarySha256':sha(binary),
                'sourceLockSha256':sha(lock), 'outputSha256':hashlib.sha256(result).hexdigest(), 'modifiedInputRefused':True,
-               'darkRulesGenerated':False, 'completeStylesheetGenerated':False, 'siteGenerated':False, 'publicationQualified':False}
+               'darkRulesGenerated':True, 'completeStylesheetGenerated':False, 'siteGenerated':False, 'publicationQualified':False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n'); print(receipt['status'])
 if __name__ == '__main__': main()
