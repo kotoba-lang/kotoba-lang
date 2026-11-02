@@ -63,7 +63,7 @@ def main():
                               (ROOT / 'test/site/native/article_page_file.kotoba', 'src/site/native/article_page_file.kotoba'),
                (sha_source, 'src/multiformats/sha256.kotoba')]
     modules += [(p, path) for p, path, _ in extras]
-    modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
+    modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['article_page', 'article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
     tracked += [p for p, _ in modules]
     before = {str(p): sha(p) for p in tracked}
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=False)
