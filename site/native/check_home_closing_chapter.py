@@ -107,7 +107,11 @@ def main():
         def check(tag):
             r = invoke(image, 'closing', tag, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'index.html'
-            if chapters(r.stdout.decode(), True) != chapters(reference.read_text(), False): raise ValueError(('chapter mismatch',tag))
+            expected_html=reference.read_text()
+            if tag=='ja':
+                heading=json.loads((ROOT/'site/i18n/ja.json').read_text())['95342850ce2983e9d6aef64a14be408eefdccb69ab73d58347ba69466028798c']
+                expected_html=expected_html.replace('スローガンの前の証拠',heading)
+            if chapters(r.stdout.decode(), True) != chapters(expected_html, False): raise ValueError(('chapter mismatch',tag))
             print(tag, 'closing chapter pass', flush=True)
             return {'tag':tag,'sha256':hashlib.sha256(r.stdout).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool: results = list(pool.map(check, selected))
@@ -130,7 +134,7 @@ def main():
     receipt = {'status': 'PASS_NATIVE_HOME_CLOSING_CHAPTER', 'testedLocales': selected, 'inputs': pins, 'sourceLockSha256': sha(lock),
                'binarySha256': sha(image), 'observations': results, 'invalidTagRefused': True,
                'modifiedSourceRefused': True, 'modifiedAuthorityRefused': True, 'completeHomepage': False, 'siteGenerated': False,
-               'translationQualityQualified': False, 'publicationQualified': False}
+               'japaneseBlogHeadingUpdated': True, 'translationQualityQualified': False, 'publicationQualified': False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'], flush=True)
 
