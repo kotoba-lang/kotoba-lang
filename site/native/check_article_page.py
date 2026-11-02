@@ -48,7 +48,7 @@ def main():
     for binary in (compiler, packager):
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(binary)], check=True, capture_output=True, timeout=30)
     references = [(tag, route, ROOT / 'site/dist' / ('' if tag == 'en' else tag) / path / 'index.html') for tag in selected_tags for route, path in (('infra', 'blog/infra-cost-measured-path'), ('security', 'blog/csf2-attack-graphs'))]
-    tracked = [ROOT / 'site/native/reference_translation.py', *[p for p, _, _ in extras], ROOT / 'site/native/html-dependencies.json', ROOT / 'site/native/header-dependencies.json', ROOT / 'site/native/dds-dependencies.json', *[ROOT / 'site/i18n' / (t + '.json') for t in TAGS], *[p for _, _, p in references], ROOT / 'site/infra-cost-article.edn', ROOT / 'site/security-article.edn', compiler, packager, sha_source, json_source, theme_json, dds / 'src/jp_go_dds/theme_toggle.cljk', ROOT / 'site/generate.cljk', ROOT / 'site/native/metadata-sources.json', *[p for p, _ in sources], PINS, ROOT / 'site/native/dependencies.json',
+    tracked = [ROOT / 'site/native/reference_translation.py', *[p for p, _, _ in extras], ROOT / 'site/native/html-dependencies.json', ROOT / 'site/native/header-dependencies.json', ROOT / 'site/native/dds-dependencies.json', *[ROOT / 'site/i18n' / (t + '.json') for t in TAGS], *[p for _, _, p in references], ROOT / 'site/infra-cost-article.edn', ROOT / 'site/security-article.edn', ROOT / 'site/org-identity-article.edn', compiler, packager, sha_source, json_source, theme_json, dds / 'src/jp_go_dds/theme_toggle.cljk', ROOT / 'site/generate.cljk', ROOT / 'site/native/metadata-sources.json', *[p for p, _ in sources], PINS, ROOT / 'site/native/dependencies.json',
                ROOT / 'site/native/check_source_concat.py', *REFS, Path(__file__).resolve()]
     modules = [(ROOT / 'site/native/dds_base_css.kotoba', 'src/site/native/dds_base_css.kotoba'),
                (ROOT / 'site/native/dds_ext_css.kotoba', 'src/site/native/dds_ext_css.kotoba'),
@@ -77,7 +77,7 @@ def main():
     shutil.copyfile(theme_json, out / 'theme.json')
     (out / 'site/i18n').mkdir(parents=True, exist_ok=True)
     for tag in TAGS: shutil.copyfile(ROOT / 'site/i18n' / (tag + '.json'), out / 'site/i18n' / (tag + '.json'))
-    for name in ('infra-cost-article.edn', 'security-article.edn'): shutil.copyfile(ROOT / 'site' / name, out / 'site' / name)
+    for name in ('infra-cost-article.edn', 'security-article.edn', 'org-identity-article.edn'): shutil.copyfile(ROOT / 'site' / name, out / 'site' / name)
     lock = out / 'project.ksl'
     lock.write_text('KSL1\nentry /src/site/native/article_page_file.kotoba\nroot /src\n' +
                     ''.join('file ' + sha(out / name) + ' /' + name + '\n' for _, name in sorted(modules, key=lambda x: x[1])))
@@ -116,17 +116,32 @@ def main():
             return {'route': route, 'tag': tag, 'sha256': hashlib.sha256(result).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(check, references))
+        identity = run(binary, 'identity', 'en', expected_exit=42)
+        identity_text = identity.decode()
+        for required in ('<title>Organization identity and verifiable membership on Kotoba Cloud</title>',
+                         'href="https://kotoba-lang.org/spec/org-identity/" rel="canonical"',
+                         'One source of truth per layer', 'Membership: W3C Verifiable Credentials with status',
+                         'Current API surface', 'ADR-2609141633', 'Specification · Authentication &amp; organization identity'):
+            if required not in identity_text: raise ValueError(('identity source content missing', required))
+        if 'freebuff' in identity_text.lower() or re.search(r'<link\b[^>]*\bhreflang=', identity_text) or '/ja/spec/org-identity/' in identity_text:
+            raise ValueError('identity page exposes telemetry or ungenerated translations')
+        run(binary, 'identity', 'ja', expected_exit=7)
         # Stage existing HTML to test the shared sitemap command through the
         # same native entry. These are test inputs, not native-regenerated pages.
         manifest = []
         for i, source in enumerate(pages):
             target = out / 'sitemap-pages' / f'{i:04}.html'
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
+            if source == ROOT / 'site/dist/spec/org-identity/index.html': target.write_bytes(identity)
+            else: shutil.copyfile(source, target)
             manifest.append('/sitemap-pages/' + target.name)
         (out / 'manifest.edn').write_text(json.dumps(manifest))
-        if run(binary, 'sitemap', expected_exit=42) != (ROOT / 'site/dist/sitemap.xml').read_bytes():
-            raise ValueError('shared command sitemap differs')
+        old_urls = re.findall(r'<loc>([^<]+)</loc>', (ROOT / 'site/dist/sitemap.xml').read_text())
+        if old_urls.count('https://kotoba-lang.org') != 1: raise ValueError('unexpected legacy blank-page canonical')
+        urls = sorted(set(('https://kotoba-lang.org/spec/org-identity/' if x == 'https://kotoba-lang.org' else x) for x in old_urls))
+        expected_sitemap = ('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
+                            ''.join('<url><loc>' + x + '</loc></url>\n' for x in urls) + '</urlset>\n').encode()
+        if run(binary, 'sitemap', expected_exit=42) != expected_sitemap: raise ValueError('corrected command sitemap differs')
         run(binary, 'unknown', 'en', expected_exit=7)
         run(binary, 'infra', '../ja', expected_exit=7)
         original = (out / 'tokens.cljk').read_bytes(); (out / 'tokens.cljk').write_bytes(original + b' ')
@@ -139,6 +154,6 @@ def main():
     if any(sha(p) != before[str(p)] for p in tracked): raise ValueError('source changed during gate')
     receipt = {'status':('PASS_NATIVE_ARTICLE_PAGE_LOCALE' if a.tag else 'PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE'), 'testedLocales':selected_tags, 'inputs':before, 'binarySha256':sha(binary),
                'sourceLockSha256':sha(lock), 'observations': results, 'invalidRouteRefused':True, 'invalidTagRefused':True, 'freebuffAbsent':True, 'modifiedInputRefused':True,
-               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
+               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'englishIdentitySourceChecked':True, 'identityMissingLocaleRefused':True, 'correctedIdentitySitemapChecked':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n'); print(receipt['status'])
 if __name__ == '__main__': main()

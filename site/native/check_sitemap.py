@@ -44,14 +44,20 @@ def main():
     run(packager,'page-unsigned.macho','page.raw','fs2-cli-stdio-general',m[1].decode())
     image=out/'page.macho';shutil.copyfile(out/'page-unsigned.macho',image);image.chmod(0o700);subprocess.run(['/usr/bin/codesign','--force','--sign','-',str(image)],check=True,capture_output=True,timeout=30)
     def manifest(paths): (out/'manifest.edn').write_text(json.dumps(paths,ensure_ascii=True))
-    manifest(files);actual=run(image,expected=42).stdout.decode()
-    if actual!=expected:raise ValueError('native sitemap mismatch')
+    # The checked-in legacy identity page is blank and claims the bare origin.
+    # Refuse that input, then compare the other actual pages with its URL omitted.
+    manifest(files);run(image,expected=7)
+    bad = pages.index(ROOT/'site/dist/spec/org-identity/index.html')
+    remaining = files[:bad]+files[bad+1:]
+    manifest(remaining);actual=run(image,expected=42).stdout.decode()
+    corrected=expected.replace('<url><loc>https://kotoba-lang.org</loc></url>\n','')
+    if actual!=corrected:raise ValueError('native sitemap mismatch without blank legacy page')
     (out/'fixture.html').write_text('<link rel="canonical" href="https://kotoba-lang.org/test/">')
     manifest(['/fixture.html','/fixture.html']);r=run(image,expected=42).stdout.decode()
     if r.count('<loc>https://kotoba-lang.org/test/</loc>')!=1:raise ValueError('deduplication failed')
-    for html in ('<p>no canonical</p>', '<link rel="canonical" href="https://kotoba-lang.org.evil/x">', '<link rel="canonical" href="https://kotoba-lang.org/a&b">', '<link rel="canonical" href="https://kotoba-lang.org/a"><link rel="canonical" href="https://kotoba-lang.org/b">'):
+    for html in ('<p>no canonical</p>', '<link rel="canonical" href="https://kotoba-lang.org.evil/x">', '<link rel="canonical" href="https://kotoba-lang.org">', '<link rel="canonical" href="https://kotoba-lang.org/a&b">', '<link rel="canonical" href="https://kotoba-lang.org/a"><link rel="canonical" href="https://kotoba-lang.org/b">'):
         (out/'fixture.html').write_text(html);manifest(['/fixture.html']);run(image,expected=7)
     if any(sha(p)!=pins[str(p)] for p in tracked):raise ValueError('source drift')
-    receipt={'status':'PASS_NATIVE_SITEMAP_PROJECTION','inputs':pins,'htmlCount':len(pages),'canonicalCount':len(set(urls)),'siteGenerated':False,'fullSiteQualified':False}
+    receipt={'status':'PASS_NATIVE_SITEMAP_PROJECTION','inputs':pins,'htmlCount':len(pages),'canonicalCount':len(set(urls))-1,'blankIdentityPageRefused':True,'siteGenerated':False,'fullSiteQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':main()
