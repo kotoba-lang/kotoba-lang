@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 from urllib.parse import urljoin
+from legal_reference import legal_reference
 from check_footers import Tree, normalize, TAGS, ARTICLES, sections
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,7 +69,7 @@ def main():
     catalogs = [ROOT / 'site/i18n' / (tag + '.json') for tag in TAGS]
     references = [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'legal' / 'index.html' for tag in TAGS]
     tracked = [component_deps, compiler, packager, deps, html_deps, button_deps, source_pins, ROOT / 'site/generate.cljk',
-               *[p for p, _ in source], *catalogs, *references, Path(__file__).resolve(), ROOT / 'site/native/check_footers.py']
+               *[p for p, _ in source], *catalogs, *references, Path(__file__).resolve(), ROOT / 'site/native/check_footers.py', ROOT / 'site/native/legal_reference.py']
     pins = {str(p): sha(p) for p in tracked}
     for src, relative in source:
         target = out / relative
@@ -111,7 +112,7 @@ def main():
         def check(tag):
             result=invoke(image,tag,expected=42)
             ref=ROOT/'site/dist'/('' if tag=='en' else tag)/'legal'/'index.html'
-            original=ref.read_text().replace('site/generate.cljk','site/native/legal_body.kotoba')
+            original=legal_reference(ref.read_text(),tag).replace('site/generate.cljk','site/native/legal_body.kotoba')
             if nav(result.stdout.decode(),tag)!=nav(original,tag): raise ValueError(('legal body mismatch',tag))
             print(tag,'legal body pass',flush=True)
             return {'tag':tag,'sha256':hashlib.sha256(result.stdout).hexdigest()}

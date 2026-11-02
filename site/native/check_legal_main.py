@@ -10,6 +10,7 @@ import platform
 import re
 import shutil
 import subprocess
+from legal_reference import legal_reference
 from check_footers import Tree, normalize, TAGS, ARTICLES
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -61,7 +62,7 @@ def main():
     references = [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'legal' / 'index.html' for tag in TAGS]
     authorities = []
     tracked = [*authorities, components, ROOT / 'site/native/dds-dependencies.json', compiler, packager, deps, html_deps, source_pins, ROOT / 'site/generate.cljk',
-               *[p for p, _ in source], *catalogs, *references, Path(__file__).resolve(), ROOT / 'site/native/check_footers.py']
+               *[p for p, _ in source], *catalogs, *references, Path(__file__).resolve(), ROOT / 'site/native/check_footers.py', ROOT / 'site/native/legal_reference.py']
     pins = {str(p): sha(p) for p in tracked}
     for src, relative in source:
         target = out / relative
@@ -104,7 +105,7 @@ def main():
         def check(tag):
             r = invoke(image, tag, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'legal' / 'index.html'
-            if main_node(r.stdout.decode()) != main_node(reference.read_text()): raise ValueError(('legal main mismatch',tag))
+            if main_node(r.stdout.decode()) != main_node(legal_reference(reference.read_text(),tag)): raise ValueError(('legal main mismatch',tag))
             print(tag, 'legal main pass', flush=True)
             return {'tag':tag,'sha256':hashlib.sha256(r.stdout).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool: results = list(pool.map(check, selected))
