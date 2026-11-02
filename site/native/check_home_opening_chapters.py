@@ -13,7 +13,7 @@ import subprocess
 from check_footers import Tree, normalize, TAGS, ARTICLES
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULES = ['home_opening_chapters', 'home_contents', 'home_deliberate', 'home_section', 'source_concat', 'locale_tree', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders', 'locale_links', 'locale_rebase']
+MODULES = ['home_opening_page', 'home_opening_chapters', 'home_contents', 'home_deliberate', 'home_section', 'source_concat', 'locale_tree', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders', 'locale_links', 'locale_rebase']
 
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -51,7 +51,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ('compiler', 'packager', 'sha256-source', 'html-core', 'html-hiccup', 'dds-components', 'dds-table', 'output'):
         ap.add_argument('--' + name, type=Path, required=True)
+    ap.add_argument('--tag', choices=TAGS)
     a = ap.parse_args()
+    selected = [a.tag] if a.tag else TAGS
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'):
         raise ValueError('requires native macOS ARM64')
     compiler, packager, sha_source, core, hiccup, components, dds_table = [p.resolve(strict=True) for p in
@@ -122,17 +124,17 @@ def main():
         image.chmod(0o700)
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(image)], check=True, capture_output=True, timeout=30)
         def check(tag):
-            r = invoke(image, tag, expected=42)
+            r = invoke(image, 'opening', tag, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'index.html'
             if chapters(r.stdout.decode(), True) != chapters(reference.read_text(), False): raise ValueError(('chapter mismatch',tag))
             print(tag, 'opening chapters pass', flush=True)
             return {'tag':tag,'sha256':hashlib.sha256(r.stdout).hexdigest()}
-        with ThreadPoolExecutor(max_workers=3) as pool: results = list(pool.map(check, TAGS))
-        invoke(image, '../ja', expected=7)
+        with ThreadPoolExecutor(max_workers=3) as pool: results = list(pool.map(check, selected))
+        invoke(image, 'opening', '../ja', expected=7)
         for name in ['generator.cljk',*[x.name for x in authorities]]:
             src=out/name; original=src.read_bytes()
             try:
-                src.write_bytes(original+b' ');invoke(image, 'en', expected=7)
+                src.write_bytes(original+b' ');invoke(image, 'opening', 'en', expected=7)
             finally: src.write_bytes(original)
     finally:
         if fd != 3:
@@ -144,7 +146,7 @@ def main():
         os.close(fd)
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source changed during gate')
-    receipt = {'status': 'PASS_NATIVE_HOME_OPENING_CHAPTERS', 'inputs': pins, 'sourceLockSha256': sha(lock),
+    receipt = {'status': 'PASS_NATIVE_HOME_OPENING_CHAPTERS', 'testedLocales': selected, 'inputs': pins, 'sourceLockSha256': sha(lock),
                'binarySha256': sha(image), 'observations': results, 'invalidTagRefused': True,
                'modifiedSourceRefused': True, 'modifiedAuthorityRefused': True, 'completeHomepage': False, 'siteGenerated': False,
                'translationQualityQualified': False, 'publicationQualified': False}
