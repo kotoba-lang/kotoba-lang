@@ -41,7 +41,11 @@ def current_reference(node, source, catalog, protected=False):
         return node
     if isinstance(node, tuple) and len(node) == 3 and isinstance(node[0], str) and isinstance(node[1], tuple):
         tag, attrs, children = node
-        protected = protected or dict(attrs).get('translate') == 'no' or tag in ('script','style','pre','code','kbd','samp')
+        attributes = dict(attrs)
+        if tag == 'article' and attributes.get('lang') == 'en' and attributes.get('translate') == 'no':
+            attributes['dir'] = 'ltr'
+            attrs = tuple(sorted(attributes.items()))
+        protected = protected or attributes.get('translate') == 'no' or tag in ('script','style','pre','code','kbd','samp')
         return tag, attrs, tuple(current_reference(c, source, catalog, protected) for c in children)
     return node
 
@@ -123,8 +127,7 @@ def main():
             r = invoke(image, tag, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'blog' / 'index.html'
             reference_node = main_node(reference.read_text())
-            if tag != 'en':
-                reference_node = current_reference(reference_node, json.loads((ROOT/'site/i18n/en.json').read_text()), json.loads((ROOT/'site/i18n'/(tag+'.json')).read_text()))
+            reference_node = current_reference(reference_node, json.loads((ROOT/'site/i18n/en.json').read_text()), json.loads((ROOT/'site/i18n'/(tag+'.json')).read_text()))
             if main_node(r.stdout.decode()) != reference_node: raise ValueError(('blog main mismatch',tag))
             print(tag, 'blog main pass', flush=True)
             return {'tag':tag,'sha256':hashlib.sha256(r.stdout).hexdigest()}

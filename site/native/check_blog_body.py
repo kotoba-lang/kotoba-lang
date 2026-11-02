@@ -116,7 +116,7 @@ def main():
             ref=ROOT/'site/dist'/('' if tag=='en' else tag)/'blog'/'index.html'
             original=ref.read_text().replace('site/generate.cljk','site/native/blog_body.kotoba')
             reference=nav(original,tag)
-            if tag != 'en': reference=current_reference(reference,json.loads((ROOT/'site/i18n/en.json').read_text()),json.loads((ROOT/'site/i18n'/(tag+'.json')).read_text()))
+            reference=current_reference(reference,json.loads((ROOT/'site/i18n/en.json').read_text()),json.loads((ROOT/'site/i18n'/(tag+'.json')).read_text()))
             if nav(result.stdout.decode(),tag)!=reference: raise ValueError(('blog body mismatch',tag))
             print(tag,'blog body pass',flush=True)
             return {'tag':tag,'sha256':hashlib.sha256(result.stdout).hexdigest()}
