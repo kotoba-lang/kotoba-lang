@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 from urllib.parse import urljoin
-from check_blog_main import current_reference
+from check_blog_main import current_reference, fresh_japanese_reference
 from check_footers import Tree, normalize, TAGS, ARTICLES, sections
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,8 +40,10 @@ def main():
     for name in ('compiler', 'packager', 'sha256-source', 'html-core', 'html-hiccup', 'dds-components', 'dds-button', 'dds-theme', 'dds-selector', 'output'):
         ap.add_argument('--' + name, type=Path, required=True)
     ap.add_argument('--tag', choices=TAGS)
+    ap.add_argument('--catalog-root', type=Path, default=ROOT/'site/i18n')
     a = ap.parse_args()
     selected = [a.tag] if a.tag else TAGS
+    catalog_root = a.catalog_root.resolve(strict=True)
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'):
         raise ValueError('requires native macOS ARM64')
     compiler, packager, sha_source, core, hiccup, components, button, theme, selector = [p.resolve(strict=True) for p in
@@ -66,7 +68,7 @@ def main():
     source += [(ROOT / 'test/site/native/blog_body_file.kotoba', 'src/site/native/blog_body_file.kotoba'),
                (sha_source, 'src/multiformats/sha256.kotoba'), (core, 'src/html_core.kotoba'),
                (hiccup, 'src/html_hiccup.kotoba'), (components, 'src/components.kotoba'), (button, 'src/button.kotoba'), (theme, 'src/theme_toggle.kotoba'), (selector, 'src/language_selector.kotoba')]
-    catalogs = [ROOT / 'site/i18n' / (tag + '.json') for tag in TAGS]
+    catalogs = [catalog_root / (tag + '.json') for tag in TAGS]
     references = [ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'blog' / 'index.html' for tag in TAGS]
     authorities = [ROOT/'site'/(name+'-article.edn') for name in ('embench-c-parity','usage','embench-progress','infra-cost','security','org-identity')]
     tracked = [*authorities, component_deps, compiler, packager, deps, html_deps, button_deps, source_pins, ROOT / 'site/generate.cljk',
@@ -114,9 +116,10 @@ def main():
         def check(tag):
             result=invoke(image,tag,expected=42)
             ref=ROOT/'site/dist'/('' if tag=='en' else tag)/'blog'/'index.html'
-            original=ref.read_text().replace('site/generate.cljk','site/native/blog_body.kotoba')
+            catalog=json.loads((catalog_root/(tag+'.json')).read_text())
+            original=fresh_japanese_reference(ref.read_text(),tag,catalog).replace('site/generate.cljk','site/native/blog_body.kotoba')
             reference=nav(original,tag)
-            reference=current_reference(reference,json.loads((ROOT/'site/i18n/en.json').read_text()),json.loads((ROOT/'site/i18n'/(tag+'.json')).read_text()))
+            reference=current_reference(reference,json.loads((catalog_root/'en.json').read_text()),catalog)
             if nav(result.stdout.decode(),tag)!=reference: raise ValueError(('blog body mismatch',tag))
             print(tag,'blog body pass',flush=True)
             return {'tag':tag,'sha256':hashlib.sha256(result.stdout).hexdigest()}

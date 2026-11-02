@@ -30,7 +30,9 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     for n in ('compiler','packager','sha256-source','dds-root','css-source','json-source','theme-json','html-core','html-hiccup','output'):ap.add_argument('--'+n,type=Path,required=True)
     ap.add_argument('--tag',choices=TAGS)
+    ap.add_argument('--catalog-root',type=Path,default=ROOT/'site/i18n')
     a=ap.parse_args()
+    catalog_root=a.catalog_root.resolve(strict=True)
     if (platform.system(),platform.machine())!=('Darwin','arm64'):raise ValueError('requires macOS arm64')
     compiler,packager,sha_source,dds,css_source,json_source,theme_json,core,hiccup=(p.resolve(strict=True) for p in (a.compiler,a.packager,a.sha256_source,a.dds_root,a.css_source,a.json_source,a.theme_json,a.html_core,a.html_hiccup))
     spec=json.loads((ROOT/'site/native/css-source-dependencies.json').read_text());html=json.loads((ROOT/'site/native/html-dependencies.json').read_text())
@@ -40,7 +42,7 @@ def main():
     for p in (compiler,packager):subprocess.run(['/usr/bin/codesign','--verify','--strict',str(p)],check=True,capture_output=True,timeout=30)
     names=['blog_head_page','page_head','dds_base_css','dds_ext_css','dds_ext_data','dds_palette','dds_skin_css','dds_bridge_css','source_concat','syntax_theme','article_head','header_scripts','page_metadata','locale_links','locale_message','locale_catalog','locale_placeholders']
     modules=[(ROOT/'site/native'/(n+'.kotoba'),'src/site/native/'+n+'.kotoba') for n in names]+[(ROOT/'test/site/native/blog_head_file.kotoba','src/site/native/blog_head_file.kotoba'),(sha_source,'src/multiformats/sha256.kotoba'),(css_source,'src/css_sheet.kotoba'),(json_source,'src/json_scalar.kotoba'),(core,'src/html_core.kotoba'),(hiccup,'src/html_hiccup.kotoba')]
-    catalogs=[ROOT/'site/i18n'/(tag+'.json') for tag in TAGS];refs=[ROOT/'site/dist'/('' if tag=='en' else tag)/'blog'/'index.html' for tag in TAGS]
+    catalogs=[catalog_root/(tag+'.json') for tag in TAGS];refs=[ROOT/'site/dist'/('' if tag=='en' else tag)/'blog'/'index.html' for tag in TAGS]
     tracked=[compiler,packager,ROOT/'site/native/css-source-dependencies.json',ROOT/'site/native/html-dependencies.json',ROOT/'site/native/dependencies.json',ROOT/'site/native/check_footers.py',Path(__file__).resolve(),*[p for p,_ in modules],*[p for p,_ in inputs],*catalogs,*refs]
     pins={str(p):sha(p) for p in tracked};out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     for p,name in modules:
