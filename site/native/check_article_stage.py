@@ -25,7 +25,8 @@ def main():
     article_receipt=json.loads((article/'receipt.json').read_text());ref=json.loads((reference/'receipt.json').read_text())
     if not article_receipt.get('englishIdentitySourceChecked') or ref['status']!='PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE':raise ValueError('unqualified references')
     expected={(r['route'],r['tag']):r['sha256'] for r in ref['observations']}
-    if set(expected)!={(r,t) for r in ('infra','security') for t in TAGS}:raise ValueError('missing article reference')
+    bilingual=(('parity','embench-c-parity-20261015'),('progress','embench-progress-20261012'),('usage','kotoba-murakumo-how-to-use-20261015'))
+    if set(expected)!={(r,t) for r in ('infra','security') for t in TAGS}|{(r,t) for r,_ in bilingual for t in ('en','ja')}:raise ValueError('missing article reference')
     for p in (compiler,packager):subprocess.run(['/usr/bin/codesign','--verify','--strict',str(p)],check=True,capture_output=True,timeout=30)
     modules=[(ROOT/'site/native/article_stage.kotoba','src/site/native/article_stage.kotoba'),(ROOT/'test/site/native/article_stage_file.kotoba','src/site/native/article_stage_file.kotoba'),(source,'src/multiformats/sha256.kotoba')]
     inputs=[compiler,packager,deps,Path(__file__).resolve(),*[p for p,_ in modules],article_image,article/'receipt.json',reference/'receipt.json',asset_image,asset/'receipt.json']
@@ -71,6 +72,10 @@ def main():
         for route,slug in (('infra','infra-cost-measured-path'),('security','csf2-attack-graphs')):
             path=site/('' if tag=='en' else tag)/'blog'/slug/'index.html';wanted[str(path.relative_to(site))]=expected[(route,tag)]
             if sha(path)!=expected[(route,tag)] or b'freebuff' in path.read_bytes().lower():raise ValueError(('article mismatch',route,tag))
+    for route,slug in bilingual:
+        for tag in ('en','ja'):
+            path=site/('' if tag=='en' else tag)/'blog'/slug/'index.html';wanted[str(path.relative_to(site))]=expected[(route,tag)]
+            if sha(path)!=expected[(route,tag)] or b'freebuff' in path.read_bytes().lower():raise ValueError(('bilingual article mismatch',route,tag))
     identity=site/'spec/org-identity/index.html';wanted[str(identity.relative_to(site))]='1eddf303567a0ea780ab1938cf06598c19df9e08b4d2565e04925f06eaf83dcf'
     if sha(identity)!=wanted[str(identity.relative_to(site))] or b'freebuff' in identity.read_bytes().lower():raise ValueError('identity mismatch')
     if {str(p.relative_to(site)):sha(p) for p in site.rglob('*') if p.is_file()}!=wanted:raise ValueError('output set mismatch')
