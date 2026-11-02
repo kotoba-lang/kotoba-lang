@@ -63,8 +63,10 @@ def main():
                               (ROOT / 'test/site/native/article_page_file.kotoba', 'src/site/native/article_page_file.kotoba'),
                (sha_source, 'src/multiformats/sha256.kotoba')]
     modules += [(p, path) for p, path, _ in extras]
-    modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['article_page', 'article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
+    modules += [(ROOT / 'site/native' / (n + '.kotoba'), 'src/site/native/' + n + '.kotoba') for n in ['site_command', 'sitemap_page', 'sitemap', 'article_page', 'article_head', 'header_scripts', 'page_metadata', 'article_body', 'article_section', 'footer', 'header', 'header_inline', 'header_menu', 'header_theme', 'header_selector', 'locale_mark', 'locale_tree', 'locale_rebase', 'locale_links', 'locale_filter', 'locale_message', 'locale_catalog', 'locale_placeholders']]
     tracked += [p for p, _ in modules]
+    pages = sorted((ROOT / 'site/dist').rglob('*.html'))
+    tracked += pages + [ROOT / 'site/dist/sitemap.xml']
     before = {str(p): sha(p) for p in tracked}
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=False)
     for src, name in modules:
@@ -114,6 +116,17 @@ def main():
             return {'route': route, 'tag': tag, 'sha256': hashlib.sha256(result).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(check, references))
+        # Stage existing HTML to test the shared sitemap command through the
+        # same native entry. These are test inputs, not native-regenerated pages.
+        manifest = []
+        for i, source in enumerate(pages):
+            target = out / 'sitemap-pages' / f'{i:04}.html'
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            manifest.append('/sitemap-pages/' + target.name)
+        (out / 'manifest.edn').write_text(json.dumps(manifest))
+        if run(binary, 'sitemap', expected_exit=42) != (ROOT / 'site/dist/sitemap.xml').read_bytes():
+            raise ValueError('shared command sitemap differs')
         run(binary, 'unknown', 'en', expected_exit=7)
         run(binary, 'infra', '../ja', expected_exit=7)
         original = (out / 'tokens.cljk').read_bytes(); (out / 'tokens.cljk').write_bytes(original + b' ')
@@ -126,6 +139,6 @@ def main():
     if any(sha(p) != before[str(p)] for p in tracked): raise ValueError('source changed during gate')
     receipt = {'status':('PASS_NATIVE_ARTICLE_PAGE_LOCALE' if a.tag else 'PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE'), 'testedLocales':selected_tags, 'inputs':before, 'binarySha256':sha(binary),
                'sourceLockSha256':sha(lock), 'observations': results, 'invalidRouteRefused':True, 'invalidTagRefused':True, 'freebuffAbsent':True, 'modifiedInputRefused':True,
-               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'siteGenerated':False, 'publicationQualified':False}
+               'darkRulesGenerated':True, 'completeStylesheetGenerated':True, 'completeArticlePageGenerated':True, 'sharedSitemapCommandChecked':True, 'existingSitemapPages':len(pages), 'siteGenerated':False, 'publicationQualified':False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n'); print(receipt['status'])
 if __name__ == '__main__': main()
