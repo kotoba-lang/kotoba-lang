@@ -43,6 +43,22 @@ def main():
     mappings += [('play', p.name, p) for p in sorted((assets/'play').iterdir()) if p.is_file()]
     mappings += [('ipfs', p.name, p) for p in sorted((assets/'ipfs').iterdir()) if p.is_file()]
     mappings += [('ipfs', 'bafkreiaeohkv2zuo2x4yq745euqm5wijrub5xpkxbbw5gre6tdp3sxzonm', assets/'play/double-21.kotoba')]
+    mappings += [('', 'dependencies.edn', ROOT/'site/dependencies.edn'), ('', 'sponsorship.edn', ROOT/'site/sponsorship.edn'),
+                 ('.well-known', 'kotoba-package-registry.edn', ROOT/'lang/package-registry.edn'),
+                 ('.well-known', 'kotoba-cryptographic-boundaries.edn', ROOT/'security/cryptographic-boundaries.edn'),
+                 ('security', 'csf2-threat-model.md', ROOT/'docs/security/csf2-threat-model.md'),
+                 ('spec', 'org-identity-adr.md', ROOT/'site/spec/org-identity-adr.md'),
+                 ('schemas/trust-profile', 'v1', ROOT/'site/vendor/identity/resources/public/schemas/trust-profile/v1.json')]
+    for name in ('eas/kotobase-v1.json','erc8004/murakumo-v1.json','erc8004/murakumo-v1.json.signature.json','human-passport/itonami-v1.json'):
+        p=ROOT/'site/vendor/identity/resources/public/policies/trust'/name
+        mappings.append(('policies/trust/'+str(Path(name).parent),p.name,p))
+    for name in ('embench-c-parity-20261015.json','embench-candidate-review-20261013.json','embench-progress-20261012.json',
+                 'embench-resume-20261012.json','embench-resume-20261013.json','embench-work-status-20261013.json'):
+        mappings.append(('benchmarks',name,ROOT/'site/benchmarks'/name))
+    mappings += [('benchmarks',name,ROOT/'bench'/directory/'latest.json') for name,directory in (
+        ('build-scaling-latest.json','public-build-scaling'),('compile-wasm-latest.json','public-compile-comparison'),
+        ('domains-latest.json','public-domain-comparison'),('end-to-end-latest.json','public-end-to-end-comparison'),
+        ('runtime-native-latest.json','public-runtime-comparison'))]
     if len({(group, name) for group, name, _ in mappings}) != len(mappings):
         raise ValueError('duplicate destination')
     modules = [(ROOT/'site/native/static_asset_controller.kotoba', 'src/site/native/static_asset_controller.kotoba'),
