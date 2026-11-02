@@ -110,7 +110,7 @@ def main():
             print(tag, which, 'home section pass', flush=True)
             return {'tag': tag, 'section': which, 'sha256': hashlib.sha256(r.stdout).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool:
-            results = list(pool.map(check, [(tag, which) for tag in TAGS for which in ('why', 'what')]))
+            results = list(pool.map(check, [(tag, which) for tag in TAGS for which in ('why', 'what', 'docs', 'roadmap', 'community')]))
         invoke(image, '../ja', 'why', expected=7)
         invoke(image, 'en', 'unknown', expected=7)
         src = out / 'generator.cljk'; original = src.read_bytes()
@@ -129,7 +129,7 @@ def main():
         os.close(fd)
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source changed during gate')
-    receipt = {'status': 'PASS_NATIVE_HOME_WHY_WHAT_SECTIONS', 'inputs': pins, 'sourceLockSha256': sha(lock),
+    receipt = {'status': 'PASS_NATIVE_HOME_FIVE_SECTIONS', 'inputs': pins, 'sourceLockSha256': sha(lock),
                'binarySha256': sha(image), 'observations': results, 'invalidTagRefused': True,
                'modifiedSourceRefused': True, 'completeHomepage': False, 'siteGenerated': False,
                'translationQualityQualified': False, 'publicationQualified': False}
