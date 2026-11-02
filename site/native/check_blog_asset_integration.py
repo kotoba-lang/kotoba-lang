@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
-TAGS = ('en', 'ar', 'pcm')
+TAGS = ('en','ar','arz','bn','de','es','fr','hi','id','ja','ko','mr','pcm','pt','ru','ur','zh-Hans')
 
 
 def sha(p):
@@ -48,7 +48,8 @@ def main():
         invoke(asset_image,[src,sha(src),dest,name])
         if sha(dest/name)!=sha(src):raise ValueError('staged asset mismatch')
     actual={str(p.relative_to(site)) for p in site.rglob('*') if p.is_file()}
-    wanted={'blog/index.html','ar/blog/index.html','pcm/blog/index.html','kotoba-wordmark.png','favicon.ico','play/double-21.wasm'}
+    wanted={('' if tag=='en' else tag+'/')+'blog/index.html' for tag in TAGS}
+    wanted.update({'kotoba-wordmark.png','favicon.ico','play/double-21.wasm'})
     if actual!=wanted:raise ValueError(('unexpected public stage contents',actual))
     if any(sha(Path(p))!=digest for p,digest in pins.items()):raise ValueError('input drift')
     receipt={'status':'PASS_NATIVE_BLOG_ASSET_INTEGRATION_MACOS','inputs':pins,'observations':observations,'nativeStaging':True,'onlyExpectedPublicFiles':True,'testOrchestration':'python observer','completeSiteGenerated':False,'linuxQualified':False,'publicationQualified':False}
