@@ -11,7 +11,7 @@ def fragment_worker(tag, directories):
     for name,directory in zip(('opening','evidence','developer','closing'),map(Path,directories)):
         fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
         if fd!=3: os.dup2(fd,3)
-        try: r=subprocess.run([str(directory/'nav.macho'),tag],cwd=directory,env={'PATH':'/nonexistent','LANG':'C'},pass_fds=(3,),capture_output=True,timeout=300)
+        try: r=subprocess.run([str(directory/'nav.macho'),*(['closing',tag] if name=='closing' else [tag])],cwd=directory,env={'PATH':'/nonexistent','LANG':'C'},pass_fds=(3,),capture_output=True,timeout=300)
         finally:
             if fd!=3: os.close(fd)
         if r.returncode!=42 or r.stderr: raise RuntimeError((name,tag,r.returncode,r.stderr[-500:]))

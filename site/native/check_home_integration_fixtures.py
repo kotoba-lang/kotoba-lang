@@ -71,7 +71,7 @@ def main():
     selected=a.tag or TAGS;results=[]
     for tag in selected:
         d=out/'pages'/tag;d.mkdir(parents=True)
-        fragments={n:render(n,tag,tag) for n in ('opening','evidence','developer','closing')}
+        fragments={n:render(n,tag,*(['closing',tag] if n=='closing' else [tag])) for n in ('opening','evidence','developer','closing')}
         fragments['benchmark']=b'<section id="benchmark">TEST BENCHMARK</section>'
         fragments['library']=b'<section id="libraries">TEST LIBRARY</section>'
         for n,v in fragments.items():(d/(n+'.html')).write_bytes(v)
