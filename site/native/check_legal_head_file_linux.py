@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify an explicitly staged experimental Linux x86 legal-head generator.
+"""Qualify an explicitly staged experimental Linux x86 legal-page head or body generator.
 
 The caller supplies a private staging root, a native compiler and runner, and a
 previously qualified 17-locale head receipt. This is an experimental comparison,
@@ -22,6 +22,7 @@ def sha(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--kind', choices=('head', 'body'), default='head')
     for name in ('stage', 'compiler', 'runner', 'reference', 'output'):
         ap.add_argument('--' + name, type=Path, required=True)
     for name in ('compiler-sha256', 'runner-sha256', 'reference-sha256'):
@@ -43,11 +44,12 @@ def main():
         raise ValueError('output must be a new private directory inside the stage')
     out.mkdir(parents=True, exist_ok=False)
     src = stage / 'src'
-    entry = src / 'site/native/legal_head_file_linux_file.kotoba'
-    files = [p for p in sorted(src.rglob('*.kotoba')) if p.name not in ('legal_head_file.kotoba', 'legal_head_page.kotoba')]
+    entry = src / ('site/native/legal_' + a.kind + '_file_linux_file.kotoba')
+    files = [p for p in sorted(src.rglob('*.kotoba')) if p.name not in ('legal_' + a.kind + '_file.kotoba', 'legal_' + a.kind + '_page.kotoba')]
     if entry not in files:
         raise ValueError('entry missing')
-    inputs = files + [stage / n for n in ('dds.css', 'language.css', 'box.css', 'menu.css', 'behavior.cljk', 'core.cljk', 'tokens.cljk', 'generator.cljk', 'theme-source.cljk', 'theme.json')] + [stage / 'site/i18n' / (tag + '.json') for tag in TAGS]
+    resources = ('dds.css', 'language.css', 'box.css', 'menu.css', 'behavior.cljk', 'core.cljk', 'tokens.cljk', 'generator.cljk', 'theme-source.cljk', 'theme.json') if a.kind == 'head' else ('generator.cljk',)
+    inputs = files + [stage / n for n in resources] + [stage / 'site/i18n' / (tag + '.json') for tag in TAGS]
     pins = {str(p): sha(p) for p in inputs}
     lock = out / 'project.ksl'
     lock.write_text('KSL1\nentry ' + str(entry) + '\nroot ' + str(src) + '\n' + ''.join('file ' + sha(p) + ' ' + str(p) + '\n' for p in files))
@@ -97,7 +99,7 @@ def main():
         generator.write_bytes(original)
     if any(sha(Path(p)) != digest for p, digest in pins.items()) or sha(compiler) != a.compiler_sha256 or sha(runner) != a.runner_sha256 or sha(reference) != a.reference_sha256:
         raise ValueError('input changed during qualification')
-    receipt = {'status': 'PASS_EXPERIMENTAL_LINUX_LEGAL_HEAD', 'compilerSha256': sha(compiler), 'runnerSha256': sha(runner), 'referenceSha256': sha(reference), 'inputs': pins, 'binarySha256': sha(image), 'sourceLockSha256': sha(lock), 'observations': rows, 'existingFilePreserved': True, 'invalidInputsRefused': True, 'experimentalCompiler': True, 'linuxSpawnQualified': False, 'fullSiteGenerated': False, 'publicationQualified': False}
+    receipt = {'status': 'PASS_EXPERIMENTAL_LINUX_LEGAL_' + a.kind.upper(), 'compilerSha256': sha(compiler), 'runnerSha256': sha(runner), 'referenceSha256': sha(reference), 'inputs': pins, 'binarySha256': sha(image), 'sourceLockSha256': sha(lock), 'observations': rows, 'existingFilePreserved': True, 'invalidInputsRefused': True, 'experimentalCompiler': True, 'linuxSpawnQualified': False, 'fullSiteGenerated': False, 'publicationQualified': False}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'], flush=True)
 
