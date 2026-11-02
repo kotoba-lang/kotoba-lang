@@ -18,17 +18,17 @@ MODULES = ['home_section', 'source_concat', 'locale_tree', 'locale_filter', 'loc
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
-def nav(html, fragment):
+def nav(html, fragment, which):
     tree = Tree(); tree.feed(html); tree.close()
     found = []
     def walk(node):
         if not isinstance(node, list): return
         attrs = dict(node[1])
-        if node[0] == 'section' and attrs.get('id') == 'why':
+        if node[0] == 'section' and attrs.get('id') == which:
             found.append(normalize(node)); return
         for item in node[2]: walk(item)
     walk(tree.root)
-    if len(tree.stack) != 1 or len(found) != 1: raise ValueError('expected why section')
+    if len(tree.stack) != 1 or len(found) != 1: raise ValueError('expected selected section')
     return tuple(found)
 
 def main():
@@ -101,20 +101,22 @@ def main():
         shutil.copyfile(out / 'nav-unsigned.macho', image)
         image.chmod(0o700)
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(image)], check=True, capture_output=True, timeout=30)
-        def check(tag):
-            r = invoke(image, tag, expected=42)
+        def check(case):
+            tag, which = case
+            r = invoke(image, tag, which, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'index.html'
-            if nav(r.stdout.decode(), True) != nav(reference.read_text(), False):
-                raise ValueError(('homepage section mismatch', tag))
-            print(tag, 'home why section pass', flush=True)
-            return {'tag': tag, 'sha256': hashlib.sha256(r.stdout).hexdigest()}
+            if nav(r.stdout.decode(), True, which) != nav(reference.read_text(), False, which):
+                raise ValueError(('homepage section mismatch', tag, which))
+            print(tag, which, 'home section pass', flush=True)
+            return {'tag': tag, 'section': which, 'sha256': hashlib.sha256(r.stdout).hexdigest()}
         with ThreadPoolExecutor(max_workers=3) as pool:
-            results = list(pool.map(check, TAGS))
-        invoke(image, '../ja', expected=7)
+            results = list(pool.map(check, [(tag, which) for tag in TAGS for which in ('why', 'what')]))
+        invoke(image, '../ja', 'why', expected=7)
+        invoke(image, 'en', 'unknown', expected=7)
         src = out / 'generator.cljk'; original = src.read_bytes()
         try:
             src.write_bytes(original + b' ')
-            invoke(image, 'en', expected=7)
+            invoke(image, 'en', 'why', expected=7)
         finally:
             src.write_bytes(original)
     finally:
@@ -127,7 +129,7 @@ def main():
         os.close(fd)
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source changed during gate')
-    receipt = {'status': 'PASS_NATIVE_HOME_WHY_SECTION', 'inputs': pins, 'sourceLockSha256': sha(lock),
+    receipt = {'status': 'PASS_NATIVE_HOME_WHY_WHAT_SECTIONS', 'inputs': pins, 'sourceLockSha256': sha(lock),
                'binarySha256': sha(image), 'observations': results, 'invalidTagRefused': True,
                'modifiedSourceRefused': True, 'completeHomepage': False, 'siteGenerated': False,
                'translationQualityQualified': False, 'publicationQualified': False}
