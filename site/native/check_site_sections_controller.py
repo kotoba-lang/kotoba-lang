@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Qualify native macOS staging of blog and legal pages and static assets."""
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -41,6 +42,7 @@ def main():
     legal_expected={x['tag']:x['sha256'] for x in lr['observations']}
     if set(legal_expected)!=set(TAGS):raise ValueError('legal locale coverage mismatch')
     assets=ROOT/'site/assets'
+    hosting_headers=ROOT/'site/_headers';hosting_generator=ROOT/'site/generate.cljk';hosting_source=assets/'play/double-21.kotoba'
     mappings=[('', 'kotoba-wordmark.png', assets/'kotoba-wordmark.png'), ('', 'favicon.ico', assets/'kotoba-favicon.ico'),
               ('', 'kotoba-favicon.png', assets/'kotoba-favicon.png'), ('', 'kotoba-og-card.png', assets/'kotoba-og-card.png'),
               ('', 'agent-quickstart.md', assets/'agent-quickstart.md'), ('', 'llms.txt', assets/'llms.txt'),
@@ -50,8 +52,8 @@ def main():
     mappings += [('ipfs',p.name,p) for p in sorted((assets/'ipfs').iterdir()) if p.is_file()]
     mappings += [('ipfs','bafkreiaeohkv2zuo2x4yq745euqm5wijrub5xpkxbbw5gre6tdp3sxzonm',assets/'play/double-21.kotoba')]
     if len({(g,n) for g,n,_ in mappings})!=len(mappings):raise ValueError('duplicate asset destination')
-    modules=[(ROOT/'site/native/site_sections_controller.kotoba','src/site/native/site_sections_controller.kotoba'),(ROOT/'test/site/native/site_sections_controller_file.kotoba','src/site/native/site_sections_controller_file.kotoba'),(source,'src/multiformats/sha256.kotoba')]
-    tracked=[compiler,packager,deps,Path(__file__).resolve(),*[p for p,_ in modules],page/'receipt.json',page_image,asset/'receipt.json',asset_image,head/'receipt.json',head_image,body/'receipt.json',body_image,reference/'receipt.json',legal_head/'receipt.json',legal_head_image,legal_body/'receipt.json',legal_body_image,legal_ref/'receipt.json',static/'receipt.json',static_image,*[p for _,_,p in mappings]]
+    modules=[(ROOT/'site/native/site_sections_controller.kotoba','src/site/native/site_sections_controller.kotoba'),(ROOT/'test/site/native/site_sections_controller_file.kotoba','src/site/native/site_sections_controller_file.kotoba'),(ROOT/'site/native/hosting_metadata.kotoba','src/site/native/hosting_metadata.kotoba'),(source,'src/multiformats/sha256.kotoba')]
+    tracked=[compiler,packager,deps,Path(__file__).resolve(),*[p for p,_ in modules],page/'receipt.json',page_image,asset/'receipt.json',asset_image,head/'receipt.json',head_image,body/'receipt.json',body_image,reference/'receipt.json',legal_head/'receipt.json',legal_head_image,legal_body/'receipt.json',legal_body_image,legal_ref/'receipt.json',static/'receipt.json',static_image,hosting_headers,hosting_generator,hosting_source,*[p for _,_,p in mappings]]
     pins={str(p):sha(p) for p in tracked};out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     for p,n in modules:
         q=out/n;q.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(p,q)
@@ -74,7 +76,7 @@ def main():
     entries=' '.join('{'+ ' '.join(':'+k+' '+json.dumps(v,ensure_ascii=False) for k,v in row.items())+'}' for row in rows)
     static_manifest=out/'static-assets.edn'
     static_manifest.write_text('{:stager '+json.dumps(str(asset_image))+' :stager-sha256 '+json.dumps(sha(asset_image))+' :assets ['+entries+']}')
-    data={'page':str(page_image),'page-sha':sha(page_image),'asset':str(asset_image),'asset-sha':sha(asset_image),'head-dir':str(head),'head':str(head_image),'head-sha':sha(head_image),'body-dir':str(body),'body':str(body_image),'body-sha':sha(body_image),'static-controller':str(static_image),'static-controller-sha':sha(static_image),'static-manifest':str(static_manifest),'static-manifest-sha':sha(static_manifest),'legal-head-dir':str(legal_head),'legal-head':str(legal_head_image),'legal-head-sha':sha(legal_head_image),'legal-body-dir':str(legal_body),'legal-body':str(legal_body_image),'legal-body-sha':sha(legal_body_image)}
+    data={'page':str(page_image),'page-sha':sha(page_image),'asset':str(asset_image),'asset-sha':sha(asset_image),'head-dir':str(head),'head':str(head_image),'head-sha':sha(head_image),'body-dir':str(body),'body':str(body_image),'body-sha':sha(body_image),'static-controller':str(static_image),'static-controller-sha':sha(static_image),'static-manifest':str(static_manifest),'static-manifest-sha':sha(static_manifest),'hosting-headers':str(hosting_headers),'hosting-headers-sha':sha(hosting_headers),'hosting-generator':str(hosting_generator),'hosting-generator-sha':sha(hosting_generator),'hosting-source':str(hosting_source),'hosting-source-sha':sha(hosting_source),'legal-head-dir':str(legal_head),'legal-head':str(legal_head_image),'legal-head-sha':sha(legal_head_image),'legal-body-dir':str(legal_body),'legal-body':str(legal_body_image),'legal-body-sha':sha(legal_body_image)}
     def run(m,private,site,code):
         r=subprocess.run([str(image),str(m),str(private),str(site)],cwd=out,env={'PATH':'/nonexistent','LANG':'C'},capture_output=True,timeout=3000)
         if r.returncode!=code or r.stdout or r.stderr:raise RuntimeError((r.returncode,r.stdout[:100],r.stderr[-400:]))
@@ -82,8 +84,10 @@ def main():
     private=out/'private';site=out/'site';private.mkdir();site.mkdir()
     run(bad,private,site,7)
     if list(private.iterdir()) or list(site.iterdir()):raise ValueError('invalid manifest created output')
+    bad_host=out/'bad-host.edn';wrong=dict(data);wrong['hosting-headers-sha']='0'*64;manifest(bad_host,wrong);run(bad_host,private,site,7)
+    if list(private.iterdir()) or list(site.iterdir()):raise ValueError('invalid hosting input created output')
     good=out/'manifest.edn';manifest(good,data);run(good,private,site,42)
-    wanted={('' if tag=='en' else tag+'/')+route+'/index.html' for tag in TAGS for route in ('blog','legal')};wanted.update(str(Path(g)/n) for g,n,_ in mappings)
+    wanted={('' if tag=='en' else tag+'/')+route+'/index.html' for tag in TAGS for route in ('blog','legal')};wanted.update(str(Path(g)/n) for g,n,_ in mappings);wanted.update({'_headers','_redirects','robots.txt'})
     actual={str(p.relative_to(site)) for p in site.rglob('*') if p.is_file()}
     if actual!=wanted:raise ValueError(('unexpected site files',actual))
     for tag in TAGS:
@@ -91,10 +95,16 @@ def main():
         if sha(site/('' if tag=='en' else tag)/'legal/index.html')!=legal_expected[tag]:raise ValueError(('legal mismatch',tag))
     for group,name,src in mappings:
         if sha(src)!=sha(site/group/name):raise ValueError(('asset mismatch',group,name))
+    digest=hashlib.sha256(hosting_source.read_bytes()).digest();cid='b'+base64.b32encode(b'\x01\x55\x12\x20'+digest).decode().lower().rstrip('=')
+    hosting_expected={'_headers':hosting_headers.read_bytes()+('\n/ipfs/'+cid+'\n  Content-Type: text/plain; charset=utf-8\n  Content-Disposition: inline; filename=hello.kotoba\n').encode(),
+                      '_redirects':b'/zh /zh-Hans/ 301\n/zh/* /zh-Hans/:splat 301\n',
+                      'robots.txt':b'User-agent: *\nAllow: /\n\nSitemap: https://kotoba-lang.org/sitemap.xml\n'}
+    for name,value in hosting_expected.items():
+        if (site/name).read_bytes()!=value or b'freebuf' in value.lower():raise ValueError(('hosting metadata mismatch',name))
     before={str(p):sha(p) for p in site.rglob('*') if p.is_file()};run(good,private,site,7)
     if any(sha(Path(p))!=h for p,h in before.items()):raise ValueError('existing output modified')
     if any(sha(Path(p))!=h for p,h in pins.items()):raise ValueError('input drift')
-    receipt={'status':'PASS_NATIVE_SITE_SECTIONS_CONTROLLER_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':list(TAGS),'badDigestRefused':True,'existingStagePreserved':True,'nativeOrchestration':True,'privateImmutableStageRequired':True,'sections':['blog','legal'],'staticAssetCount':len(mappings),'completeSiteGenerated':False,'linuxQualified':False,'publicationQualified':False}
+    receipt={'status':'PASS_NATIVE_SITE_SECTIONS_CONTROLLER_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':list(TAGS),'badDigestRefused':True,'existingStagePreserved':True,'nativeOrchestration':True,'privateImmutableStageRequired':True,'sections':['blog','legal'],'staticAssetCount':len(mappings),'hostingMetadata':list(hosting_expected),'completeSiteGenerated':False,'linuxQualified':False,'publicationQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 
 if __name__=='__main__':main()
