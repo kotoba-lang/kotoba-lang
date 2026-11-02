@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 KEY = 'e01d4e101e1c7895d762666ebdc4b5afcdd6371cd2114cc03183dbad5d96d93c'
+INFRA_DESCRIPTION_KEY = '53f80adebb0df566c86cb205729d99d45b1e7f541648c8ace37cc562d22db88a'
 JA_INFRA_KEYS = (
     '2c6e6f525f9525ef273a888bfe59dd234cef798eebe994da8238c3c7bf72ec63',
     '51b20b928484a32745f949ddc983bf127ef61eed990b8b849d0211217e9ce41e',
@@ -91,7 +92,7 @@ JA_INFRA_KEYS = (
 def reference_title(html, tag):
     english = json.loads((ROOT / 'site/i18n/en.json').read_text())
     catalog = json.loads((ROOT / 'site/i18n' / (tag + '.json')).read_text())
-    keys = (KEY,) + (JA_INFRA_KEYS if tag == 'ja' else ())
+    keys = (KEY,) + (JA_INFRA_KEYS if tag == 'ja' else (INFRA_DESCRIPTION_KEY,))
     for key in sorted(keys, key=lambda k: len(english[k]), reverse=True):
         html = html.replace(escape(english[key], quote=True), escape(catalog[key], quote=True))
     return html
