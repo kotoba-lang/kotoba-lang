@@ -1,13 +1,16 @@
 # site — kotoba-lang.org
 
-The language's public static site. It has no third-party runtime dependency.
-Small inline scripts filter the generated reference index and run the Play
-surface; Play fetches only the same-origin, digest-bound Wasm artifact. Queries
-stay in the browser and no telemetry is emitted.
+The language's public static site. Small inline scripts filter the generated
+reference index in the browser and run the Play surface. Play fetches its
+digest-bound Wasm artifact from the same origin. For visits with a `bfcid` URL
+parameter or cookie, the page also loads the Freebuff tag from `freebuff.com`;
+after a successful Play run, the page queues a `trial_started` conversion when
+`window.freebuff` is present. The tag's own network behavior and data handling
+are outside the local generator code and are not established by this description.
 
 ## What makes this page different from a README
 
-`generate.cljs` **derives the language claims from this repository's own authority files**
+`generate.cljk` **derives the language claims from this repository's own authority files**
 rather than restating them in prose. The eight safety claims and their residual
 risks, the deliberately-absent surface, the elaboration pipeline, the deny
 rules, the Component Model / WASI pins and the identity non-goals are all read
@@ -320,7 +323,7 @@ still exactly the file's bytes.
 
 ## The `Fastest` claim on the first screen
 
-`cold-start` in `generate.cljs` derives it once, from
+`cold-start` in `generate.cljk` derives it once, from
 `bench/public-build-scaling/latest.json`. Four of the five public reports
 record a **failed** quiet-host gate and therefore may not rank anything, and
 the page says so next to each of them. The build-scaling report is the
