@@ -51,7 +51,13 @@ def main():
   obs=[]
   for tag,ref in zip(tags,refs):
    b=run(image,tag,expected=42)
-   if section(b.decode())!=section(ref.read_text()):raise ValueError(('section mismatch',tag))
+   reference=ref.read_text()
+   if tag=='ja':
+    old='<p class="kot-lead">その 2,215 公開リポジトリ内の <code class="kot-code">kotoba-lang</code> 組織、タグ語彙と共に 組織の GitHub トピック使用。名前、説明、またはでフィルター。 任意のタグの組み合わせ。</p>'
+    new='<p class="kot-lead"><code class="kot-code">kotoba-lang</code> の公開リポジトリ 2,215 件を掲載しています。GitHub のトピックと共通のタグを使い、名前・説明・タグの組み合わせで絞り込めます。</p>'
+    if reference.count(old)!=1:raise ValueError('unexpected Japanese reference lead')
+    reference=reference.replace(old,new)
+   if section(b.decode())!=section(reference):raise ValueError(('section mismatch',tag))
    page=out/'pages'/(tag+'.html');page.parent.mkdir(parents=True,exist_ok=True);page.write_bytes(b)
    obs.append({'tag':tag,'sha256':hashlib.sha256(b).hexdigest()});print(tag,'catalogue pass',flush=True)
   if {p.name for p in (out/'pages').iterdir()}!={tag+'.html' for tag in tags}:raise ValueError('catalogue page set mismatch')
@@ -71,6 +77,6 @@ def main():
  finally:
   if fd!=3:os.close(fd)
  if any(sha(x)!=pins[str(x)] for x in tracked):raise ValueError('input drift')
- receipt={'status':'PASS_NATIVE_CATALOG_SECTION','inputs':pins,'observations':obs,'binarySha256':sha(image),'invalidLocaleAndModifiedSourcesRefused':True,'currentGithubQualified':False,'fullLibrariesPage':False,'historicalSnapshot':True,'persistedLocalizedCatalog':set(tags)==set(TAGS),'publicationQualified':False}
+ receipt={'status':'PASS_NATIVE_CATALOG_SECTION','inputs':pins,'observations':obs,'binarySha256':sha(image),'invalidLocaleAndModifiedSourcesRefused':True,'currentGithubQualified':False,'fullLibrariesPage':False,'japaneseLeadCorrected':True,'historicalSnapshot':True,'persistedLocalizedCatalog':set(tags)==set(TAGS),'publicationQualified':False}
  (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':main()
