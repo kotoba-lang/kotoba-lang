@@ -59,7 +59,8 @@ def main():
     article_receipt=json.loads((article/'receipt.json').read_text())
     if ar['status']!='PASS_NATIVE_MULTILINGUAL_ARTICLE_PAGE' or not article_receipt.get('englishIdentitySourceChecked'):raise ValueError('unqualified article references')
     article_expected={(x['route'],x['tag']):x['sha256'] for x in ar['observations']}
-    if set(article_expected)!={(route,tag) for route in ('infra','security') for tag in TAGS}:raise ValueError('article locale coverage mismatch')
+    bilingual=(('parity','embench-c-parity-20261015'),('progress','embench-progress-20261012'),('usage','kotoba-murakumo-how-to-use-20261015'))
+    if set(article_expected)!={(route,tag) for route in ('infra','security') for tag in TAGS}|{(route,tag) for route,_ in bilingual for tag in ('en','ja')}:raise ValueError('article locale coverage mismatch')
     assets=ROOT/'site/assets'
     hosting_headers=ROOT/'site/_headers';hosting_generator=ROOT/'site/generate.cljk';hosting_source=assets/'play/double-21.kotoba'
     mappings=[('', 'kotoba-wordmark.png', assets/'kotoba-wordmark.png'), ('', 'favicon.ico', assets/'kotoba-favicon.ico'),
@@ -139,6 +140,7 @@ def main():
     good=out/'manifest.edn';manifest(good,data);run(good,private,site,42)
     wanted={('' if tag=='en' else tag+'/')+route+'/index.html' for tag in TAGS for route in ('blog','legal','sponsor')};wanted.update(str(Path(g)/n) for g,n,_ in mappings);wanted.update({'_headers','_redirects','robots.txt','spec/org-identity/index.html'});wanted.update(('' if tag=='en' else tag+'/')+'blog/'+slug+'/index.html' for tag in TAGS for slug in ('infra-cost-measured-path','csf2-attack-graphs'))
     wanted.update({'start/index.html','ta/index.html','uk/index.html'})
+    wanted.update(('' if tag=='en' else 'ja/')+'blog/'+slug+'/index.html' for _,slug in bilingual for tag in ('en','ja'))
     actual={str(p.relative_to(site)) for p in site.rglob('*') if p.is_file()}
     if actual!=wanted:raise ValueError(('unexpected site files',actual))
     for tag in TAGS:
@@ -153,6 +155,10 @@ def main():
         for route,slug in (('infra','infra-cost-measured-path'),('security','csf2-attack-graphs')):
             path=site/('' if tag=='en' else tag)/'blog'/slug/'index.html'
             if sha(path)!=article_expected[(route,tag)] or b'freebuff' in path.read_bytes().lower():raise ValueError(('article mismatch',route,tag))
+    for route,slug in bilingual:
+        for tag in ('en','ja'):
+            path=site/('' if tag=='en' else 'ja')/'blog'/slug/'index.html'
+            if sha(path)!=article_expected[(route,tag)] or b'freebuff' in path.read_bytes().lower():raise ValueError(('bilingual article mismatch',route,tag))
     identity=site/'spec/org-identity/index.html'
     if sha(identity)!='1eddf303567a0ea780ab1938cf06598c19df9e08b4d2565e04925f06eaf83dcf' or b'freebuff' in identity.read_bytes().lower():raise ValueError('identity mismatch')
     digest=hashlib.sha256(hosting_source.read_bytes()).digest();cid='b'+base64.b32encode(b'\x01\x55\x12\x20'+digest).decode().lower().rstrip('=')
@@ -164,7 +170,7 @@ def main():
     before={str(p):sha(p) for p in site.rglob('*') if p.is_file()};run(good,private,site,7)
     if any(sha(Path(p))!=h for p,h in before.items()):raise ValueError('existing output modified')
     if any(sha(Path(p))!=h for p,h in pins.items()):raise ValueError('input drift')
-    receipt={'status':'PASS_NATIVE_SITE_SECTIONS_CONTROLLER_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':list(TAGS),'badDigestRefused':True,'existingStagePreserved':True,'nativeOrchestration':True,'privateImmutableStageRequired':True,'sections':['blog','legal','articles','identity','sponsor','starters'],'articleCount':35,'staticAssetCount':len(mappings),'hostingMetadata':list(hosting_expected),'completeSiteGenerated':False,'linuxQualified':False,'publicationQualified':False}
+    receipt={'status':'PASS_NATIVE_SITE_SECTIONS_CONTROLLER_MACOS','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':list(TAGS),'badDigestRefused':True,'existingStagePreserved':True,'nativeOrchestration':True,'privateImmutableStageRequired':True,'sections':['blog','legal','articles','identity','sponsor','starters'],'articleCount':41,'staticAssetCount':len(mappings),'hostingMetadata':list(hosting_expected),'completeSiteGenerated':False,'linuxQualified':False,'publicationQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 
 if __name__=='__main__':main()
