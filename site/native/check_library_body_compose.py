@@ -77,6 +77,10 @@ def main():
    old='href="/ja/libraries/">日本語</a>';new='href="/libraries/">English</a>'
    if original.count(old)!=1:raise ValueError('unexpected Japanese navigation')
    original=original.replace(old,new)
+   old_lead='<p class="kot-lead">その 2,215 公開リポジトリ内の <code class="kot-code">kotoba-lang</code> 組織、タグ語彙と共に 組織の GitHub トピック使用。名前、説明、またはでフィルター。 任意のタグの組み合わせ。</p>'
+   new_lead='<p class="kot-lead"><code class="kot-code">kotoba-lang</code> の公開リポジトリ 2,215 件を掲載しています。GitHub のトピックと共通のタグを使い、名前・説明・タグの組み合わせで絞り込めます。</p>'
+   if original.count(old_lead)!=1:raise ValueError('unexpected Japanese reference lead')
+   original=original.replace(old_lead,new_lead)
   privacy=sections(pref.read_text(),True)[2][0][2][2][2][-1];base='https://kotoba-lang.org/'+('' if tag=='en' else tag+'/')+'libraries/'
   if body(got.decode(),base,False)!=body(original,base,True,privacy):raise ValueError(('body mismatch',tag))
   q=out/'pages'/(tag+'.html');q.parent.mkdir(parents=True,exist_ok=True);q.write_bytes(got);results.append({'tag':tag,'sha256':hashlib.sha256(got).hexdigest()});print(tag,'body pass',flush=True)
