@@ -2,8 +2,7 @@
 """Observe the native historical catalogue section, not current catalog or publication."""
 import argparse,hashlib,json,os,platform,re,shutil,subprocess
 from pathlib import Path
-from check_footers import Tree, normalize
-TAGS=("en","ja")
+from check_footers import Tree, normalize, TAGS
 ROOT=Path(__file__).resolve().parents[2]
 MODULES=['library_catalog_section','library_aggregate_stream','library_catalog_stream','library_classifier','locale_tree','locale_filter','locale_message','locale_catalog','locale_placeholders']
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
