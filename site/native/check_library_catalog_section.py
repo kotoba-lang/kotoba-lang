@@ -20,6 +20,7 @@ def main():
  p=argparse.ArgumentParser()
  for n in ('compiler','packager','sha256-source','html-core','html-hiccup','dds-components','rows-dir','output'):p.add_argument('--'+n,type=Path,required=True)
  p.add_argument('--tag',choices=TAGS,action='append');a=p.parse_args();tags=a.tag or TAGS
+ if len(set(tags))!=len(tags):raise ValueError('duplicate locale')
  if (platform.system(),platform.machine())!=('Darwin','arm64'):raise ValueError('requires macOS ARM64')
  compiler,packager,sha_source,core,hiccup,components=[v.resolve(strict=True) for v in (a.compiler,a.packager,a.sha256_source,a.html_core,a.html_hiccup,a.dds_components)]
  rows=a.rows_dir.resolve(strict=True);rr=json.loads((rows/'receipt.json').read_text())
@@ -52,7 +53,9 @@ def main():
   for tag,ref in zip(tags,refs):
    b=run(image,tag,expected=42)
    if section(b.decode())!=section(ref.read_text()):raise ValueError(('section mismatch',tag))
+   page=out/'pages'/(tag+'.html');page.parent.mkdir(parents=True,exist_ok=True);page.write_bytes(b)
    obs.append({'tag':tag,'sha256':hashlib.sha256(b).hexdigest()});print(tag,'catalogue pass',flush=True)
+  if {p.name for p in (out/'pages').iterdir()}!={tag+'.html' for tag in tags}:raise ValueError('catalogue page set mismatch')
   if run(image,'../ja',expected=7):raise ValueError('invalid locale emitted output')
   for name in ('generator.cljk','library-taxonomy.edn','library-catalog.edn','package-registry.edn','rows.html'):
    q=out/name;old=q.read_bytes()
@@ -69,6 +72,6 @@ def main():
  finally:
   if fd!=3:os.close(fd)
  if any(sha(x)!=pins[str(x)] for x in tracked):raise ValueError('input drift')
- receipt={'status':'PASS_NATIVE_CATALOG_SECTION','inputs':pins,'observations':obs,'binarySha256':sha(image),'invalidLocaleAndModifiedSourcesRefused':True,'currentGithubQualified':False,'fullLibrariesPage':False,'historicalSnapshot':True,'publicationQualified':False}
+ receipt={'status':'PASS_NATIVE_CATALOG_SECTION','inputs':pins,'observations':obs,'binarySha256':sha(image),'invalidLocaleAndModifiedSourcesRefused':True,'currentGithubQualified':False,'fullLibrariesPage':False,'historicalSnapshot':True,'persistedLocalizedCatalog':set(tags)==set(TAGS),'publicationQualified':False}
  (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':main()
