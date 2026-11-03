@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise native chapter assembly; benchmark and library are test fixtures."""
+"""Exercise native chapter assembly; benchmark is a test fixture; library uses qualified native fragments."""
 import argparse, base64, hashlib, json, os, platform, re, shutil, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -8,10 +8,10 @@ TAGS=('en','ar','arz','bn','de','es','fr','hi','id','ja','ko','mr','pcm','pt','r
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def fragment_worker(tag, directories):
     result={}
-    for name,directory in zip(('opening','evidence','developer','closing'),map(Path,directories)):
+    for name,directory in zip(('opening','evidence','developer','closing','library'),map(Path,directories)):
         fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
         if fd!=3: os.dup2(fd,3)
-        try: r=subprocess.run([str(directory/'nav.macho'),*(['closing',tag] if name=='closing' else [tag])],cwd=directory,env={'PATH':'/nonexistent','LANG':'C'},pass_fds=(3,),capture_output=True,timeout=300)
+        try: r=subprocess.run([str(directory/'nav.macho'),*([name,tag] if name in ('opening','closing','library') else [tag])],cwd=directory,env={'PATH':'/nonexistent','LANG':'C'},pass_fds=(3,),capture_output=True,timeout=300)
         finally:
             if fd!=3: os.close(fd)
         if r.returncode!=42 or r.stderr: raise RuntimeError((name,tag,r.returncode,r.stderr[-500:]))
@@ -23,13 +23,13 @@ def fragment_worker(tag, directories):
     return result
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
-    for n in ('compiler','packager','sha256-source','opening-dir','evidence-dir','developer-dir','closing-dir','output'): ap.add_argument('--'+n,type=Path,required=True)
+    for n in ('compiler','packager','sha256-source','opening-dir','evidence-dir','developer-dir','closing-dir','library-dir','output'): ap.add_argument('--'+n,type=Path,required=True)
     a=ap.parse_args()
     if (platform.system(),platform.machine())!=('Darwin','arm64'): raise ValueError('requires macOS arm64')
-    compiler,packager,source,opening,evidence,developer,closing=(p.resolve(strict=True) for p in (a.compiler,a.packager,a.sha256_source,a.opening_dir,a.evidence_dir,a.developer_dir,a.closing_dir))
+    compiler,packager,source,opening,evidence,developer,closing,library=(p.resolve(strict=True) for p in (a.compiler,a.packager,a.sha256_source,a.opening_dir,a.evidence_dir,a.developer_dir,a.closing_dir,a.library_dir))
     if sha(source)!=json.loads((ROOT/'site/native/dependencies.json').read_text())['dependencies'][0]['sha256']: raise ValueError('SHA dependency drift')
     for p in (compiler,packager): subprocess.run(['/usr/bin/codesign','--verify','--strict',str(p)],check=True,capture_output=True,timeout=30)
-    parts=[(opening,()),(evidence,()),(developer,()),(closing,())]
+    parts=[(opening,()),(evidence,()),(developer,()),(closing,()),(library,())]
     for d,_ in parts:
         receipt=json.loads((d/'receipt.json').read_text())
         if sha(d/'nav.macho')!=receipt['binarySha256']: raise ValueError('component binary drift')
@@ -54,10 +54,9 @@ def main():
     image=out/'chapters.macho';shutil.copyfile(out/'chapters-unsigned.macho',image);image.chmod(0o700);subprocess.run(['/usr/bin/codesign','--force','--sign','-',str(image)],check=True,capture_output=True,timeout=30)
     names=('opening','evidence','benchmark','developer','library','closing')
     (out/'benchmark.html').write_text('<section id="benchmark">TEST BENCHMARK</section>')
-    (out/'library.html').write_text('<section id="libraries">TEST LIBRARY</section>')
     def manifest(tag): (out/'manifest.edn').write_text('{:tag "'+tag+'" '+ ' '.join(':'+n+' "'+sha(out/(n+'.html'))+'"' for n in names)+'}')
     def make_fragments(tag):
-        r=subprocess.run([sys.executable,str(Path(__file__).resolve()),'--fragment-worker',tag,*map(str,(opening,evidence,developer,closing))],capture_output=True,timeout=1200,check=True)
+        r=subprocess.run([sys.executable,str(Path(__file__).resolve()),'--fragment-worker',tag,*map(str,(opening,evidence,developer,closing,library))],capture_output=True,timeout=1200,check=True)
         return tag,json.loads(r.stdout)
     with ThreadPoolExecutor(max_workers=4) as pool:
         fragments=dict(pool.map(make_fragments,TAGS))
@@ -83,8 +82,8 @@ def main():
         if run_in(image,out,TAGS[-1],expected=7): raise ValueError('partial output on structure refusal')
         p.write_bytes(original)
     if any(sha(p)!=pins[str(p)] for p in tracked): raise ValueError('input drift')
-    receipt={'status':'PASS_NATIVE_HOME_CHAPTERS_COMPOSE','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':results,'fixtureBenchmarkAndLibrary':True,'digestAndStructureRefusals':True,'fullHomepage':False,'siteGenerated':False,'publicationQualified':False}
+    receipt={'status':'PASS_NATIVE_HOME_CHAPTERS_COMPOSE','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':results,'fixtureBenchmark':True,'nativeLibrary':True,'digestAndStructureRefusals':True,'fullHomepage':False,'siteGenerated':False,'publicationQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':
-    if len(sys.argv)==7 and sys.argv[1]=='--fragment-worker': print(json.dumps(fragment_worker(sys.argv[2],sys.argv[3:])))
+    if len(sys.argv)==8 and sys.argv[1]=='--fragment-worker': print(json.dumps(fragment_worker(sys.argv[2],sys.argv[3:])))
     else: main()
