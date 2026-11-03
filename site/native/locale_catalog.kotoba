@@ -1,0 +1,254 @@
+(ns site.native.locale-catalog
+  (:export [catalogs-match? catalogs-meet-minimum? catalog-value open-catalog indexed-value])
+  (:schemas {:site/catalog [:record :site/catalog [[:source :string] [:index :vector-i64]]]})
+  (:require [site.native.locale-placeholders :as placeholders]))
+
+;; Catalogs are JSON objects from unescaped lowercase SHA-256 keys to strings.
+;; JSON string escapes, including valid Unicode surrogate pairs, are decoded.
+(defn- cp-width [cp :i64] :i64
+  (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
+
+(defn- ws? [cp :i64] :bool
+  (or (= cp 32) (= cp 9) (= cp 10) (= cp 13)))
+
+(defn- blank-cp? [cp :i64] :bool
+  ;; kotoba.lang.text/blank? follows Java whitespace, not ECMAScript \s.
+  (or (and (>= cp 9) (<= cp 13)) (and (>= cp 28) (<= cp 31))
+      (= cp 32) (= cp 5760) (and (>= cp 8192) (<= cp 8198))
+      (and (>= cp 8200) (<= cp 8202)) (= cp 8232) (= cp 8233)
+      (= cp 8287) (= cp 12288)))
+
+(defn- skip-ws [text :string start :i64] :i64
+  (let [length (string-byte-length text)]
+    (loop [i start]
+      (if (and (< i length) (ws? (string-code-point-at text i))) (recur (+ i 1)) i))))
+
+(defn- escape? [cp :i64] :bool
+  (or (= cp 34) (= cp 92) (= cp 47) (= cp 98) (= cp 102) (= cp 110) (= cp 114) (= cp 116)))
+
+(defn- hex-any [cp :i64] :i64
+  (cond (and (>= cp 48) (<= cp 57)) (- cp 48)
+        (and (>= cp 97) (<= cp 102)) (- cp 87)
+        (and (>= cp 65) (<= cp 70)) (- cp 55)
+        :else -1))
+
+(defn- unicode-unit [text :string start :i64 limit :i64] :i64
+  (if (> (+ start 4) limit) -1
+    (loop [i 0 value 0]
+      (if (= i 4) value
+        (let [v (hex-any (string-code-point-at text (+ start i)))]
+          (if (< v 0) -1 (recur (+ i 1) (+ (* value 16) v))))))))
+
+;; Exclusive offset following one Unicode escape, or -1 for an invalid pair.
+(defn- unicode-end [text :string slash :i64 limit :i64] :i64
+  (let [unit (unicode-unit text (+ slash 2) limit)]
+    (cond (< unit 0) -1
+          (and (>= unit 56320) (<= unit 57343)) -1
+          (and (>= unit 55296) (<= unit 56319))
+          (let [next (+ slash 6)]
+            (if (or (> (+ next 6) limit) (not (= (string-code-point-at text next) 92))
+                    (not (= (string-code-point-at text (+ next 1)) 117))) -1
+              (let [low (unicode-unit text (+ next 2) limit)]
+                (if (and (>= low 56320) (<= low 57343)) (+ next 6) -1))))
+          :else (+ slash 6))))
+
+;; Exclusive offset after a JSON string; -1 means malformed.
+(defn- string-end [text :string start :i64] :i64
+  (let [length (string-byte-length text)]
+    (if (or (>= start length) (not (= (string-code-point-at text start) 34))) -1
+      (loop [i (+ start 1)]
+        (if (>= i length) -1
+          (let [cp (string-code-point-at text i)]
+            (cond (= cp 34) (+ i 1)
+                  (< cp 32) -1
+                  (= cp 92) (if (>= (+ i 1) length) -1
+                              (let [kind (string-code-point-at text (+ i 1))]
+                                (cond (= kind 117) (let [end (unicode-end text i length)]
+                                                     (if (< end 0) -1 (recur end)))
+                                      (escape? kind) (recur (+ i 2))
+                                      :else -1)))
+                  :else (recur (+ i (cp-width cp))))))))))
+
+(defn- has-unicode-escape? [text :string start :i64 end :i64] :bool
+  (loop [i start]
+    (if (>= i end) false
+      (let [cp (string-code-point-at text i)]
+        (if (= cp 92)
+          (if (= (string-code-point-at text (+ i 1)) 117) true (recur (+ i 2)))
+          (recur (+ i (cp-width cp))))))))
+
+(defn- append-utf8 [out :vector-i64 cp :i64] :vector-i64
+  (cond (< cp 128) (vector-conj out cp)
+        (< cp 2048) (vector-conj (vector-conj out (bit-or 192 (u64-shift-right cp 6)))
+                                 (bit-or 128 (bit-and cp 63)))
+        (< cp 65536) (vector-conj (vector-conj (vector-conj out (bit-or 224 (u64-shift-right cp 12)))
+                                               (bit-or 128 (bit-and (u64-shift-right cp 6) 63)))
+                                  (bit-or 128 (bit-and cp 63)))
+        :else (vector-conj (vector-conj (vector-conj (vector-conj out (bit-or 240 (u64-shift-right cp 18)))
+                                                   (bit-or 128 (bit-and (u64-shift-right cp 12) 63)))
+                                        (bit-or 128 (bit-and (u64-shift-right cp 6) 63)))
+                           (bit-or 128 (bit-and cp 63)))))
+
+(defn- decoded-escape [kind :i64] :i64
+  (cond (= kind 98) 8 (= kind 102) 12 (= kind 110) 10 (= kind 114) 13 (= kind 116) 9 :else kind))
+
+;; Called only for strings that passed string-end. Construct the decoded UTF-8
+;; view only when a Unicode escape could affect placeholder or blank checks.
+(defn- decode-value [text :string start :i64 end :i64] :string
+  (let [bytes (loop [i start out (vector-alloc 0)]
+                (if (>= i end) out
+                  (let [cp (string-code-point-at text i)]
+                    (if (not (= cp 92))
+                      (recur (+ i (cp-width cp)) (append-utf8 out cp))
+                      (let [kind (string-code-point-at text (+ i 1))]
+                        (if (not (= kind 117))
+                          (recur (+ i 2) (append-utf8 out (decoded-escape kind)))
+                          (let [unit (unicode-unit text (+ i 2) end)]
+                            (if (and (>= unit 55296) (<= unit 56319))
+                              (let [low (unicode-unit text (+ i 8) end)
+                                    scalar (+ 65536 (* (- unit 55296) 1024) (- low 56320))]
+                                (recur (+ i 12) (append-utf8 out scalar)))
+                              (recur (+ i 6) (append-utf8 out unit))))))))))]
+    (string-from-utf8 (bytes-from-vector-i64 bytes))))
+
+(defn- value-view [text :string start :i64 end :i64] :string
+  (if (has-unicode-escape? text start end) (decode-value text start end)
+    (string-substring text start end)))
+
+(defn- blank-value? [text :string start :i64 end :i64] :bool
+  (if (has-unicode-escape? text start end)
+    (let [decoded (decode-value text start end)] (blank-decoded? decoded))
+  (loop [i start]
+    (if (>= i end) true
+      (let [cp (string-code-point-at text i)]
+        (if (= cp 92)
+          (let [escaped (string-code-point-at text (+ i 1))]
+            (if (or (= escaped 110) (= escaped 114) (= escaped 116) (= escaped 102))
+              (recur (+ i 2)) false))
+          (if (blank-cp? cp) (recur (+ i (cp-width cp))) false)))))))
+
+(defn- blank-decoded? [text :string] :bool
+  (loop [i 0]
+    (if (>= i (string-byte-length text)) true
+      (let [cp (string-code-point-at text i)]
+        (if (blank-cp? cp) (recur (+ i (cp-width cp))) false)))))
+
+(defn- hex-digit [cp :i64] :i64
+  (cond (and (>= cp 48) (<= cp 57)) (- cp 48)
+        (and (>= cp 97) (<= cp 102)) (- cp 87)
+        :else -1))
+
+(defn- key-valid? [text :string start :i64 end :i64] :bool
+  (if (not (= (- end start) 64)) false
+    (loop [i start]
+      (if (>= i end) true
+        (if (< (hex-digit (string-code-point-at text i)) 0) false (recur (+ i 1)))))))
+
+(defn- key-hash [text :string start :i64] :i64
+  (loop [i 0 value 0]
+    (if (= i 8) value
+      (recur (+ i 1) (+ (* value 16) (hex-digit (string-code-point-at text (+ start i))))))))
+
+;; A bounded open-addressed table stores key, value-start and value-end byte
+;; offsets. Slot zero is the error flag; slot one is the entry count.
+(defn- find-slot [table :vector-i64 indexed :string key-text :string key-start :i64] :i64
+  (let [hash (key-hash key-text key-start)]
+    (loop [probe 0]
+      (if (>= probe 4096) -1
+        (let [slot (+ 2 (* 3 (bit-and (+ hash probe) 4095)))
+              found (vector-at table slot)]
+          (if (= found 0) slot
+            (if (string=? (string-substring indexed (- found 1) (+ found 63))
+                          (string-substring key-text key-start (+ key-start 64)))
+              slot
+              (recur (+ probe 1)))))))))
+
+(defn- failed [table :vector-i64] :vector-i64 (vector-assoc! table 0 -1))
+
+(defn- add-entry [table :vector-i64 text :string key :i64 value :i64 value-end :i64] :vector-i64
+  (let [slot (find-slot table text text key)]
+    (if (or (< slot 0) (not (= (vector-at table slot) 0))) (failed table)
+      (let [count (vector-at table 1)
+            t1 (vector-assoc! table slot (+ key 1))
+            t2 (vector-assoc! t1 (+ slot 1) value)
+            t3 (vector-assoc! t2 (+ slot 2) value-end)]
+        (vector-assoc! t3 1 (+ count 1))))))
+
+;; State 0 allows an empty object; state 1 follows a comma and requires a key.
+(defn- parse-entries [table :vector-i64 text :string start :i64 state :i64] :vector-i64
+  (let [length (string-byte-length text) p (skip-ws text start)]
+    (cond (>= p length) (failed table)
+          (= (string-code-point-at text p) 125)
+          (if (and (= state 0) (= (skip-ws text (+ p 1)) length)) table (failed table))
+          :else
+          (let [key-end (string-end text p)]
+            (if (or (< key-end 0) (not (key-valid? text (+ p 1) (- key-end 1)))) (failed table)
+              (let [colon (skip-ws text key-end)]
+                (if (or (>= colon length) (not (= (string-code-point-at text colon) 58))) (failed table)
+                  (let [value (skip-ws text (+ colon 1)) value-end (string-end text value)]
+                    (if (< value-end 0) (failed table)
+                      (let [t (add-entry table text (+ p 1) (+ value 1) (- value-end 1))
+                            next (skip-ws text value-end)]
+                        (cond (< (vector-at t 0) 0) t
+                              (>= next length) (failed t)
+                              (= (string-code-point-at text next) 44) (parse-entries t text (+ next 1) 1)
+                              (= (string-code-point-at text next) 125)
+                              (if (= (skip-ws text (+ next 1)) length) t (failed t))
+                              :else (failed t))))))))))))
+
+(defn- parse-catalog [text :string] :vector-i64
+  (let [table (vector-alloc 12290) p (skip-ws text 0) length (string-byte-length text)]
+    (if (or (>= p length) (not (= (string-code-point-at text p) 123))) (failed table)
+      (parse-entries table text (+ p 1) 0))))
+
+(defn- every-entry? [source :string source-table :vector-i64 target :string target-table :vector-i64] :bool
+  (loop [slot 2]
+    (if (>= slot 12290) true
+      (let [key (vector-at source-table slot)]
+        (if (= key 0) (recur (+ slot 3))
+          (let [found (find-slot target-table target source (- key 1))]
+            (if (or (< found 0) (= (vector-at target-table found) 0)) false
+              (let [source-start (vector-at source-table (+ slot 1)) source-end (vector-at source-table (+ slot 2))
+                    target-start (vector-at target-table (+ found 1)) target-end (vector-at target-table (+ found 2))]
+                (if (or (blank-value? source source-start source-end) (blank-value? target target-start target-end)) false
+                  (if (placeholders/placeholders-match? (value-view source source-start source-end)
+                                                        (value-view target target-start target-end))
+                    (recur (+ slot 3)) false))))))))))
+
+(defn catalogs-meet-minimum? [source :string target :string minimum :i64] :bool
+  (let [s (parse-catalog source) t (parse-catalog target)]
+    (and (= (vector-at s 0) 0) (= (vector-at t 0) 0) (>= (vector-at s 1) minimum) (> minimum 0)
+         (every-entry? source s target t))))
+
+(defn catalogs-match? [source :string target :string] :bool
+  (catalogs-meet-minimum? source target 1))
+
+;; Open once per locale and reuse the resulting index during generation.
+;; Callers must retain the record produced here without mutating its index.
+(defn open-catalog [text :string] [:option [:ref :site/catalog]]
+  (let [table (parse-catalog text)]
+    (if (= (vector-at table 0) 0)
+      (option-some-of [:option [:ref :site/catalog]]
+                      (record-new [:ref :site/catalog] text table))
+      (option-none-of [:option [:ref :site/catalog]]))))
+
+(defn indexed-value [state [:ref :site/catalog] key :string] [:option :string]
+  (if (not (key-valid? key 0 (string-byte-length key)))
+    (option-none-of [:option :string])
+    (let [text (get state :source) table (get state :index)]
+      (if (or (not (= (vector-count table) 12290)) (not (= (vector-at table 0) 0)))
+        (option-none-of [:option :string])
+        (let [slot (find-slot table text key 0)]
+          (if (or (< slot 0) (= (vector-at table slot) 0))
+            (option-none-of [:option :string])
+            (let [start (vector-at table (+ slot 1)) end (vector-at table (+ slot 2))]
+              (if (blank-value? text start end)
+                (option-none-of [:option :string])
+                (option-some-of [:option :string] (decode-value text start end))))))))))
+
+;; Convenience for isolated lookups. Streaming builders use open-catalog and
+;; indexed-value so a large catalog is parsed once, not once per text node.
+(defn catalog-value [text :string key :string] [:option :string]
+  (match-option (open-catalog text) [:option [:ref :site/catalog]]
+    (none (option-none-of [:option :string]))
+    (some state (indexed-value state key))))
