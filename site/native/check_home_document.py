@@ -68,7 +68,7 @@ def main():
   b=run(image,out,tag,expected=42);s=b.decode();shape=Shape();shape.feed(s);shape.close();rtl=tag in ('ar','arz','ur');attrs={'lang':tag}
   if rtl:attrs['dir']='rtl'
   expected_html='<!DOCTYPE html>\n<html lang="'+tag+('" dir="rtl">' if rtl else '">')+(out/'head.html').read_text()+(out/'body.html').read_text()+'</html>'
-  if s!=expected_html or shape.html!=[attrs] or shape.head!=1 or shape.body!=1 or 'KOTOBA_' in s or 'freebuff' in s.lower() or 'TEST BENCHMARK' not in s:raise ValueError(('document mismatch',tag))
+  if s!=expected_html or shape.html!=[attrs] or shape.head!=1 or shape.body!=1 or 'KOTOBA_' in s or 'freebuff' in s.lower() or 'UNQUALIFIED EVIDENCE FOR TEST' not in s:raise ValueError(('document mismatch',tag))
   q=out/'pages'/(tag+'.html');q.parent.mkdir(parents=True,exist_ok=True);q.write_bytes(b);results.append({'tag':tag,'sha256':hashlib.sha256(b).hexdigest()})
  for name in ('head.html','body.html'):
   q=out/name;old=q.read_bytes()
@@ -80,7 +80,7 @@ def main():
  if run(image,out,TAGS[-1],expected=7):raise ValueError('partial output on locale mismatch')
  manifest('../ja')
  if run(image,out,'../ja',expected=7):raise ValueError('partial output on invalid locale')
- for name,old,new in [('head.html','<head>','<bad>'),('body.html','</body>','</bad>'),('body.html','TEST BENCHMARK','KOTOBA_HERO_SLOT')]:
+ for name,old,new in [('head.html','<head>','<bad>'),('body.html','</body>','</bad>'),('body.html','UNQUALIFIED EVIDENCE FOR TEST','KOTOBA_HERO_SLOT')]:
   q=out/name;original=q.read_bytes();s=original.decode()
   if s.count(old)!=1:raise ValueError('negative control anchor')
   q.write_text(s.replace(old,new,1));manifest(TAGS[-1])

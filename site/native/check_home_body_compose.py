@@ -68,7 +68,7 @@ def main():
   shutil.copyfile(chapters/'pages'/(tag+'.html'),out/'chapters.html');(out/'scripts.html').write_bytes(bundle);manifest(tag)
   got=run(image,out,tag,expected=42);data={n:(out/(n+'.html')).read_text() for n in names}
   expected_body=data['shell'].replace('KOTOBA_HERO_SLOT',data['hero']).replace('KOTOBA_CHAPTERS_SLOT',data['chapters']).replace(slots,data['scripts'])
-  if got.decode()!=expected_body or b'KOTOBA_' in got or b'TEST BENCHMARK' not in got:raise ValueError(('body mismatch',tag))
+  if got.decode()!=expected_body or b'KOTOBA_' in got or b'UNQUALIFIED EVIDENCE FOR TEST' not in got:raise ValueError(('body mismatch',tag))
   q=out/'pages'/(tag+'.html');q.parent.mkdir(parents=True,exist_ok=True);q.write_bytes(got);results.append({'tag':tag,'sha256':hashlib.sha256(got).hexdigest()})
  for n in names:
   q=out/(n+'.html');old=q.read_bytes()
