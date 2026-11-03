@@ -1,5 +1,26 @@
 # Kotoba
 
+**A modern Lisp machine, built for safety and machine speed.**
+
+Lisp makes programs data: small forms that people can read, compose and reason
+about. We want to bring that enduring joy of building and exploring systems to
+humans and AI agents. Kotoba is the language at the heart of a Lisp machine in
+development; Amu is its native compiler, Kototama defines the execution
+contract, and AIUEOS is the operating-system direction. Integrated debugging,
+live system modification and full machine readiness remain separate work.
+
+In one Apple M4 Embench measurement, translated Kotoba ports ran in **0.80×
+the time of C** across 19 workloads. The exploratory result used a particular
+compiler snapshot, including audited algorithm substitutions, and one timed
+sample per workload. It is not a released-toolchain result, an official
+Embench score, or a universal ranking. [Explore the measurements and audit](https://kotoba-lang.org/blog/embench-c-parity-20261015/).
+
+Try the [fixed browser demo](https://kotoba-lang.org/#play), the
+[Apple Silicon native first run](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/MACOS-ARM64.md),
+or the [pinned Linux starter](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/README.md).
+These bounded paths do not establish a complete machine or independent-user
+release qualification.
+
 Kotoba Lang OSS is stewarded by **Kotoba Foundation**. The centralized
 kotoba.cloud, murakumo.cloud, itonami.cloud and aozora.app services are operated
 by **Awai Network LLC**. See [governance and operator responsibilities](GOVERNANCE.md).
