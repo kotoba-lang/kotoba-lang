@@ -29,10 +29,12 @@ def main():
     compiler,packager,source,opening,evidence,developer,closing,library=(p.resolve(strict=True) for p in (a.compiler,a.packager,a.sha256_source,a.opening_dir,a.evidence_dir,a.developer_dir,a.closing_dir,a.library_dir))
     if sha(source)!=json.loads((ROOT/'site/native/dependencies.json').read_text())['dependencies'][0]['sha256']: raise ValueError('SHA dependency drift')
     for p in (compiler,packager): subprocess.run(['/usr/bin/codesign','--verify','--strict',str(p)],check=True,capture_output=True,timeout=30)
-    parts=[(opening,()),(evidence,()),(developer,()),(closing,()),(library,())]
-    for d,_ in parts:
+    parts=[(opening,'PASS_NATIVE_HOME_OPENING_CHAPTERS'),(evidence,'PASS_NATIVE_HOME_EVIDENCE_TEMPLATE'),(developer,'PASS_NATIVE_HOME_DEVELOPER_TEMPLATE'),(closing,'PASS_NATIVE_HOME_CLOSING_CHAPTER'),(library,'PASS_NATIVE_HOME_LIBRARY')]
+    for d,status in parts:
         receipt=json.loads((d/'receipt.json').read_text())
-        if sha(d/'nav.macho')!=receipt['binarySha256']: raise ValueError('component binary drift')
+        observations=receipt.get('observations',[])
+        if receipt.get('status')!=status or sha(d/'nav.macho')!=receipt['binarySha256']: raise ValueError('component qualification or binary drift')
+        if len(observations)!=len(TAGS) or {x.get('tag') for x in observations}!=set(TAGS): raise ValueError('component locale coverage mismatch')
     modules=[(ROOT/'site/native/home_chapters_compose.kotoba','src/site/native/home_chapters_compose.kotoba'),(ROOT/'test/site/native/home_chapters_compose_file.kotoba','src/site/native/home_chapters_compose_file.kotoba'),(source,'src/multiformats/sha256.kotoba')]
     tracked=[compiler,packager,ROOT/'site/native/dependencies.json',Path(__file__).resolve(),*[p for p,_ in modules],*[d/'receipt.json' for d,_ in parts],*[d/'nav.macho' for d,_ in parts]]
     pins={str(p):sha(p) for p in tracked};out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
@@ -67,7 +69,9 @@ def main():
         data={n:(out/(n+'.html')).read_text() for n in names}
         expected=data['opening']+data['evidence'].replace('KOTOBA_BENCHMARK_SLOT',data['benchmark'])+data['developer'].replace('KOTOBA_LIBRARY_SLOT',data['library'])+data['closing']
         if got!=expected or 'KOTOBA_' in got: raise ValueError(('composition mismatch',tag))
+        page=out/'pages'/(tag+'.html');page.parent.mkdir(parents=True,exist_ok=True);page.write_text(got)
         results.append({'tag':tag,'sha256':hashlib.sha256(got.encode()).hexdigest()})
+    if {p.name for p in (out/'pages').iterdir()}!={tag+'.html' for tag in TAGS}: raise ValueError('chapter output set mismatch')
     for n in names:
         p=out/(n+'.html');old=p.read_bytes()
         try:p.write_bytes(old+b' ');r=run_in(image,out,TAGS[-1],expected=7)
@@ -82,7 +86,7 @@ def main():
         if run_in(image,out,TAGS[-1],expected=7): raise ValueError('partial output on structure refusal')
         p.write_bytes(original)
     if any(sha(p)!=pins[str(p)] for p in tracked): raise ValueError('input drift')
-    receipt={'status':'PASS_NATIVE_HOME_CHAPTERS_COMPOSE','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':results,'fixtureBenchmark':True,'nativeLibrary':True,'digestAndStructureRefusals':True,'fullHomepage':False,'siteGenerated':False,'publicationQualified':False}
+    receipt={'status':'PASS_NATIVE_HOME_CHAPTERS_COMPOSE','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':results,'fixtureBenchmark':True,'nativeLibrary':True,'persistedLocalizedChapters':True,'digestAndStructureRefusals':True,'fullHomepage':False,'siteGenerated':False,'publicationQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':
     if len(sys.argv)==8 and sys.argv[1]=='--fragment-worker': print(json.dumps(fragment_worker(sys.argv[2],sys.argv[3:])))
