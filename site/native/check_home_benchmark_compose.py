@@ -22,6 +22,8 @@ def main():
  if sha(source)!=json.loads((ROOT/'site/native/dependencies.json').read_text())['dependencies'][0]['sha256']: raise ValueError('SHA dependency drift')
  for x in (compiler,packager): subprocess.run(['/usr/bin/codesign','--verify','--strict',str(x)],check=True,capture_output=True,timeout=30)
  checks=((intro,'PASS_NATIVE_BENCHMARK_INTRO','nav.macho','observations'),(cards,'PASS_NATIVE_BENCHMARK_CARDS','cards.macho','observations'),(scaling,'PASS_BOUNDED_SCALING_SECTION','page.macho','locales'),(runtime,'PASS_BOUNDED_RUNTIME_SECTION','page.macho','locales'),(compile,'PASS_BOUNDED_COMPILE_SECTION','page.macho','locales'),(tail,'PASS_NATIVE_BENCHMARK_TAIL','page.macho','locales'))
+ tail_receipt=json.loads((tail/'receipt.json').read_text())
+ if not tail_receipt.get('syntheticEvidence') or tail_receipt.get('publicationQualified') is not False: raise ValueError('expected explicitly unqualified test evidence')
  records={}
  for d,status,binary,field in checks:
   r=json.loads((d/'receipt.json').read_text()); obs=r.get(field,[])
@@ -50,8 +52,10 @@ def main():
   values=(intros[tag],(cards/'pages'/(tag+'.html')).read_bytes(),(scaling/'pages'/(tag+'.html')).read_bytes(),(runtime/'pages'/(tag+'.html')).read_bytes(),(compile/'pages'/(tag+'.html')).read_bytes(),(tail/'pages'/(tag+'.html')).read_bytes())
   for n,data in zip(names,values): (out/(n+'.html')).write_bytes(data)
   manifest(tag);result=run(image,out,tag,expected=42);expected=values[0][:-len(b'</section>')]+values[1]+values[2]+values[3]+values[4]+values[5]+b'</section>'
-  if result!=expected: raise ValueError(('composition mismatch',tag))
+  if result!=expected or result.count(b'UNQUALIFIED EVIDENCE FOR TEST')!=1: raise ValueError(('composition mismatch or fixture missing',tag))
+  page=out/'pages'/(tag+'.html');page.parent.mkdir(parents=True,exist_ok=True);page.write_bytes(result)
   results.append({'tag':tag,'sha256':hashlib.sha256(result).hexdigest()})
+ if {x.name for x in (out/'pages').iterdir()}!={tag+'.html' for tag in TAGS}: raise ValueError('page set mismatch')
  for n in names:
   f=out/(n+'.html');old=f.read_bytes()
   try:
@@ -62,6 +66,7 @@ def main():
  if run(image,out,TAGS[-1],expected=7): raise ValueError('partial tag refusal')
  manifest('../ja')
  if run(image,out,'../ja',expected=7): raise ValueError('partial invalid locale')
+ if {x.name for x in (out/'pages').iterdir()}!={tag+'.html' for tag in TAGS}: raise ValueError('page set mismatch')
  for n in names:
   f=out/(n+'.html');old=f.read_bytes()
   try:
@@ -69,6 +74,6 @@ def main():
    if run(image,out,TAGS[-1],expected=7): raise ValueError('partial structure refusal')
   finally: f.write_bytes(old)
  if any(sha(x)!=pins[str(x)] for x in tracked): raise ValueError('input drift')
- receipt={'status':'PASS_NATIVE_BENCHMARK_COMPOSE','inputs':pins,'binarySha256':sha(image),'locales':results,'syntheticRemainder':True,'nativeDomainSubsection':True,'fullBenchmark':False,'publicationQualified':False}
+ receipt={'status':'PASS_NATIVE_BENCHMARK_COMPOSE','inputs':pins,'binarySha256':sha(image),'locales':results,'syntheticRemainder':True,'nativeDomainSubsection':True,'persistedLocalizedBenchmark':True,'fullBenchmark':False,'publicationQualified':False}
  (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__': main()
