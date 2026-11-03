@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare one native build-scaling benchmark table in all locales; not the full section."""
+"""Verify and persist the native build-scaling subsection in all locales; not the full benchmark."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -87,18 +87,29 @@ def main():
         return selected
     def check(case):
         tag,ref=case
-        got=fragment_nodes(run(image,tag,expected=42).stdout.decode(),False)
+        output=run(image,tag,expected=42).stdout
+        got=fragment_nodes(output.decode(),False)
         expected=fragment_nodes(ref.read_text(),True)
         if len(got)!=len(expected): raise ValueError(('count mismatch',tag,len(got),len(expected)))
         for i,(a,b) in enumerate(zip(got,expected)):
             if normalize(a)!=normalize(b): raise ValueError(('template mismatch',tag,i,str(a)[:500],str(b)[:500]))
-        return {'tag':tag,'sha256':hashlib.sha256(str([normalize(x) for x in got]).encode()).hexdigest()}
+        page=out/'pages'/(tag+'.html');page.parent.mkdir(parents=True,exist_ok=True);page.write_bytes(output)
+        return {'tag':tag,'sha256':hashlib.sha256(output).hexdigest(),'normalizedSha256':hashlib.sha256(str([normalize(x) for x in got]).encode()).hexdigest()}
     with ThreadPoolExecutor(max_workers=3) as pool: results=list(pool.map(check,zip(TAGS,refs)))
-    run(image,'../ja',expected=7)
+    if {p.name for p in (out/'pages').iterdir()}!={tag+'.html' for tag in TAGS}: raise ValueError('page set mismatch')
+    if run(image,'../ja',expected=7).stdout:raise ValueError('partial invalid-locale output')
     for name in ('generator.cljk','scaling-benchmark.json','chart.cljk'):
-        target=out/name; original=target.read_bytes();target.write_bytes(original+b' ');run(image,'en',expected=7);target.write_bytes(original)
-    target=out/'scaling-benchmark.json';target.write_text('['*128);run(image,'en',expected=7)
+        target=out/name; original=target.read_bytes()
+        try:
+            target.write_bytes(original+b' ')
+            if run(image,'en',expected=7).stdout: raise ValueError('partial modified-source output')
+        finally: target.write_bytes(original)
+    target=out/'scaling-benchmark.json'; original=target.read_bytes()
+    try:
+        target.write_text('['*128)
+        if run(image,'en',expected=7).stdout: raise ValueError('partial invalid-report output')
+    finally: target.write_bytes(original)
     if any(sha(p)!=pins[str(p)] for p in tracked):raise ValueError('input drift')
-    receipt={'status':'PASS_BOUNDED_SCALING_SECTION','inputs':pins,'locales':results,'siteGenerated':False,'fullBenchmarkSection':False, 'buildScalingSubsection':True}
+    receipt={'status':'PASS_BOUNDED_SCALING_SECTION','inputs':pins,'locales':results,'binarySha256':sha(image),'persistedLocalizedScaling':True,'digestAndLocaleRefusals':True,'siteGenerated':False,'fullBenchmarkSection':False, 'buildScalingSubsection':True}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':main()
