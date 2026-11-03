@@ -2,8 +2,7 @@
 """Observe the two source-pinned static library sections, not current catalog or publication."""
 import argparse,hashlib,json,os,platform,re,shutil,subprocess
 from pathlib import Path
-from check_footers import Tree, normalize
-TAGS=("en","ja")
+from check_footers import Tree, normalize, TAGS
 ROOT=Path(__file__).resolve().parents[2]
 MODULES=['library_static_section','home_section','source_concat','locale_tree','locale_filter','locale_message','locale_catalog','locale_placeholders','locale_links','locale_rebase']
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
