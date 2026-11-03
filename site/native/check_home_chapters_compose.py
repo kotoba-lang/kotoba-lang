@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise native chapter assembly; benchmark introduction, six-card grid and library are native; remaining benchmark is a fixture."""
+"""Exercise native chapter assembly; benchmark introduction, six-card grid, scaling subsection and library are native; remaining benchmark is a fixture."""
 import argparse, base64, hashlib, json, os, platform, re, shutil, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -23,10 +23,10 @@ def fragment_worker(tag, directories):
     return result
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
-    for n in ('compiler','packager','sha256-source','opening-dir','evidence-dir','developer-dir','closing-dir','library-dir','intro-dir','grid-dir','output'): ap.add_argument('--'+n,type=Path,required=True)
+    for n in ('compiler','packager','sha256-source','opening-dir','evidence-dir','developer-dir','closing-dir','library-dir','intro-dir','grid-dir','scaling-dir','output'): ap.add_argument('--'+n,type=Path,required=True)
     a=ap.parse_args()
     if (platform.system(),platform.machine())!=('Darwin','arm64'): raise ValueError('requires macOS arm64')
-    compiler,packager,source,opening,evidence,developer,closing,library,intro,grid=(p.resolve(strict=True) for p in (a.compiler,a.packager,a.sha256_source,a.opening_dir,a.evidence_dir,a.developer_dir,a.closing_dir,a.library_dir,a.intro_dir,a.grid_dir))
+    compiler,packager,source,opening,evidence,developer,closing,library,intro,grid,scaling=(p.resolve(strict=True) for p in (a.compiler,a.packager,a.sha256_source,a.opening_dir,a.evidence_dir,a.developer_dir,a.closing_dir,a.library_dir,a.intro_dir,a.grid_dir,a.scaling_dir))
     if sha(source)!=json.loads((ROOT/'site/native/dependencies.json').read_text())['dependencies'][0]['sha256']: raise ValueError('SHA dependency drift')
     for p in (compiler,packager): subprocess.run(['/usr/bin/codesign','--verify','--strict',str(p)],check=True,capture_output=True,timeout=30)
     parts=[(opening,'PASS_NATIVE_HOME_OPENING_CHAPTERS'),(evidence,'PASS_NATIVE_HOME_EVIDENCE_TEMPLATE'),(developer,'PASS_NATIVE_HOME_DEVELOPER_TEMPLATE'),(closing,'PASS_NATIVE_HOME_CLOSING_CHAPTER'),(library,'PASS_NATIVE_HOME_LIBRARY'),(intro,'PASS_NATIVE_BENCHMARK_INTRO')]
@@ -40,8 +40,13 @@ def main():
     if grid_receipt.get('status')!='PASS_NATIVE_BENCHMARK_CARDS' or sha(grid/'cards.macho')!=grid_receipt['binarySha256'] or len(grid_obs)!=len(TAGS) or {x.get('tag') for x in grid_obs}!=set(TAGS): raise ValueError('grid qualification mismatch')
     grid_pages=[grid/'pages'/(tag+'.html') for tag in TAGS]
     if any(sha(grid/'pages'/(x['tag']+'.html'))!=x['sha256'] for x in grid_obs): raise ValueError('grid page drift')
+    scaling_receipt=json.loads((scaling/'receipt.json').read_text())
+    scaling_obs=scaling_receipt.get('locales',[])
+    if scaling_receipt.get('status')!='PASS_BOUNDED_SCALING_SECTION' or not scaling_receipt.get('persistedLocalizedScaling') or sha(scaling/'page.macho')!=scaling_receipt['binarySha256'] or len(scaling_obs)!=len(TAGS) or {x.get('tag') for x in scaling_obs}!=set(TAGS): raise ValueError('scaling qualification mismatch')
+    scaling_pages=[scaling/'pages'/(tag+'.html') for tag in TAGS]
+    if any(sha(scaling/'pages'/(x['tag']+'.html'))!=x['sha256'] for x in scaling_obs): raise ValueError('scaling page drift')
     modules=[(ROOT/'site/native/home_chapters_compose.kotoba','src/site/native/home_chapters_compose.kotoba'),(ROOT/'test/site/native/home_chapters_compose_file.kotoba','src/site/native/home_chapters_compose_file.kotoba'),(source,'src/multiformats/sha256.kotoba')]
-    tracked=[compiler,packager,ROOT/'site/native/dependencies.json',Path(__file__).resolve(),*[p for p,_ in modules],*[d/'receipt.json' for d,_ in parts],*[d/'nav.macho' for d,_ in parts],grid/'receipt.json',grid/'cards.macho',*grid_pages]
+    tracked=[compiler,packager,ROOT/'site/native/dependencies.json',Path(__file__).resolve(),*[p for p,_ in modules],*[d/'receipt.json' for d,_ in parts],*[d/'nav.macho' for d,_ in parts],grid/'receipt.json',grid/'cards.macho',*grid_pages,scaling/'receipt.json',scaling/'page.macho',*scaling_pages]
     pins={str(p):sha(p) for p in tracked};out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     for p,n in modules:
         q=out/n;q.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(p,q)
@@ -73,7 +78,9 @@ def main():
         if not intro_html.endswith('</section>') or intro_html.count('id="benchmark"')!=1 or 'TEST BENCHMARK' in intro_html: raise ValueError('invalid benchmark introduction')
         cards=(grid/'pages'/(tag+'.html')).read_text()
         if not cards.startswith('<div class="dds-ext-grid"') or not cards.endswith('</div>') or 'TEST BENCHMARK' in cards: raise ValueError('invalid card grid')
-        (out/'benchmark.html').write_text(intro_html[:-len('</section>')]+cards+'<div>TEST BENCHMARK</div></section>')
+        scale=(scaling/'pages'/(tag+'.html')).read_text()
+        if 'TEST BENCHMARK' in scale or '98765000000' in scale or 'Build time as the source gets larger' not in scale and tag=='en': raise ValueError('invalid scaling subsection')
+        (out/'benchmark.html').write_text(intro_html[:-len('</section>')]+cards+scale+'<div>TEST BENCHMARK</div></section>')
         manifest(tag);got=run_in(image,out,tag,expected=42).decode()
         data={n:(out/(n+'.html')).read_text() for n in names}
         expected=data['opening']+data['evidence'].replace('KOTOBA_BENCHMARK_SLOT',data['benchmark'])+data['developer'].replace('KOTOBA_LIBRARY_SLOT',data['library'])+data['closing']
@@ -95,7 +102,7 @@ def main():
         if run_in(image,out,TAGS[-1],expected=7): raise ValueError('partial output on structure refusal')
         p.write_bytes(original)
     if any(sha(p)!=pins[str(p)] for p in tracked): raise ValueError('input drift')
-    receipt={'status':'PASS_NATIVE_HOME_CHAPTERS_COMPOSE','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':results,'fixtureBenchmark':True,'nativeBenchmarkIntro':True,'nativeBenchmarkCards':True,'nativeLibrary':True,'persistedLocalizedChapters':True,'digestAndStructureRefusals':True,'fullHomepage':False,'siteGenerated':False,'publicationQualified':False}
+    receipt={'status':'PASS_NATIVE_HOME_CHAPTERS_COMPOSE','inputs':pins,'binarySha256':sha(image),'sourceLockSha256':sha(lock),'locales':results,'fixtureBenchmark':True,'nativeBenchmarkIntro':True,'nativeBenchmarkCards':True,'nativeScalingSubsection':True,'nativeLibrary':True,'persistedLocalizedChapters':True,'digestAndStructureRefusals':True,'fullHomepage':False,'siteGenerated':False,'publicationQualified':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'])
 if __name__=='__main__':
     if len(sys.argv)==9 and sys.argv[1]=='--fragment-worker': print(json.dumps(fragment_worker(sys.argv[2],sys.argv[3:])))
