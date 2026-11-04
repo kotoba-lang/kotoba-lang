@@ -35,6 +35,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ('compiler', 'packager', 'sha256-source', 'html-core', 'html-hiccup', 'dds-components', 'output'):
         ap.add_argument('--' + name, type=Path, required=True)
+    ap.add_argument('--community-only', action='store_true', help='check community in every locale plus English controls')
     a = ap.parse_args()
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'):
         raise ValueError('requires native macOS ARM64')
@@ -105,12 +106,23 @@ def main():
             tag, which = case
             r = invoke(image, tag, which, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'index.html'
-            if nav(r.stdout.decode(), True, which) != nav(reference.read_text(), False, which):
+            expected = reference.read_text()
+            if which == 'community':
+                marker = 'href="https://github.com/orgs/kotoba-lang/repositories"'
+                start = expected.find(marker)
+                end = expected.find('</p>', start)
+                if start < 0 or end < 0: raise ValueError(('community reference missing', tag))
+                end += len('</p>')
+                link = '<p><a class="kot-link" href="https://www.reddit.com/user/com-junkawasaki/m/kotoba/" rel="noreferrer">Reddit</a></p>'
+                expected = expected[:end] + link + expected[end:]
+            if nav(r.stdout.decode(), True, which) != nav(expected, False, which):
                 raise ValueError(('homepage section mismatch', tag, which))
             print(tag, which, 'home section pass', flush=True)
             return {'tag': tag, 'section': which, 'sha256': hashlib.sha256(r.stdout).hexdigest()}
+        cases = ([(tag, 'community') for tag in TAGS] + [('en', which) for which in ('why', 'what', 'docs', 'roadmap', 'cloud')]
+                 if a.community_only else [(tag, which) for tag in TAGS for which in ('why', 'what', 'docs', 'roadmap', 'community', 'cloud')])
         with ThreadPoolExecutor(max_workers=3) as pool:
-            results = list(pool.map(check, [(tag, which) for tag in TAGS for which in ('why', 'what', 'docs', 'roadmap', 'community', 'cloud')]))
+            results = list(pool.map(check, cases))
         invoke(image, '../ja', 'why', expected=7)
         invoke(image, 'en', 'unknown', expected=7)
         src = out / 'generator.cljk'; original = src.read_bytes()
@@ -129,7 +141,7 @@ def main():
         os.close(fd)
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source changed during gate')
-    receipt = {'status': 'PASS_NATIVE_HOME_SIX_SECTIONS', 'inputs': pins, 'sourceLockSha256': sha(lock),
+    receipt = {'status': 'PASS_NATIVE_COMMUNITY_LOCALES' if a.community_only else 'PASS_NATIVE_HOME_SIX_SECTIONS', 'inputs': pins, 'sourceLockSha256': sha(lock),
                'binarySha256': sha(image), 'observations': results, 'invalidTagRefused': True,
                'modifiedSourceRefused': True, 'completeHomepage': False, 'siteGenerated': False,
                'translationQualityQualified': False, 'publicationQualified': False}
