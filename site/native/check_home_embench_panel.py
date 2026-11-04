@@ -74,7 +74,12 @@ def main():
     actual=run(image,expected=42).stdout.decode(); rendered=nodes(actual)
     results=[]
     for tag,ref in zip(TAGS,refs):
-        if nodes(ref.read_text()) != rendered: raise ValueError(('panel mismatch',tag))
+        reference = ref.read_text()
+        old = 'href="./benchmarks/embench-c-parity-20261015.json"'
+        new = 'href="/benchmarks/embench-c-parity-20261015.json"'
+        if reference.count(old) != 1: raise ValueError(('unexpected reference link',tag))
+        if nodes(reference.replace(old, new)) != rendered: raise ValueError(('panel mismatch',tag))
+        if actual.count(new) != 1 or old in actual: raise ValueError(('incorrect benchmark link',tag))
         results.append(tag)
     for name in ('generator.cljk','embench.json','chart.cljk'):
         target=out/name; original=target.read_bytes()
