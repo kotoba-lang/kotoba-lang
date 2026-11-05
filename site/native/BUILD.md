@@ -103,9 +103,9 @@ a hosted fallback or report this local profile as Linux CI qualification.
 ## Linux observation, before automatic release qualification
 
 `Native site Linux observation` runs on an x86-64 Linux cloud runner for pull
-requests that change its diagnostic inputs. It downloads only a pinned Amu
-static ELF and twelve pinned native library sources, verifying every digest.
-It also fetches the digest-pinned, import-free native runner source. Linux
+requests that change its diagnostic inputs. It downloads a pinned Amu static
+ELF, twelve native library sources, the import-free native runner source and
+the existing DDS/grammar byte authorities (25 files), verifying every digest. Linux
 project compilation accepts KX64V1 payloads, rather than the scalar `static`
 format. The compiler builds a loaderless ELF runner with `kx64-runner` and
 the observer checks its native result receipts. Current-source project
@@ -131,9 +131,10 @@ The report
 keeps producer compilation, executed verdicts, full-site generation and
 publication as separate fields, including failures and private diagnostics.
 The pinned upstream Linux compiler is itself labelled a candidate. A passing
-observation must not enable the production Workers Builds trigger. Full-site
-rendering, locale/catalog gates, native controller and output parity are still
-required. The independent local CLJK route above remains available.
+observation must not enable the production Workers Builds trigger. The full
+sequence below separately verifies rendering, locale/catalog gates and output
+parity; a qualified native release controller is still required for automatic
+publication. The independent local CLJK route above remains available.
 
 ### Experimental complete Linux build
 
@@ -148,7 +149,7 @@ adapter. All authority parsing and output composition remain native Kotoba.
 ```sh
 python3 site/native/fetch_linux_observation.py --profile current-source --output /new/inputs
 python3 site/native/build_site.py --linux-inputs /new/inputs --compiler /new/inputs/amu.elf \
-  --libraries /new/inputs/lib --grammar /new/inputs/grammar --output /new/build --jobs 2
+  --libraries /new/inputs/lib --grammar /new/inputs/grammar --output /new/build --jobs 4
 python3 site/native/verify_site.py --build /new/build
 python3 site/native/compare_native_candidate.py --build /new/build
 python3 site/native/qualify_linux.py --build /new/build --inputs /new/inputs \
@@ -161,6 +162,31 @@ preflight passes, retaining private failures and the candidate. The byte
 comparison covers all 189 files against the already published Mac receipt;
 the same native page/catalog predicates cover 119 pages and 16 catalogs with
 mutation, bad-path, missing-landmark/key and small-source controls. A partial
-native stdout is never admitted as a successful fragment. This implementation
-still needs actual cloud execution evidence. `publish_site.py` explicitly
-refuses Linux candidates while publication/controller qualification is open.
+native stdout is never admitted as a successful fragment. `publish_site.py`
+explicitly refuses Linux candidates while publication/controller qualification
+is open.
+
+### Observed cloud results — 2026-11-05
+
+GitHub Actions run [41971823396](https://github.com/kotoba-lang/kotoba-lang/actions/runs/41971823396)
+at source `2002873bbc19f43c034251fb03c8c1798b24dc68` passed both profiles.
+The current-source profile executed all four native preflight checks, compiled
+52/52 producer closures, generated 17 locales / 189 files, matched every byte
+of the published Mac candidate, and passed 119 page / 16 catalog native checks
+and the real partial-output refusal controls. Its full generation/qualification
+step took 30m50s with four locale workers on Linux x86-64, four logical CPUs
+and 16,760,344,576 bytes RAM. This is one configuration-specific observation.
+
+The earlier two-worker run [41965504624](https://github.com/kotoba-lang/kotoba-lang/actions/runs/41965504624)
+also passed the full sequence (52m15s). Its artifact omitted four `.well-known`
+files because of GitHub's default hidden-file exclusion. The final workflow
+explicitly includes hidden files; independent artifact readback verified all
+189 candidate files plus the 56 native program/runner/source-lock bindings.
+The dated receipt is `docs/evidence/native-site-linux-cloud-20261105.json`.
+
+These results qualify the bounded generation/validation observation, not the
+upstream compiler as a whole or a native automatic release controller. They
+do not establish Cloudflare integrated Builds compatibility: that environment
+has a separate [20-minute build limit](https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/).
+No Workers Builds configuration or production trigger is created by this
+workflow. The explicit local CLJK route remains unchanged.
