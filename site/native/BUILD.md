@@ -123,13 +123,44 @@ python3 site/native/fetch_linux_observation.py --output /new/inputs
 python3 site/native/observe_linux.py --inputs /new/inputs --output /new/observation
 ```
 
-This is a diagnostic, not a qualified release controller or full-site build.
-The current macOS entries read virtual absolute paths under FD3, while Linux
-admits real paths under an explicit filesystem root. Native compile success
-does not solve that bridge or establish rendered output parity. The report
+This preflight is not a qualified release controller or full-site build.
+The immutable old profile is a negative baseline: its native basic checks
+must pass and its capability-bearing producer projects must all refuse E7101
+without artifacts. Only the current profile may proceed to full generation.
+The report
 keeps producer compilation, executed verdicts, full-site generation and
 publication as separate fields, including failures and private diagnostics.
 The pinned upstream Linux compiler is itself labelled a candidate. A passing
 observation must not enable the production Workers Builds trigger. Full-site
 rendering, locale/catalog gates, native controller and output parity are still
 required. The independent local CLJK route above remains available.
+
+### Experimental complete Linux build
+
+`--linux-inputs` explicitly selects `LinuxBuild`, the pinned current-source
+compiler, its self-built loaderless ELF KX64 runner, and `input_linux.kotoba`
+as the source of the `site.native.input` module. This adapter translates the
+site's logical leading slash to a relative request under the granted cwd;
+the default Mac adapter keeps the FD3 absolute spelling. Neither retries a
+refused operation with another provider. Text and binary reads use the same
+adapter. All authority parsing and output composition remain native Kotoba.
+
+```sh
+python3 site/native/fetch_linux_observation.py --profile current-source --output /new/inputs
+python3 site/native/build_site.py --linux-inputs /new/inputs --compiler /new/inputs/amu.elf \
+  --libraries /new/inputs/lib --grammar /new/inputs/grammar --output /new/build --jobs 2
+python3 site/native/verify_site.py --build /new/build
+python3 site/native/compare_native_candidate.py --build /new/build
+python3 site/native/qualify_linux.py --build /new/build --inputs /new/inputs \
+  --libraries /new/inputs/lib --grammar /new/inputs/grammar
+python3 site/native/check_release_failures.py --build /new/build
+```
+
+The cloud workflow performs this sequence only after its current-source
+preflight passes, retaining private failures and the candidate. The byte
+comparison covers all 189 files against the already published Mac receipt;
+the same native page/catalog predicates cover 119 pages and 16 catalogs with
+mutation, bad-path, missing-landmark/key and small-source controls. A partial
+native stdout is never admitted as a successful fragment. This implementation
+still needs actual cloud execution evidence. `publish_site.py` explicitly
+refuses Linux candidates while publication/controller qualification is open.

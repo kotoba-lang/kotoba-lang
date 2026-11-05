@@ -110,9 +110,13 @@ def observe(build,reference=None,port_reference=None):
  report={'status':'PASS_NATIVE_SITE_OBSERVATION','buildReceiptSha256':sha(build/'receipt.json'),'files':files,'reference':{},'differences':{},'generatorStampNormalization':sorted(STAMPS),'published':False,'reviewedPortDifferences':{},'normalizationRules':['URL resolution','explicit native generator stamps','head metadata field order (style/script order retained)','equivalent hreflang aria-current true/page','LTR English source islands']}
  programs={}
  for manifest in sorted(build.glob('*/build.json')):
-  record=json.loads(manifest.read_text());image=manifest.parent/'entry.macho';lock=manifest.parent/'project.ksl'
+  record=json.loads(manifest.read_text());image=manifest.parent/record.get('image','entry.macho');lock=manifest.parent/'project.ksl'
   if sha(image)!=record['binarySha256'] or sha(lock)!=record['sourceLockSha256']:raise ValueError('native program drift '+manifest.parent.name)
   programs[manifest.parent.name]={'binarySha256':sha(image),'sourceLockSha256':sha(lock),'buildManifestSha256':sha(manifest)}
+  if record.get('profile')=='Linux-x86_64':
+   runner=Path(record['runner']['path'])
+   if sha(runner)!=record['runner']['sha256']:raise ValueError('Linux runner drift')
+   programs[manifest.parent.name].update(image=record['image'],runnerSha256=sha(runner))
  report['nativePrograms']=programs
  if port_reference:
   report['portReference']={str(p.relative_to(port_reference)):sha(p) for p in port_reference.rglob('*') if p.is_file()}

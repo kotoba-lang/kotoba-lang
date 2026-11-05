@@ -167,7 +167,7 @@ def main():
     # Actual native execution, including the negative f64 comparison that was
     # a historical site blocker. A compile-success alone cannot pass this.
     fixtures = {
-      'float-negative-order': '(ns probe (:export [main]))\n(defn main [] :i64 (if (< -2.0 -1.0) 42 7))\n',
+      'float-negative-order': '(ns probe (:export [main]))\n(defn main [] :i64 (if (f64-lt -2.0 -1.0) 42 7))\n',
       'scoped-read': '(ns probe (:export [main]) (:capabilities [:cli/args :fs/app-data]))\n(defn main [] :i64 (if (string=? (typed-cap-call :fs/app-data :string :string (typed-cap-call :cli/args :string :string "0")) "native-input") 42 7))\n'
     }
     required = True
@@ -185,7 +185,8 @@ def main():
                 sibling.write_text('native-input')
                 refusal, stdout, stderr = o.execute(name + '-outside', image, folder, [str(sibling)])
                 item['outsideScopeRefusal'] = refusal
-                item['passed'] &= refusal['exit'] not in (None, 0, 42) and not stdout and b'KEXE_TRAP' in stderr
+                item['passed'] &= refusal['exit'] == 120 and b'KEXE_TRAP' in stderr and re.fullmatch(
+                    rb'\{:status :trap :exit 120 :fuel [^\n]*\}\n?', stdout) is not None
         required &= item['passed']
         report['nativeChecks'].append(item)
         save()
@@ -223,7 +224,7 @@ def main():
     # separately unported virtual-path runtime bridge; it is not execution.
     recipes = json.loads((ROOT / 'site/native/build-components.json').read_text())
     for name, recipe in recipes.items():
-        sources = {'src/site/native/'+n+'.kotoba':(ROOT/'site/native'/(n+'.kotoba')).read_bytes() for n in recipe['modules']}
+        sources = {'src/site/native/'+n+'.kotoba':(ROOT/'site/native'/('input_linux.kotoba' if n=='input' else n+'.kotoba')).read_bytes() for n in recipe['modules']}
         for n in recipe['entries']:
             sources[n] = (ROOT/'test/site/native'/Path(n).name).read_bytes()
         for n in recipe['aliases']:
@@ -232,7 +233,19 @@ def main():
         report['components'].append({**row, 'name':name})
         print(name, 'compiled' if row['compiled'] else 'BLOCKED', flush=True)
         save()
-    report.update(status='PASS_LINUX_NATIVE_PREFLIGHT_OBSERVATION' if required else 'FAIL_LINUX_NATIVE_PREFLIGHT_OBSERVATION',
+    complete = required and all(x['compiled'] for x in report['components'])
+    baseline = False
+    if a.profile == 'release-source':
+        baseline = all(x['exit']==0 and not x['stderrTail'] for x in report['cliCommands']) and len(report['cliCommands'])==2
+        baseline &= len(report['components'])==52 and all(not x['compiled'] and x['exit']==1 and 'E7101' in x['stderrTail'] and not x['artifactExists'] for x in report['components'])
+        for check in report['nativeChecks']:
+            if check['name']=='scoped-read':
+                compile=check['compilation']
+                baseline &= not compile['compiled'] and compile['exit']==1 and 'E7101' in compile['stderrTail'] and not compile['artifactExists']
+            else:
+                baseline &= check['passed']
+    report.update(status='PASS_LINUX_BASELINE_REFUSALS' if baseline else ('PASS_LINUX_NATIVE_PREFLIGHT_OBSERVATION' if complete else 'FAIL_LINUX_NATIVE_PREFLIGHT_OBSERVATION'),
+                  executedNativeChecksPassed=required, baselineRefusalControls=baseline,
                   compiledComponents=sum(x['compiled'] for x in report['components']), totalComponents=len(recipes),
                   allProducerClosuresCompiled=all(x['compiled'] for x in report['components']),
                   remainingBlockers=['Current producers use macOS FD3 virtual absolute paths; Linux uses explicitly scoped real paths.',
@@ -242,7 +255,7 @@ def main():
     if sha(compiler) != spec['compilerSha256']:
         raise ValueError('compiler changed during observation')
     print(report['status'], report['compiledComponents'], '/', report['totalComponents'], flush=True)
-    if not required:
+    if not (complete or baseline):
         raise SystemExit(1)
 
 

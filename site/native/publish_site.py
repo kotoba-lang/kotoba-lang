@@ -13,6 +13,7 @@ def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--build',type=Path,required=True);p.add_argument('--wrangler',type=Path,required=True);p.add_argument('--dry-run',action='store_true');a=p.parse_args()
  build=a.build.resolve(strict=True);candidate=build/'candidate';receipt=json.loads((build/'receipt.json').read_text());observation=json.loads((build/'observation.json').read_text());negative=json.loads((build/'negative-controls.json').read_text())
  files={str(p.relative_to(candidate)):sha(p) for p in candidate.rglob('*') if p.is_file()}
+ if receipt.get('profile')=='Linux-x86_64':raise ValueError('Linux candidates are observation-only; automatic publication is not qualified')
  if receipt.get('status')!='BUILT_NATIVE_SITE_CANDIDATE' or receipt.get('cljkInvoked') is not False or files!=receipt['files']:raise ValueError('native candidate drift')
  if observation.get('status')!='PASS_NATIVE_SITE_OBSERVATION' or observation.get('buildReceiptSha256')!=sha(build/'receipt.json') or observation.get('files')!=files:raise ValueError('candidate lacks successful observation')
  if negative.get('status')!='PASS_NATIVE_RELEASE_REFUSALS' or negative.get('candidateUnchanged') is not True or negative.get('buildReceiptSha256')!=sha(build/'receipt.json'):raise ValueError('candidate lacks refusal observations')

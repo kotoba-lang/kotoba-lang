@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TAGS = ('ar', 'arz', 'bn', 'de', 'es', 'fr', 'hi', 'id',
         'ja', 'ko', 'mr', 'pcm', 'pt', 'ru', 'ur', 'zh-Hans')
 SOURCES = ('site/native/locale_placeholders.kotoba', 'site/native/locale_catalog.kotoba',
-           'test/site/native/locale_catalog_file.kotoba')
+           'test/site/native/locale_catalog_file.kotoba', 'site/native/input.kotoba')
 
 
 def sha(path):

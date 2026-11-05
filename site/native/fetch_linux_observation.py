@@ -39,6 +39,17 @@ def main():
     for pin in pins.values():
         fetch('kotoba', spec['librariesRevision'], 'lib/' + pin['path'],
               'lib/' + pin['path'], pin['sha256'])
+    css = json.loads((ROOT/'site/native/css-source-dependencies.json').read_text())
+    for path, digest in css['ddsBase']['files'].items():
+        source = 'lib/kotoba.jpGoDigitalDesignSystem/'+path
+        fetch('kotoba', css['ddsBase']['revision'], source, source, digest)
+    theme = css['themeSource']
+    fetch('kotoba', theme['revision'], theme['path'], theme['path'], theme['sha256'])
+    syntax = css['syntaxTheme']
+    fetch('grammar', syntax['revision'], syntax['path'], 'grammar/'+syntax['path'], syntax['sha256'])
+    highlight = json.loads((ROOT/'site/native/highlight-source-dependencies.json').read_text())['grammar']
+    for path_key, digest_key in [('catalogPath','catalogSha256'), ('tokenizerPath','tokenizerSha256')]:
+        fetch('grammar', highlight['revision'], highlight[path_key], 'grammar/'+highlight[path_key], highlight[digest_key])
     (out / 'fetch.json').write_text(json.dumps(fetched, indent=2) + '\n')
     print('Fetched and verified', len(fetched), 'immutable inputs')
 

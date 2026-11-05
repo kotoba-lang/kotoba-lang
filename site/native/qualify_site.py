@@ -28,6 +28,7 @@ def bind(build,pages,catalogs):
   records.append({'directory':str(folder),'receiptSha256':sha(folder/'receipt.json'),'program':image,'programSha256':sha(folder/image),'sourceLock':lock,'sourceLockSha256':sha(folder/lock)})
  source_names=['site/native/locale_pages.kotoba','test/site/native/locale_pages_file.kotoba','test/site/native/locale_pages_test.kotoba','site/native/locale_catalog.kotoba','site/native/locale_placeholders.kotoba','test/site/native/locale_catalog_file.kotoba','site/native/check_pages.py','site/native/check_catalog_files.py','site/native/qualify_site.py']
  sources={n:sha(ROOT/n) for n in source_names}
+ sources['site/native/input.kotoba']=sha(ROOT/'site/native/input.kotoba')
  for n in source_names[:6]:
   if sources[n] not in ((pages/'page-file.ksl').read_text()+(pages/'page-unit.ksl').read_text()+(catalogs/'project.ksl').read_text()):raise ValueError('source not in native gate locks '+n)
  result={'status':'PASS_NATIVE_SITE_VALIDATION','buildReceiptSha256':sha(build/'receipt.json'),'pageChecks':119,'catalogChecks':16,'gates':records,'sourceHashes':sources,'published':False}

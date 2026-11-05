@@ -7,7 +7,7 @@ The new output directory is private until every native producer succeeds.
 """
 import argparse,concurrent.futures,hashlib,json,os,shutil
 from pathlib import Path
-from build_support import Build,ROOT,TAGS,native_run,sha,write_bytes
+from build_support import Build,ROOT,TAGS,native_run,sha,write_bytes,program_image
 
 def manifest(folder,tag,parts,name='manifest.edn'):
  for k,data in parts.items():write_bytes(folder/(k+'.html'),data)
@@ -22,7 +22,7 @@ class Job:
   for name,path in data.items():write_bytes(self.folder/name,Path(path).read_bytes())
   self.fragments={}
  def run(self,name,*args):
-  result=native_run(self.output/name/'entry.macho',self.folder,args)
+  result=native_run(program_image(self.output/name),self.folder,args)
   write_bytes(self.output/'fragments'/self.tag/(name+'-'+('-'.join(args) or 'data')+'.html'),result)
   return result
  def compose(self,name,parts,document=False,tag=None):
@@ -65,10 +65,17 @@ def locale_job(output,tag):
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
- for name in ['compiler','packager','libraries','grammar','output']:p.add_argument('--'+name,type=Path,required=True)
+ for name in ['compiler','libraries','grammar','output']:p.add_argument('--'+name,type=Path,required=True)
+ p.add_argument('--packager',type=Path);p.add_argument('--linux-inputs',type=Path)
  p.add_argument('--jobs',type=int,default=3);a=p.parse_args()
  if a.jobs<1 or a.jobs>8:raise ValueError('jobs must be 1..8')
- b=Build(a.output,a.compiler,a.packager,a.libraries,a.grammar)
+ if a.linux_inputs:
+  from linux_build import LinuxBuild
+  b=LinuxBuild(a.output,a.linux_inputs,a.libraries,a.grammar)
+  if b.compiler!=a.compiler.resolve():raise ValueError('Linux compiler argument mismatch')
+ else:
+  if not a.packager:raise ValueError('macOS profile requires --packager')
+  b=Build(a.output,a.compiler,a.packager,a.libraries,a.grammar)
  for name in b.recipes:b.compile(name)
  (b.output/'data.json').write_text(json.dumps({n:str(p) for n,p in b.data.items()},indent=2)+'\n')
  # Catalogue rows are rendered once natively and reused without translation.
@@ -109,6 +116,6 @@ def main():
  b.finish()
  files={str(f.relative_to(b.output/'candidate')):sha(f) for f in sorted((b.output/'candidate').rglob('*')) if f.is_file()}
  if len(files)!=189 or len(pages)!=133:raise ValueError(('release route count',len(files),len(pages)))
- receipt={'status':'BUILT_NATIVE_SITE_CANDIDATE','files':files,'htmlPages':len(pages),'locales':list(TAGS),'compilerSha256':sha(b.compiler),'packagerSha256':sha(b.packager),'inputsSha256':sha(b.output/'inputs.json'),'cljkInvoked':False,'published':False}
+ receipt={'status':'BUILT_NATIVE_SITE_CANDIDATE','files':files,'htmlPages':len(pages),'locales':list(TAGS),'compilerSha256':sha(b.compiler),'packagerSha256':sha(b.packager),'inputsSha256':sha(b.output/'inputs.json'),'cljkInvoked':False,'published':False,'profile':getattr(b,'profile','macOS-ARM64')}
  (b.output/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'],len(files),flush=True)
 if __name__=='__main__':main()
