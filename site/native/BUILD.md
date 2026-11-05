@@ -99,3 +99,29 @@ There is no qualified Cloudflare Linux build replacement for this macOS
 ARM64 profile. The former Workers Builds Node/NBB trigger is removed during
 the native cutover; local explicit CLJK builds remain available. Do not add
 a hosted fallback or report this local profile as Linux CI qualification.
+
+## Linux observation, before automatic release qualification
+
+`Native site Linux observation` runs on an x86-64 Linux cloud runner for pull
+requests that change its diagnostic inputs. It downloads only a pinned Amu
+static ELF and twelve pinned native library sources, verifying every digest.
+It runs a negative-number float comparison, scoped file reads and the sitemap
+unit/mutation pair as native programs, then observes compilation of all 52
+actual producer closures. Python stages bytes and records native process
+results. No CLJK, package install, C compiler, emulator or publication is run.
+
+```sh
+python3 site/native/fetch_linux_observation.py --output /new/inputs
+python3 site/native/observe_linux.py --inputs /new/inputs --output /new/observation
+```
+
+This is a diagnostic, not a qualified release controller or full-site build.
+The current macOS entries read virtual absolute paths under FD3, while Linux
+admits real paths under an explicit filesystem root. Native compile success
+does not solve that bridge or establish rendered output parity. The report
+keeps producer compilation, executed verdicts, full-site generation and
+publication as separate fields, including failures and private diagnostics.
+The pinned upstream Linux compiler is itself labelled a candidate. A passing
+observation must not enable the production Workers Builds trigger. Full-site
+rendering, locale/catalog gates, native controller and output parity are still
+required. The independent local CLJK route above remains available.
