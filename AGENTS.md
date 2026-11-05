@@ -95,3 +95,14 @@ record its command, tool versions, pinned inputs and output hashes separately.
 The native path must not invoke it or fall back to it, and CLJK success must
 not be reported as native qualification. This scoped site instruction does
 not restore JVM/NBB in CI or change other products' native-only contracts.
+
+## Native site delivery boundary (KOTOBA-160, 2026-11-05)
+
+The site's default build is the explicit macOS ARM64 native builder documented
+in `site/native/BUILD.md`; source/data pins and negative controls are required.
+The previous Workers Builds Node/NBB automatic build/deploy trigger is removed
+for the native cutover. There is no qualified Linux CI replacement yet; the
+local native build, route/DOM observer and refusal controls cover this release,
+while automated cloud rebuilding and other native targets remain unqualified.
+Keep the owner's explicitly retained local `site:build:cljk` route independent.
+Neither generation nor publication may silently select it as a fallback.
