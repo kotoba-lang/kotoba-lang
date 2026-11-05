@@ -83,3 +83,15 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
 All agents follow this contract. Old inventories, receipts and ADRs record
 past state; they do not prove current native qualification or grant permission
 for a production cutover or stopping existing services. Preserve unrelated WIP.
+
+## Site transition: retain the CLJK route (owner 2026-11-05, KOTOBA-160)
+
+The owner explicitly requested resolving native site generation and publishing
+JUN-851 while retaining the current CLJK route because native validation is
+still insufficient. Preserve `site/generate.cljk`, its dependencies and its
+explicit build entry for independent comparison and recovery during this
+transition. A local, explicitly selected CLJK comparison build is permitted;
+record its command, tool versions, pinned inputs and output hashes separately.
+The native path must not invoke it or fall back to it, and CLJK success must
+not be reported as native qualification. This scoped site instruction does
+not restore JVM/NBB in CI or change other products' native-only contracts.
