@@ -33,6 +33,7 @@ def main():
         fetched.append(dict(url=url, path=target, bytes=len(data), sha256=digest))
 
     fetch('amu', spec['amuRevision'], spec['compilerPath'], 'amu.elf', spec['compilerSha256'])
+    fetch('amu', spec['amuRevision'], spec['runnerSourcePath'], 'runner.kotoba', spec['runnerSourceSha256'])
     (out / 'amu.elf').chmod(0o700)
     pins = json.loads((ROOT / 'site/native/build-library-pins.json').read_text())
     for pin in pins.values():

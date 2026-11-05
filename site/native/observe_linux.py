@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import struct
 import subprocess
@@ -32,14 +33,16 @@ def static_elf(path):
 
 
 class Observation:
-    def __init__(self, out, compiler):
-        self.out, self.compiler = out, compiler
+    def __init__(self, out, compiler, explicit_caps):
+        self.out, self.compiler, self.explicit_caps = out, compiler, explicit_caps
         self.calls = []
 
-    def invoke(self, name, image, folder, argv=(), allow='35,37,38,39'):
+    def invoke(self, name, image, folder, argv=(), allow='35,37,38,39', structured=False):
         env = dict(PATH='/nonexistent', LANG='C', KEXE_ALLOW=allow,
                    KEXE_CAP_RESOURCES_35=str(folder), KEXE_STACK_BYTES='8388608',
                    KEXE_FUEL='off', KEXE_STRING_POOL='268435456')
+        if structured:
+            env['KEXE_STRUCTURED_REPORT'] = '1'
         start = time.monotonic()
         try:
             r = subprocess.run([str(image), *map(str, argv)], cwd=folder, env=env,
@@ -58,7 +61,7 @@ class Observation:
         (self.out / 'calls.json').write_text(json.dumps(self.calls, indent=2) + '\n')
         return row, stdout, stderr
 
-    def compile(self, name, sources, entry, native=True):
+    def compile(self, name, sources, entry, capabilities='35,37,38,39'):
         folder = self.out / name
         folder.mkdir()
         for target, data in sources.items():
@@ -67,20 +70,32 @@ class Observation:
         lock = folder / 'source.ksl'
         lock.write_text('KSL1\nentry ' + str(entry_path) + '\nroot ' + str(folder / 'src') + '\n' +
                         ''.join('file ' + sha(folder / n) + ' ' + str(folder / n) + '\n' for n in sorted(sources)))
-        image = folder / ('entry.elf' if native else 'entry.kx64')
+        image = folder / 'entry.kx64'
+        extra = ['--project-capabilities', capabilities] if self.explicit_caps and capabilities != '-' else []
         row, _, stderr = self.invoke(name + '-compile', self.compiler, folder,
             ['compile', entry_path, '--target', 'x86_64-linux', '--output', image,
-             '--format', 'static' if native else 'kx64-v1', '--source-path', folder / 'src',
-             '--source-lock', lock, '--source-lock-sha256', sha(lock)])
+             '--format', 'kx64-v1', '--source-path', folder / 'src',
+             '--source-lock', lock, '--source-lock-sha256', sha(lock), *extra])
         row = dict(row, sourceLockSha256=sha(lock), sources={n:sha(folder/n) for n in sources},
                    artifactExists=image.is_file())
         row['compiled'] = row['exit'] == 0 and not stderr and image.is_file()
         if row['compiled']:
-            if native:
-                static_elf(image)
-                image.chmod(0o700)
+            header, payload = image.read_bytes().split(b'\n\n', 1)
+            m = re.fullmatch(rb'KX64V1 x86_64-linux sysv-ctx-v11 ([0-9]+) 0', header)
+            if not m or int(m[1]) != len(payload) or not payload or payload[0] != 0xe9:
+                raise ValueError('invalid native project payload')
+            (folder/'entry.bin').write_bytes(payload)
             row['artifactSha256'] = sha(image)
-        return row, image, folder
+        return row, folder/'entry.bin', folder
+
+    def execute(self, name, payload, folder, argv=(), allow='35,37,38,39'):
+        return self.invoke(name, self.runner, folder,
+            [payload, '0', '0', 'x86_64', allow, '--', *argv], allow=allow, structured=True)
+
+
+def verdict(row, stdout, stderr, expected):
+    return row['exit'] == 0 and not stderr and re.fullmatch(
+        rb'\{:status :ok\s+:result ' + str(expected).encode() + rb'\s+[^\n]*\}\n?', stdout) is not None
 
 
 def main():
@@ -103,7 +118,7 @@ def main():
             raise ValueError('library input drift: ' + n)
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    o = Observation(out, compiler)
+    o = Observation(out, compiler, spec['explicitProjectCapabilities'])
     report = dict(status='LINUX_NATIVE_OBSERVATION_INCOMPLETE', host=dict(system=platform.system(),
         machine=platform.machine(), kernel=platform.release()), compilerSha256=sha(compiler),
         amuRevision=spec['amuRevision'], profile=a.profile, nativeChecks=[], components=[], cliCommands=[], fullSiteGenerated=False,
@@ -112,6 +127,28 @@ def main():
 
     def save():
         (out / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
+    save()
+
+    # Linux project compilation emits KX64V1, not a static ELF. Build the
+    # upstream's native runner from its pinned, import-free source through
+    # the separate scalar kx64-runner interface; never use a C loader.
+    runner_source = inputs / 'runner.kotoba'
+    if sha(runner_source) != spec['runnerSourceSha256']:
+        raise ValueError('native runner source drift')
+    runtime = out / 'native-runner'
+    runtime.mkdir()
+    shutil.copyfile(runner_source, runtime/'runner.kotoba')
+    o.runner = runtime/'runner.elf'
+    row, _, stderr = o.invoke('runner-build', compiler, runtime,
+        ['compile', runtime/'runner.kotoba', '--target', 'x86_64-linux', '--output', o.runner, '--format', 'kx64-runner'])
+    report['runnerBuild'] = dict(row, sourceSha256=sha(runner_source))
+    if row['exit'] == 0 and not stderr and o.runner.is_file():
+        report['runnerBuild']['imageSha256'] = static_elf(o.runner)
+        o.runner.chmod(0o700)
+    else:
+        report['status'] = 'FAIL_LINUX_NATIVE_RUNNER_BUILD'
+        save()
+        raise SystemExit(1)
     save()
 
     # Distinguish CLI dispatch from the source-lock/project/backend boundary.
@@ -140,13 +177,13 @@ def main():
         if row['compiled']:
             target = folder / 'input.txt'
             target.write_text('native-input')
-            run, stdout, stderr = o.invoke(name + '-run', image, folder, [str(target)] if name == 'scoped-read' else ())
+            run, stdout, stderr = o.execute(name + '-run', image, folder, [str(target)] if name == 'scoped-read' else ())
             item['execution'] = run
-            item['passed'] = run['exit'] == 42 and not stdout and not stderr
+            item['passed'] = verdict(run, stdout, stderr, 42)
             if name == 'scoped-read':
                 sibling = out / 'outside-scope.txt'
                 sibling.write_text('native-input')
-                refusal, stdout, stderr = o.invoke(name + '-outside', image, folder, [str(sibling)])
+                refusal, stdout, stderr = o.execute(name + '-outside', image, folder, [str(sibling)])
                 item['outsideScopeRefusal'] = refusal
                 item['passed'] &= refusal['exit'] not in (None, 0, 42) and not stdout and b'KEXE_TRAP' in stderr
         required &= item['passed']
@@ -163,12 +200,20 @@ def main():
             source = source.replace(needle, b'https://kotoba-lang.org/wrong/</loc>')
         row, image, folder = o.compile(name, {
           'src/site/native/sitemap.kotoba':(ROOT / 'site/native/sitemap.kotoba').read_bytes(),
-          'src/site/native/sitemap_test.kotoba':source}, 'src/site/native/sitemap_test.kotoba')
+          'src/site/native/sitemap_test.kotoba':source}, 'src/site/native/sitemap_test.kotoba', capabilities='-')
         item = dict(name=name, compilation=row, passed=False)
         if row['compiled']:
-            run, stdout, stderr = o.invoke(name + '-run', image, folder, allow='-')
+            run, stdout, stderr = o.execute(name + '-run', image, folder, allow='-')
             item['execution'] = run
-            item['passed'] = run['exit'] == (7 if mutant else 42) and not stdout and not stderr
+            item['passed'] = verdict(run, stdout, stderr, 7 if mutant else 42)
+            if not mutant:
+                refused = folder/'wrong-lock.kx64'
+                denial, _, diagnostic = o.invoke('sitemap-lock-refusal', compiler, folder,
+                    ['compile', folder/'src/site/native/sitemap_test.kotoba', '--target', 'x86_64-linux',
+                     '--output', refused, '--format', 'kx64-v1', '--source-path', folder/'src',
+                     '--source-lock', folder/'source.ksl', '--source-lock-sha256', '0'*64])
+                item['sourceLockRefusal'] = denial
+                item['passed'] &= denial['exit'] not in (None, 0) and b'E6015' in diagnostic and not refused.exists()
         required &= item['passed']
         report['nativeChecks'].append(item)
         save()
@@ -183,7 +228,7 @@ def main():
             sources[n] = (ROOT/'test/site/native'/Path(n).name).read_bytes()
         for n in recipe['aliases']:
             sources['src/'+n] = (inputs/'lib'/ALIASES[n]).read_bytes()
-        row, _, _ = o.compile('component-'+name, sources, recipe.get('entry') or recipe['entries'][0], native=False)
+        row, _, _ = o.compile('component-'+name, sources, recipe.get('entry') or recipe['entries'][0])
         report['components'].append({**row, 'name':name})
         print(name, 'compiled' if row['compiled'] else 'BLOCKED', flush=True)
         save()

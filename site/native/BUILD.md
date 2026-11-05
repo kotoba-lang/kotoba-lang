@@ -105,6 +105,14 @@ a hosted fallback or report this local profile as Linux CI qualification.
 `Native site Linux observation` runs on an x86-64 Linux cloud runner for pull
 requests that change its diagnostic inputs. It downloads only a pinned Amu
 static ELF and twelve pinned native library sources, verifying every digest.
+It also fetches the digest-pinned, import-free native runner source. Linux
+project compilation accepts KX64V1 payloads, rather than the scalar `static`
+format. The compiler builds a loaderless ELF runner with `kx64-runner` and
+the observer checks its native result receipts. Current-source project
+compilation receives the explicit bounded capability list; the older source
+profile does not implement that option. No compiler flags or admission checks
+are patched in memory.
+
 It runs a negative-number float comparison, scoped file reads and the sitemap
 unit/mutation pair as native programs, then observes compilation of all 52
 actual producer closures. Python stages bytes and records native process
