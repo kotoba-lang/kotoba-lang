@@ -106,3 +106,14 @@ local native build, route/DOM observer and refusal controls cover this release,
 while automated cloud rebuilding and other native targets remain unqualified.
 Keep the owner's explicitly retained local `site:build:cljk` route independent.
 Neither generation nor publication may silently select it as a fallback.
+
+## Linux site observation (KOTOBA-160, 2026-11-05)
+
+The Linux workflow is a bounded native diagnostic: immutable static Amu ELF,
+native execution/refusals and actual producer-source compilation. It neither
+reinstates the retired hosted build nor claims a qualified native release
+controller. Python only stages bytes and observes the native processes.
+Full Linux rendering, the native controller, locale/catalog and byte parity
+remain explicit qualification requirements before automatic release. There
+is no production deploy step, npm install or CLJK fallback in this diagnostic;
+the existing local CLJK build/source/dependencies must remain intact.

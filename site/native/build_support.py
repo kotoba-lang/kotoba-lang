@@ -14,8 +14,13 @@ ALIASES={'html_core.kotoba':'kotoba.html/kotoba/html_core.kotoba','html_hiccup.k
 def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 def write_bytes(path,data):
  path=Path(path);path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+def program_image(folder):
+ folder=Path(folder)
+ return folder/('entry.bin' if (folder/'entry.bin').exists() else 'entry.macho')
 def native_run(image,folder,args=(),expected=42,timeout=900):
  """The child receives only the private data root and declared native inputs."""
+ if Path(image).suffix=='.bin':
+  return linux_run(image,folder,args,expected,timeout)
  image,folder=Path(image),Path(folder);fd=os.open(folder,os.O_RDONLY|os.O_DIRECTORY);saved=None
  if fd!=3:
   try:saved=os.dup(3)
@@ -34,6 +39,21 @@ def native_run(image,folder,args=(),expected=42,timeout=900):
   (folder/'failed.stdout').write_bytes(r.stdout);(folder/'failed.stderr').write_bytes(r.stderr)
   raise RuntimeError((image.name,args,r.returncode,r.stderr[-1000:]))
  return r.stdout
+
+def linux_run(image,folder,args=(),expected=42,timeout=900):
+ image,folder=Path(image),Path(folder)
+ record=json.loads((image.parent/'build.json').read_text());runner=Path(record['runner']['path'])
+ if sha(image)!=record['binarySha256'] or sha(runner)!=record['runner']['sha256']:raise ValueError('Linux native program/runner drift')
+ env={'PATH':'/nonexistent','LANG':'C','KEXE_ALLOW':'35,37,38,39','KEXE_CAP_RESOURCES_35':str(folder),'KEXE_STACK_BYTES':'8388608','KEXE_FUEL':'off','KEXE_STRING_POOL':'268435456','KEXE_STRUCTURED_REPORT':'1'}
+ argv=[str(runner),str(image),'0','0','x86_64','35,37,38,39','--',*map(str,args)]
+ start=time.monotonic();r=subprocess.run(argv,cwd=folder,env=env,capture_output=True,timeout=timeout)
+ call={'image':str(image),'argv':argv,'imageSha256':sha(image),'runnerSha256':sha(runner),'exit':r.returncode,'seconds':time.monotonic()-start,'stdoutSha256':hashlib.sha256(r.stdout).hexdigest(),'stderrSha256':hashlib.sha256(r.stderr).hexdigest(),'PATH':'/nonexistent','scope':str(folder)}
+ with (folder/'calls.jsonl').open('a') as f:f.write(json.dumps(call)+'\n')
+ tail=re.search(rb'\{:status :ok :result '+str(expected).encode()+rb' :fuel [^\n]*\}\n?$',r.stdout)
+ if r.returncode or r.stderr or not tail:
+  (folder/'failed.stdout').write_bytes(r.stdout);(folder/'failed.stderr').write_bytes(r.stderr)
+  raise RuntimeError((image.name,args,r.returncode,r.stdout[-200:],r.stderr[-1000:]))
+ return r.stdout[:tail.start()]
 class Build:
  def __init__(self,output,compiler,packager,libraries,grammar):
   if (platform.system(),platform.machine())!=('Darwin','arm64'):raise ValueError('this native build profile requires macOS ARM64')

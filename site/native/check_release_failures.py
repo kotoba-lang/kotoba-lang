@@ -2,7 +2,7 @@
 """Observe real native refusals, including rejection of partially emitted HTML."""
 import argparse,json
 from pathlib import Path
-from build_support import native_run,sha,write_bytes
+from build_support import native_run,sha,write_bytes,program_image
 from build_site import Job
 
 def main():
@@ -13,7 +13,7 @@ def main():
   target=folder/filename if filename else None;old=target.read_bytes() if target else None
   try:
    if target:target.write_bytes(replacement if replacement is not None else old+b' ')
-   data=native_run(build/name/'entry.macho',folder,args,expected=7)
+   data=native_run(program_image(build/name),folder,args,expected=7)
    if bool(data)!=partial:raise ValueError(('unexpected refusal output',name,len(data),partial))
    obs.append({'producer':name,'argv':args,'modified':filename,'exit':7,'partialStdoutBytes':len(data),'candidateChanged':False})
   finally:
