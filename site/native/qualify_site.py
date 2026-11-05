@@ -29,7 +29,7 @@ def bind(build,pages,catalogs):
  source_names=['site/native/locale_pages.kotoba','test/site/native/locale_pages_file.kotoba','test/site/native/locale_pages_test.kotoba','site/native/locale_catalog.kotoba','site/native/locale_placeholders.kotoba','test/site/native/locale_catalog_file.kotoba','site/native/check_pages.py','site/native/check_catalog_files.py','site/native/qualify_site.py']
  sources={n:sha(ROOT/n) for n in source_names}
  sources['site/native/input.kotoba']=sha(ROOT/'site/native/input.kotoba')
- for n in source_names[:6]:
+ for n in [*source_names[:6],'site/native/input.kotoba']:
   if sources[n] not in ((pages/'page-file.ksl').read_text()+(pages/'page-unit.ksl').read_text()+(catalogs/'project.ksl').read_text()):raise ValueError('source not in native gate locks '+n)
  result={'status':'PASS_NATIVE_SITE_VALIDATION','buildReceiptSha256':sha(build/'receipt.json'),'pageChecks':119,'catalogChecks':16,'gates':records,'sourceHashes':sources,'published':False}
  (build/'native-validation.json').write_text(json.dumps(result,indent=2)+'\n');return result

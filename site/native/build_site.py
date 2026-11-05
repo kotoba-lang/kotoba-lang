@@ -70,9 +70,10 @@ def main():
  p.add_argument('--jobs',type=int,default=3);a=p.parse_args()
  if a.jobs<1 or a.jobs>8:raise ValueError('jobs must be 1..8')
  if a.linux_inputs:
+  if a.packager:raise ValueError('Linux profile does not accept the macOS --packager option')
+  if (a.linux_inputs/'amu.elf').resolve(strict=True)!=a.compiler.resolve(strict=True):raise ValueError('Linux compiler argument mismatch')
   from linux_build import LinuxBuild
   b=LinuxBuild(a.output,a.linux_inputs,a.libraries,a.grammar)
-  if b.compiler!=a.compiler.resolve():raise ValueError('Linux compiler argument mismatch')
  else:
   if not a.packager:raise ValueError('macOS profile requires --packager')
   b=Build(a.output,a.compiler,a.packager,a.libraries,a.grammar)

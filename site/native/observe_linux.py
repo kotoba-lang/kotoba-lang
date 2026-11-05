@@ -3,7 +3,7 @@
 
 No rendering, source rewriting, hosted compiler or publication occurs here.
 Native verdicts and refusal observations remain separate from compilation.
-The existing macOS-only generator and retained CLJK route are unchanged.
+The Mac profile and the retained CLJK route remain available.
 """
 import argparse
 import hashlib
