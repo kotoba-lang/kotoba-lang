@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compose historical native library sections with an explicit test-only marker."""
+"""Compose real historical native library sections without injecting test markers."""
 import argparse,hashlib,json,os,platform,re,shutil,subprocess
 from pathlib import Path
 from urllib.parse import urljoin
@@ -71,7 +71,7 @@ def main():
  for tag,ref,pref in zip(TAGS,refs,privacyrefs):
   for n in NAMES:shutil.copyfile(files[(tag,n)],out/(n+'.html'))
   manifest(tag);got=run(image,tag,expected=42)
-  if b'UNQUALIFIED LIBRARY STATUS FOR TEST' not in got or b'KOTOBA_' in got:raise ValueError(('fixture marker',tag))
+  if b'UNQUALIFIED LIBRARY STATUS FOR TEST' in got or b'KOTOBA_' in got:raise ValueError(('fixture marker',tag))
   original=ref.read_text().replace('site/generate.cljk','site/native/library_body_shell.kotoba')
   if tag=='ja':
    old='href="/ja/libraries/">日本語</a>';new='href="/libraries/">English</a>'

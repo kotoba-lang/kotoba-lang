@@ -45,7 +45,7 @@ def main():
     d, h, s = [json.loads(p.read_text()) for p in (deps, html_deps, source_pins)]
     if (d['dependencies'][0]['sha256'] != sha(sha_source) or
         [x['sha256'] for x in h['dependencies']] != [sha(core), sha(hiccup)] or
-        s['sha256'] != sha(button) or sha(ROOT/'site/generate.cljk') != '5bb0ff5d9e2f80ca7a76545ead6d0138ab7516f2bb712dd4f059d8b0bb4f5ab2' or
+        s['sha256'] != sha(button) or sha(ROOT/'site/generate.cljk') != 'ca2955ee08ec6891787d7636238b1bc7b0ab64b807c4c8ce653ec03657d6c072' or
         sha(ROOT/'site/sponsorship.edn') != 'f7eed846369300609667cbfa3e0fa79150acd1f88f63bc742bde54ea46f6b380'):
         raise ValueError('dependency or source drift')
     component_spec = json.loads((ROOT / 'site/native/dds-dependencies.json').read_text())

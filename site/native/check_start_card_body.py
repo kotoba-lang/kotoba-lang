@@ -56,7 +56,7 @@ def main():
     if (d['dependencies'][0]['sha256'] != sha(sha_source) or
         [x['sha256'] for x in h['dependencies']] != [sha(core), sha(hiccup)] or
         b['schema'] != 'kotoba.site.native-header-dependencies.v1' or b['sha256'] != sha(button) or b['theme']['sha256'] != sha(theme) or b['selector']['sha256'] != sha(selector) or
-        sha(ROOT/'site/generate.cljk') != '5bb0ff5d9e2f80ca7a76545ead6d0138ab7516f2bb712dd4f059d8b0bb4f5ab2' or sha(ROOT/'site/src/kotoba/site/locales.cljk') != 'ef97ede6b5a4f2bf0d0efc467780b305e1cf54afa5c2800b659f613180bc0aaf'):
+        sha(ROOT/'site/generate.cljk') != 'ca2955ee08ec6891787d7636238b1bc7b0ab64b807c4c8ce653ec03657d6c072' or sha(ROOT/'site/src/kotoba/site/locales.cljk') != 'ef97ede6b5a4f2bf0d0efc467780b305e1cf54afa5c2800b659f613180bc0aaf'):
         raise ValueError('dependency or source drift')
     for p in (compiler, packager):
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(p)], check=True, capture_output=True, timeout=30)
