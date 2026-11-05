@@ -87,11 +87,13 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--inputs', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--profile', choices=['release-source', 'current-source'], default='release-source')
     a = p.parse_args()
     if (platform.system(), platform.machine()) != ('Linux', 'x86_64'):
         raise ValueError('native Linux x86-64 required; emulation is not qualification')
     inputs = a.inputs.resolve(strict=True)
     spec = json.loads((ROOT / 'site/native/linux_toolchain.json').read_text())
+    spec = {**spec, **spec['profiles'][a.profile]}
     compiler = inputs / 'amu.elf'
     if static_elf(compiler) != spec['compilerSha256']:
         raise ValueError('unqualified observation compiler bytes')
@@ -104,13 +106,26 @@ def main():
     o = Observation(out, compiler)
     report = dict(status='LINUX_NATIVE_OBSERVATION_INCOMPLETE', host=dict(system=platform.system(),
         machine=platform.machine(), kernel=platform.release()), compilerSha256=sha(compiler),
-        amuRevision=spec['amuRevision'], nativeChecks=[], components=[], fullSiteGenerated=False,
+        amuRevision=spec['amuRevision'], profile=a.profile, nativeChecks=[], components=[], cliCommands=[], fullSiteGenerated=False,
         publicationQualified=False, hostedFallback=False, cljkInvoked=False,
         macosBuilderChanged=False, limitations=['The upstream toolchain descriptor is a candidate, not complete compiler qualification.'])
 
     def save():
         (out / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
     save()
+
+    # Distinguish CLI dispatch from the source-lock/project/backend boundary.
+    cli = out / 'cli-smoke'
+    cli.mkdir()
+    literal = cli / 'literal.kotoba'
+    literal.write_text('(ns probe (:export [main]))\n(defn main [] :i64 42)\n')
+    for name, argv in [
+        ('check', ['check', literal]),
+        ('scalar-static', ['compile', literal, '--target', 'x86_64-linux', '--output', cli/'literal.elf', '--format', 'static']),
+    ]:
+        row, _, _ = o.invoke('cli-'+name, compiler, cli, argv)
+        report['cliCommands'].append(row)
+        save()
 
     # Actual native execution, including the negative f64 comparison that was
     # a historical site blocker. A compile-success alone cannot pass this.
@@ -169,7 +184,7 @@ def main():
         for n in recipe['aliases']:
             sources['src/'+n] = (inputs/'lib'/ALIASES[n]).read_bytes()
         row, _, _ = o.compile('component-'+name, sources, recipe.get('entry') or recipe['entries'][0], native=False)
-        report['components'].append(dict(name=name, **row))
+        report['components'].append({**row, 'name':name})
         print(name, 'compiled' if row['compiled'] else 'BLOCKED', flush=True)
         save()
     report.update(status='PASS_LINUX_NATIVE_PREFLIGHT_OBSERVATION' if required else 'FAIL_LINUX_NATIVE_PREFLIGHT_OBSERVATION',

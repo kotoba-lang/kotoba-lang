@@ -12,10 +12,12 @@ ROOT = Path(__file__).resolve().parents[2]
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--profile', choices=['release-source', 'current-source'], default='release-source')
     a = p.parse_args()
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     spec = json.loads((ROOT / 'site/native/linux_toolchain.json').read_text())
+    spec = {**spec, **spec['profiles'][a.profile]}
     fetched = []
 
     def fetch(repo, rev, source, target, expected):
