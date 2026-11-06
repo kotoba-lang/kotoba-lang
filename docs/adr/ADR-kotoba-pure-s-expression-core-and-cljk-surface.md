@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-04
+- **Amended 2026-11-07**: [`ADR-target-portable-canonical-form.md`](ADR-target-portable-canonical-form.md)
+  confirms that `.kotoba` stays pure and adds one spelling per meaning (D2), and
+  moves `rel` and `query` out of the portable core (D6).
 - **Supersedes**: `ADR-kotoba-syntax-layers-and-quote-position.md` (item 1 regarding surface restriction)
 - **Artifacts**: this ADR and language architecture contract
 - **Related**: `ADR-kotoba-syntax-layers-and-quote-position.md`,

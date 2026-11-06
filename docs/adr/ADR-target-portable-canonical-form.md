@@ -1,16 +1,17 @@
 # ADR — The canonical Kotoba form is the portable program; each target is a qualified profile
 
-- **Status**: Proposed. This records an owner-decision request. Nothing here is
-  implemented, qualified or a change to an accepted contract until the owner
-  accepts it; decisions D1–D7 below are open.
+- **Status**: Accepted, owner decision 2026-11-07 (D1–D7 below). This decides the
+  direction. No stage is implemented or qualified, and the exact spelling in §2.1
+  is reviewed at S1.
 - **Date**: 2026-11-07
 - **Tracking**: Linear JUN-949 (this ADR), JUN-947 (investigation)
 - **Evidence**: [`docs/evidence/target-portable-core-20261107/`](../evidence/target-portable-core-20261107/README.md)
 - **Builds on**: [`ADR-kotoba-pure-s-expression-core-and-cljk-surface.md`](ADR-kotoba-pure-s-expression-core-and-cljk-surface.md),
   [`stack-architecture-target-neutral.ja.md`](../stack-architecture-target-neutral.ja.md),
   amu ADR 0397 (ES modules over SIR), amu ADR 0410 (what coverage means)
-- **Would need amending if accepted in full**:
-  [`ADR-kotoba-amu-selfhost-only.md`](ADR-kotoba-amu-selfhost-only.md) (D3, D4)
+- **Amends**: [`ADR-kotoba-amu-selfhost-only.md`](ADR-kotoba-amu-selfhost-only.md)
+  (D3, D4), [`ADR-kotoba-pure-s-expression-core-and-cljk-surface.md`](ADR-kotoba-pure-s-expression-core-and-cljk-surface.md)
+  (D2, D6)
 
 ## Context
 
@@ -81,6 +82,56 @@ Consequences:
   `:js` branches. Target differences belong in capability providers, which keeps
   one source meaning one program.
 
+### 2.1 Kotoba stays pure: IPLD data with Unison-style identity (D2)
+
+The owner's decision: the Kotoba language is kept pure so that it stays IPLD and
+Unison-like. Rules:
+
+1. **One spelling per meaning.** `.kotoba` carries no sugar. `->`, `cond`,
+   destructuring, `#?(...)` and `defdesugar` belong to the `.cljk` and `.edn`
+   surfaces, which must normalize to the same Definition CID.
+2. **Source is inert data with an IPLD representation.** Every pure form has one
+   defined, lossless mapping onto the IPLD Data Model, with `:i64` as exact
+   integers and floats as exact bits. S1 writes that mapping down.
+3. **No second identity.** The Definition CID stays where
+   [`lang/code-identity.edn`](../../lang/code-identity.edn) puts it: DAG-CBOR over
+   checked typed KIR, effect row, interface and dependencies. The pure form is how
+   that program is written, not another hash. This keeps the refusal of a second
+   canonical S-expression in
+   [`ADR-kotoba-syntax-layers-and-quote-position.md`](ADR-kotoba-syntax-layers-and-quote-position.md).
+4. **Names are metadata.** Binders are alpha-normalized and callees are sealed by
+   CID, as already implemented, so renaming changes no identity. `(ref name)` is
+   module-local today; `(ref <cid>)` is the target for cross-definition references.
+5. **Effects are visible and typed.** Effects occur only through `perform` and are
+   sealed in the effect row. A CID never grants authority.
+
+The owner approved the direction. The following spelling is drafted to fit it and
+is reviewed at the start of S1:
+
+```clojure
+(def inc1 (lam [n :i64] :i64 (+ n 1)))
+```
+
+| Part | Spelling | Why |
+|---|---|---|
+| Top level | `(def NAME VALUE)` | Replaces `defn`; a function is a value |
+| Function | `(lam [x T ...] R BODY)`, with `T` and `R` optional where inference decides | Keeps today's binder and result order, so conversion from `defn` is mechanical |
+| Types | Data: `:i64`, `[:option T]`, `[:fn [T] R]` | Already plain data, so already representable in IPLD |
+| Other heads | `app`, `ref`, `let`, `if`, `do`, `perform`, `handle` | From the 2026-09-04 ADR, minus `rel` and `query` (D6) |
+
+To settle at S1, because the sources do not decide them:
+
+- Prefix `(f a)` or `(app f a)`. The 2026-09-04 ADR allows both, which breaks rule
+  1. The recommendation is prefix for a named head and `app` only for a computed
+  operator.
+- The canonical form of records, variants, protocols, multi-arity functions,
+  `loop`/`recur` and the module header (`ns`, exports).
+
+**Migration.** Today's `.kotoba` files, including the compiler's own seed, are
+Clojure-shaped, and the 2026-09-04 ADR permits that until its step 3. So the order
+is: selfhost admits the pure forms; sources convert mechanically with Definition
+CID equality and a negative control per pair; only then does `.kotoba` refuse sugar.
+
 ### 3. Meaning is specified at the form, without naming an ISA
 
 Add a target-independent normative contract, proposed as
@@ -95,16 +146,16 @@ it rather than defining it. It starts from what the compiler already does:
 | `:string` | UTF-8; length in bytes unless a code-point operation is named | SSoT |
 | `:f32` / `:f64` | IEEE-754, ties-to-even, no contraction or fast-math | SSoT |
 | Evaluation | Left to right, call by value | SSoT |
-| Tail calls | Proper: a call in tail position does not grow the stack | Proposed; emitters already do it, including the JS trampoline |
-| Traps | A closed, named set with the same name on every target | Proposed |
-| Resource exhaustion | See D5 | Open |
+| Tail calls | Proper: a call in tail position does not grow the stack | New in this contract; emitters already do it, including the JS trampoline |
+| Traps | A closed, named set with the same name on every target | New in this contract |
+| Resource exhaustion | A named trap on every target, including deep non-tail recursion on native (D5) | Decided; native exits 139 today |
 
 ### 4. Three profiles
 
 | Profile | Contains | Who must implement it |
 |---|---|---|
 | `kotoba-core` | Pure canonical computation: scalars, strings, bytes, records, variants, options, results, vectors, documents, closures, abort handling | Every qualified target |
-| `kotoba-cap` | `perform` and capability imports through a host ABI | A target plus a host that provides the capability; absent means refused |
+| `kotoba-cap` | `perform`, capability imports through a host ABI, and `rel` / `query` until they are portable (D6) | A target plus a host that provides the capability; absent means refused |
 | `kotoba-sys` | `kernel-*`, memory windows, GPU and privileged actions | Named native targets only |
 
 Legacy emitter builtins (`"i64+"`, `"alloc"`, `"str-ptr"`, `"mem-i32-at"`) and
@@ -122,12 +173,14 @@ program's profile is computed by the checker and recorded with its artifact.
 
 ### 6. Routes
 
-- Amu selfhost stays the reference route and, until D3 is decided, the only
-  required route.
-- A conforming route takes canonical forms and passes the corpus. It may claim
-  Definition CID identity only if it reproduces the CID; otherwise it may claim
-  behavior only.
+- Amu selfhost stays the reference route and the only required route (D3).
+- Other routes are official for generated targets when they take canonical forms
+  and pass the corpus. A route may claim Definition CID identity only if it
+  reproduces the CID; otherwise it may claim behavior only.
 - Routes do not fall back to one another.
+- Target toolchains (JVM, `rustc`, a C compiler, Python) may run generated output
+  in a separate, non-required target-qualification tier. That tier cannot feed the
+  compiler, its build or the required gates (D4).
 
 ### 7. How source targets are emitted
 
@@ -169,34 +222,38 @@ Claims are made per target. As an expectation to be tested, not a result:
 
 Each stage has its own exit evidence, and none implies the next.
 
-1. **S0**: Owner decisions D1–D7.
-2. **S1**: The self-hosted frontend admits the full canonical core, or the
-   canonical core is corrected by decision D2. Exit: core-head table all admitted,
-   surface-equivalence pairs measured with their controls.
-3. **S2**: `core-semantics` and the three profiles land; the checker reports a
-   program's profile. Exit: every conformance file classified.
+1. **S0**: Owner decisions D1–D7. Done 2026-11-07.
+2. **S1**: The pure form is written down per §2.1, including its IPLD mapping, and
+   the self-hosted frontend admits it. Conversion and the `.kotoba` sugar refusal
+   follow in that order. Exit: every pure head admitted, surface-equivalence pairs
+   measured with their controls.
+3. **S2**: `core-semantics` and the three profiles land, including the named trap
+   for resource exhaustion; the checker reports a program's profile. Exit: every
+   conformance file classified, and deep recursion gives the named trap natively.
 4. **S3**: Close `kotoba-core` gaps on the existing targets: floats on Wasm and
    JS (E7101), and the export-clause refusal (E2004) that stops 35 positive files
    on browser targets, 9 of which compile on aarch64-macos. Exit: wasm and JS match
    native on `kotoba-core`, by execution.
 5. **S4**: Linkable runtime. Exit: a constant `main` reaches only the runtime it
    uses, with fuel and trap results unchanged.
-6. **S5**: First new source target by D7, from SIR. Exit: the full `kotoba-core`
-   corpus by execution, with controls.
+6. **S5**: Rust from SIR (D7), in the D4 tier. Exit: the full `kotoba-core` corpus
+   by execution, with controls.
 7. **S6**: Further targets, each by the same exit. Coverage by device stays with
    JUN-889 and ADR 0410, which are a different question.
 
 ## Owner decisions
 
-| # | Decision | Recommendation |
+Decided by the owner on 2026-11-07.
+
+| # | Question | Decision |
 |---|---|---|
 | D1 | Adopt the §1 promise in place of "safe anywhere"? | Yes |
-| D2 | What is the canonical spelling? The 2026-09-04 ADR names `lam`, `app`, `ref`, `perform`, `handle`, `rel`, `query`, `let`, `if`, `do` and `(def name (fn ...))`, but it has no form for type annotations and `(def f (fn ...))` is refused today (E2124), while every core file uses `defn` with types | Write down the canonical top level and type syntax before S1, since this blocks a grammar-only implementation |
-| D3 | May routes other than Amu be official? Today's contract requires Amu selfhost for every target | Yes for generated-target routes that pass the corpus; keep the self-hosted compiler as the only required route |
-| D4 | May gates run target toolchains (JVM, `rustc`, a C compiler, Python) to execute generated output? JUN-290 and the selfhost-only decision forbid them in CDCI closures, but those rules were written about hosted compilers | Allow in a separate, non-required target-qualification tier that cannot feed the compiler or its gates |
-| D5 | What must deep non-tail recursion do? Native currently dies with signal exit 139, Java/JS/Python raise their own errors, and POSIX native fuel is off by default | Require a named trap on every target, including native |
-| D6 | Do `rel` and `query` belong in `kotoba-core`? They bind the core to one store and are refused by selfhost today | Move to `kotoba-cap` until they are portable |
-| D7 | First new source target? | Rust if D4 admits its toolchain, because it adds independently checked memory-safety evidence |
+| D2 | What is the canonical spelling? The 2026-09-04 ADR has no form for type annotations, and `(def f (fn ...))` is refused today (E2124) | Keep Kotoba pure so that it stays IPLD and Unison-like. §2.1 applies this; its exact spelling is reviewed at S1 |
+| D3 | May routes other than Amu be official? | Yes for generated-target routes that pass the corpus; the self-hosted compiler stays the only required route |
+| D4 | May target toolchains (JVM, `rustc`, a C compiler, Python) run generated output? | Yes, in a separate, non-required target-qualification tier that cannot feed the compiler or its gates |
+| D5 | What must deep non-tail recursion do? Native exits 139, and POSIX native fuel is off by default | A named trap on every target, including native |
+| D6 | Do `rel` and `query` belong in `kotoba-core`? | No. They stay in `kotoba-cap` until they are portable |
+| D7 | First new source target? | Rust, because it adds independently checked memory-safety evidence |
 
 ## Alternatives considered
 
@@ -220,6 +277,10 @@ Each stage has its own exit evidence, and none implies the next.
 
 ## Consequences
 
+- Converting existing `.kotoba` sources, including the compiler seed, is a large
+  migration that S1 has to size. Sugar stays admitted in `.kotoba` until it is done.
+- The required CDCI closure does not change. The workspace rule on JVM and nbb in
+  CI still has to name the D4 tier before that tier is built; see S5.
 - "Grammar alone" becomes achievable for `kotoba-core`, because the spec no
   longer needs Amu to be read. Type checking and elaboration remain real work: a
   second frontend is not small (`seed/21-check.kotoba` is about 7,900 lines at
@@ -237,7 +298,7 @@ Reported, not changed by this ADR:
 | Document | States | Code or measurement |
 |---|---|---|
 | `lang/guest-grammar.edn` `:pure-s-expression-core` and the pure-core ADR addendum | All seven pure heads admitted | Selfhost refuses `lam`, `app`, `ref`, `rel`, `query` (E2101). This addendum was measured on the retired hosted route |
-| `lang/surface-status.edn:274` | `defdesugar` is the admitted alternative to macros | Selfhost refuses it (E2003), so no authoring extension exists on the required route |
+| `lang/surface-status.edn:274` | `defdesugar` is the admitted alternative to macros | Selfhost refuses it in `.kotoba` (E2003). Under §2.1 that refusal is correct, so the entry should name `.cljk` |
 | `lang/surface-status.edn` | `some->`, `map-indexed`, `lazy-cons` and others are implemented-partial | Selfhost refuses them (E2101) |
 | `semantics-ssot.md` §3.4 | Wasm and JS have full float support | `wasm32-browser` and `js-browser` refuse floats (E7101); §3.4 names the older `wasm32-kotoba-v1` and `js-kotoba-v1` targets |
 | `semantics-ssot.md` §7 | Adversarial depth fails closed | 1e8 non-tail recursion ends with exit 139 on `bin/amu` |
