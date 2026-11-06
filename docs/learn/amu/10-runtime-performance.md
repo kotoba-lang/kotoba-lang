@@ -1,66 +1,44 @@
-# 10 生成コードの高速化
+# 10 Making generated code faster
 
-実行を速くするには、同じ計算を少ない費用で行う。
-Amu では値だけでなく fuel・trap・effect・arena の観測も保つ必要があり、
-「チェックを消したら速かった」で最適化を採用することはできない。
+**English** | [日本語](10-runtime-performance.ja.md)
 
-## どこに費用があるか
+Optimization performs the same computation at lower cost. In Amu, correctness includes fuel, traps, effects, and arena observations as well as result values. Removing checks to improve timing is not sufficient grounds for adoption.
 
-式の再計算、関数呼出し、レジスタと stack の移動、分岐、buffer の読み書き、
-型を実行時に解く処理、境界検査、fuel の更新が候補になる。
-どれを減らせるかは、その位置で既に分かっている値・型・alias・effect によって違う。
-第8章の定数 `40 + 2` は、計算前に結果が分かる最小例である。
+## Locate the cost
 
-## 実装を読むときの主な手法
+Repeated expressions, calls, register/stack movement, branches, buffer accesses, dynamic type work, bounds checks, and fuel updates can all cost time. What can be reduced depends on known values, types, aliases, and effects. The constant `40 + 2` in chapter 8 is the smallest example of knowing a result before execution.
 
-| 工夫 | 費用を減らす仕組み | 守る条件 |
+## Techniques to look for
+
+| Technique | How it reduces work | Conditions to preserve |
 |---|---|---|
-| 定数と値の性質を伝える | 同じ演算・分岐を繰り返さず、即値や適した命令を使う | i64 の wrap、型、例外・trap の意味 |
-| 小さい関数の展開・tail call | call、frame、値の移動を減らす | 引数の評価順、live value、ABI、fuel |
-| 構造を認識する native kernel | 認識した loop・計算を、適した命令列で実行する | 名前ではなく構造と guard で適用を決める |
-| loop の展開・SIMD | 分岐負担を減らす、複数の要素を一命令で扱う | 全入力要素、端数、bounds、CPU 条件 |
-| 定数から table を作る | 同じ決定木を何度も辿らず lookup する | 元の関数で完全に決まる値だけを使う |
-| 検査の hoist・batch | 成立条件を先に確かめ、重複する判定を減らす | insufficient fuel や不正 index の観測も一致 |
+| Propagate constants and value facts | Avoid repeated computation and branching; use immediates and suitable instructions | i64 wrap behavior, types, exceptions and traps |
+| Inline small functions and use tail calls | Reduce calls, frames, and moves | Argument order, live values, ABI, fuel |
+| Recognize structural native kernels | Emit suitable instruction sequences for recognized computations | Structural guards rather than benchmark names |
+| Unroll loops and use SIMD | Reduce branch overhead or process multiple elements per instruction | All elements, tails, bounds, CPU support |
+| Build tables from constants | Replace repeated decision-tree traversal with lookup | Values fully determined by the original function |
+| Hoist or batch checks | Establish conditions earlier and reduce redundant decisions | Matching insufficient-fuel and invalid-index behavior |
 
-`41-a64gen` には多数の構造認識と命令生成の経路がある。
-一般的な最適化名を並べただけで全入力に適用されると考えず、入口の predicate と外れた場合の経路を読む。
-特に過去の実験メモにある候補は、採用 source と同じとは限らない。
+`41-a64gen` contains many recognition and emission paths. Read their entry predicates and fallback paths rather than assuming that every listed technique applies to all inputs. Historical candidates are not necessarily the adopted source.
 
-## 分岐を table に変える例
+## Turn a decision tree into a table
 
-Amu の scalar threshold-tree 実験は、定数の閾値で分岐し、葉が整数定数で終わる純粋な木を認識した。
-許された形全体を確かめた後、64項の table と端点処理へ変換する。
-効果のある未知の関数や動的な葉には使わない。
-これは入力に対応する答えを benchmark 名で返す仕組みではなく、元の関数に含まれる情報から構成する変換である。
-当時の検証と測定の範囲は [実験記録](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/coscientist-scalar-tree-20261005.md) で読める。
+The scalar threshold-tree experiment recognizes a pure tree that branches on constant thresholds and ends in integer constant leaves. After checking the complete admitted shape, it replaces traversal with a 64-entry table and endpoint handling. Unknown effectful calls and dynamic leaves do not qualify. The table is derived from the original function's information, not selected answers keyed by benchmark name. Read the [experiment record](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/coscientist-scalar-tree-20261005.md) for its verification and measurement scope.
 
-## fuel と境界検査を消さずに速くする
+## Preserve fuel and bounds checks
 
-loop の反復回数や index 範囲が分かれば、毎回の同じ検査をまとめられる場合がある。
-ただし budget が途中で尽きたとき、元のどこで止まり、何を変更済みかまで一致する必要がある。
-十分な fuel の fast path と、元の実行順序を保持する path を分ける設計にも、その証明が要る。
-実際に [sufficient-fuel region 実験](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/coscientist-fuel-region-20261005.md) は、
-正しさの比較を通しても性能条件を満たさず、全体採用を拒否した。検証成功と高速化成功は別の観測である。
+Known iteration counts or index ranges can allow repeated checks to be combined. If the budget expires partway through, execution must still stop at the corresponding point with the appropriate changes already made. A sufficient-fuel fast path plus an original-order path also needs that argument. The [sufficient-fuel region experiment](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/coscientist-fuel-region-20261005.md) passed correctness comparisons but failed its performance criteria and rejected global promotion. Correctness and speed are separate observations.
 
-fuel の意味も profile ごとに読む。通常 native route の設定と metered receipt profile の予算を同一視しない。
-CPU 命令を減らしても、言語で定めた charge を勝手に減らせるとは限らない。
+Fuel semantics are profile-specific. Do not equate ordinary native settings with a metered receipt profile. Reducing CPU instructions does not automatically permit reducing semantic charges.
 
-## 公開の速度値の読み方
+## Read the public speed figures
 
-2026年10月15日の Apple M4 の19本の translated Embench ports は、
-一つの compiler snapshot、各 workload 一回の採用サンプルで、C に対する実行時間の幾何平均が約 `0.80×` だった。
-その数には監査で区別した algorithm substitution と SHA 命令の差を含む。
-released toolchain の一般的な速度や公式認定スコアではない。
-[公開記事と監査](https://kotoba-lang.org/blog/embench-c-parity-20261015/)を比率と一緒に読む。
+The 15 October 2026 Apple M4 observation covered 19 translated Embench ports with one compiler snapshot and one accepted sample per workload. Its geometric mean execution time was about `0.80×` C time. The number includes audited algorithm substitutions and a SHA-instruction difference. It is not a released-toolchain result, certified score, or universal speed ranking. Read the [public article and audit](https://kotoba-lang.org/blog/embench-c-parity-20261015/) with the ratio.
 
-別の same-algorithm M104 baseline は約 `0.8213×` で、同じ測定とは扱わない。
-これらの歴史的測定を現在の loaderless native compiler の新しい性能値に転用しない。
-[compiler lineage](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/compiler-core.json) が両者の区別を持つ。
+The separate same-algorithm M104 baseline was about `0.8213×`; it is a different measurement. Neither historical result is a new measurement of today's loaderless native compiler. The [compiler lineage](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/compiler-core.json) records the distinction.
 
-## 小課題と解説
+## Exercise and answer
 
-ある最適化で出力が同じ、コードが10%短い、という二つの結果を得た。10%高速と言えるだろうか。
-言えない。命令の依存、cache、branch、測定のばらつきが実行時間を変える。
-値以外の意味を照合した上で、同じ workload と host と compiler 条件で時間を測る必要がある。
+If output is unchanged and code is 10% smaller, is it 10% faster? Not necessarily. Dependencies, caches, branches, and timing variability affect execution. Check non-value semantics too, then measure under matching workload, host, and compiler conditions.
 
-[前へ](09-kototama.md) · [目次](README.md) · [次へ ビルドの高速化](11-build-performance.md)
+[Previous](09-kototama.md) · [Contents](README.md) · [Next: build performance](11-build-performance.md)

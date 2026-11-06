@@ -1,71 +1,47 @@
-# 09 Kototama VM
+# 09 The Kototama VM
 
-Kototama は Kotoba の virtual machine 契約である。
-特定の bytecode interpreter の名前ではなく、プログラムをどの条件で実行し、
-世界の状態をどう変え、どんな結果と記録を返すかを定める。
+**English** | [日本語](09-kototama.ja.md)
 
-## 一回の実行を表す
+Kototama is the Kotoba virtual-machine contract. It is not defined by a particular bytecode interpreter: it specifies execution conditions, world-state changes, outcomes, and execution records.
+
+## Describe one execution
 
 ```text
 program, message, state, authority, budget
-    ↓ Kototama の遷移
+    ↓ Kototama transition
 outcome, state', events, receipt
 ```
 
-program だけで実行を定義しないところが重要である。
-同じ定義でも入力や状態が異なれば結果は変わり、権限や予算が違えば拒否や資源切れになり得る。
-runtime engine はこの契約を実装する。Amu は計算を artifact にし、host はそれを実行する。
-native code を使う実装であっても、この意味で VM の役割を持てる。
+A program alone does not define an execution. Inputs and state affect results; authority and budget can produce refusal or exhaustion. An engine implements this contract. Amu produces artifacts and a host executes them. A native-code implementation can therefore fulfill a VM role too.
 
-## 四つの観点
+## Four perspectives
 
-**計算**は閉じた S 式の意味である。名前は解決され、host の reflection や unrestricted eval は持ち込まない。
-canonical なプログラムの wire form は tagged DAG-CBOR vectors で表す。
-一方、実行の内側は target の typed call や連続メモリを利用できる。
+**Computation** follows closed S-expression semantics. Names are resolved; host reflection and unrestricted eval are not introduced. Canonical program wire forms use tagged DAG-CBOR vectors, while execution can use target-specific typed calls and contiguous memory.
 
-**状態**は IPLD の world として識別する。メッセージの実行中は overlay に変更を積む。
-成功時に新しい root を commit し、revert・拒否・資源切れでは対応する overlay を破棄する。
-入れ子の呼出しが失敗した場合の snapshot と復元も契約である。
-外部サービスで起きた effect まで、state overlay の rollback で自動的に取り消せるわけではない。
+**State** is an IPLD world. A message accumulates changes in an overlay. Success commits a new root; revert, refusal, and resource exhaustion discard the relevant overlay. Nested-call snapshots and restoration are part of the contract. Rolling back state does not automatically undo effects already performed by an external service.
 
-**admission と authority**では、第7章の各出所を持つ条件を閉じた predicate で照合する。
-policy の作成や認証 adapter と、その呼出し時判定は分離される。
+**Admission and authority** compare the conditions from chapter 7 using a closed predicate with explicit origins. Policy authoring and authentication adapters are separate from that invocation decision.
 
-**receipt**は実行の記録を値として扱う。VM と implementation と profile、program/message の CID、
-前後の state root、outcome、fuel、events、authority decision 等を結び付ける。
-receipt の CID は「どの記録か」を示す。署名者の信頼、合意、二重実行防止はそれぞれ別の仕組みである。
+**Receipts** make an execution record a value. They bind the VM, implementation, profile, program/message CIDs, before/after state roots, outcome, fuel, events, and authority decision. A receipt CID identifies a record. Trust in its signer, consensus, and duplicate-execution prevention need separate mechanisms.
 
-## typed eval は検査済み定義を呼ぶ
+## Typed eval calls a checked definition
 
-Kotoba の typed eval は、ソース文字列を host に評価させる機能ではない。
-Definition CID と閉じた依存を解決・検証し、interface と完全な effect row と現在の条件で再 admission する。
-`Definition CID` はどの計算か、`Admission CID` はどの実行条件か、`Value CID` はどの結果かを表す。
-eval depth と fuel にも境界がある。
+Typed eval does not submit source text to host eval. It resolves and verifies a Definition CID and its closed dependencies, then re-admits the interface and complete effect row under current conditions. The Definition CID identifies the computation, the Admission CID identifies execution conditions, and the Value CID identifies the result. Eval depth and fuel are bounded too.
 
-pure な結果の cache の契約は Admission CID と入力 Value CID 群を結び付ける。
-HTTP や支払いの effect を過去の結果で黙って代用することは、その cache の意味ではない。
+The pure-result cache contract binds the Admission CID and input Value CIDs. It does not silently replace a fresh HTTP request or payment effect with a previous result.
 
-## VM 契約と実装 profile を区別する
+## Separate the VM contract from implementation profiles
 
-`core/v1`、EVM／FVM 系の profile は、それぞれ必要な互換性と証拠を持つ。
-EVM に似た立ち位置という説明だけで Ethereum の bytecode・state・consensus 互換にはならない。
-Wasm を出力できることも、Kototama のすべての状態遷移を実装した証拠にはならない。
+`core/v1` and Ehttps://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/FVM-related profiles each need their own compatibility scope and evidence. An EVM-like architectural role does not establish Ethereum bytecode, state, or consensus compatibility. Emitting Wasm does not establish the full Kototama state-transition contract either.
 
-Amu の `kototama.pure-i64-aot/v1` や `kototama.pure-i64-receipt/v2` は、
-空の guest authority・閉じた整数計算という別途定めた bounded profile である。
-この教材の `main → 42` の成功を、IPLD world・全 operation・全 target の conformance に広げない。
+Amu's `kototama.pure-i64-aot/v1` and `kototama.pure-i64-receipt/v2` are separately defined bounded profiles for closed integer computation with empty guest authority. The course's `main → 42` examples do not qualify IPLD worlds, every operation, or every target.
 
-## 読む正本
+## Read the authorities
 
-[VM spec](https://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/spec/kototama-vm-v1.edn)、
-[VM 解説](https://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/docs/kototama-virtual-machine.md)、
-[typed eval](../../../lang/typed-eval.edn)、
-[native i64 receipt](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/kototama-i64-receipt.md)。
-古い checkout の Datalog／Biscuit 中心の VM 説明は、現行 admission core の説明として使わない。
+Read the [VM spec](https://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/spec/kototama-vm-v1.edn), [VM explanation](https://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/docs/kototama-virtual-machine.md), [typed eval contract](../../../lang/typed-eval.edn), and [native i64 receipt profile](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/kototama-i64-receipt.md). Older checkout descriptions centered on Datalog/Biscuit are not descriptions of the current admission core.
 
-## 小課題と解説
+## Exercise and answer
 
-同じ message と receipt の CID を持てば、その message が一度しか実行されていないと分かるだろうか。
-分からない。hash は内容を識別する。再実行を防ぐには nonce、消費 journal、idempotency 等の適切な契約が必要である。
+Does having the same message and receipt CID establish that the message executed only once? No. Hashes identify content. Preventing duplicate execution requires an appropriate nonce, consumption journal, idempotency contract, or other mechanism.
 
-[前へ](08-code-generation.md) · [目次](README.md) · [次へ 実行の高速化](10-runtime-performance.md)
+[Previous](08-code-generation.md) · [Contents](README.md) · [Next: runtime performance](10-runtime-performance.md)

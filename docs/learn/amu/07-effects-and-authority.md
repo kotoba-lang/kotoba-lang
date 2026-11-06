@@ -1,60 +1,43 @@
-# 07 effects と権限
+# 07 Effects and authority
 
-型は扱う値を説明し、effect は実行が外部に何を行い得るかを説明する。
-Amu が effect を検査することと、host が具体的な操作を許すことは両方必要である。
+**English** | [日本語](07-effects-and-authority.ja.md)
 
-## 拒否する例
+Types describe values; effects describe what execution may do outside its pure computation. Amu's effect checks and the host's concrete authorization checks are both necessary.
 
-[negative-operation.kotoba](examples/negative-operation.kotoba) は `(slurp "lesson.txt")` を書いてある。
-観測した native CLI は `E2101 unknown or unsupported form 'slurp'` を返した。
-これはファイルを読もうとして OS に拒否された結果ではない。
-この入力に対応する操作がコンパイラの閉じた言語にないため、検査時に拒否された。
+## A refusal example
 
-## 宣言は許可ではない
+[negative-operation.kotoba](examples/negative-operation.kotoba) contains `(slurp "lesson.txt")`. The observed native CLI reports `E2101 unknown or unsupported form 'slurp'`. This is a compile-time refusal because the operation is outside this closed language, not an attempted file read rejected by the OS.
 
-例えば HTTP 操作を持つ検査済み定義では、その operation が effect row に含まれる。
-呼び出す関数の effect も伝播させる必要があり、外部操作を helper に隠して pure と呼ぶことはできない。
-effect row の semantic な名前と、backend の数値 wire ID は区別する。ABI の番号変更だけで定義の意味を変えないためである。
+## A declaration is not permission
 
-実行時の判断は、概念的には次の積集合である。
+A checked definition that performs HTTP must include the operation in its effect row. Called functions' effects must propagate too; hiding an external operation in a helper cannot make it pure. Semantic effect names are separate from backend numeric wire IDs so an ABI renumbering need not change definition meaning.
+
+Conceptually, invocation permission is the intersection of:
 
 ```text
-Amu が検査した effect
-∩ VM が要求した operation と resource
-∩ capability chain が与える範囲
-∩ local policy が許す範囲
-∩ runtime が現在提供できる範囲
+Amu checked effects
+∩ VM requested operations and resources
+∩ capability-chain grants
+∩ local policy permissions
+∩ currently available runtime operations
 ```
 
-さらに definition world と runtime world の一致などを調べる。
-どれかが欠ければ許可にならない。ファイル一つへの許可がディレクトリ全体の許可になったり、
-古い実行の grant が新しい実行へ持ち越されたりしてはいけない。
+Other checks include agreement between the definition world and runtime world. A missing condition denies access. Permission for one file must not become permission for its whole directory, and a previous invocation's grant must not silently authorize another.
 
-現行 Kototama の admission core は、この条件を閉じた Kotoba predicate として計算する。
-Datalog のユーザ規則をそこで実行する方式ではない。Biscuit も core 内の grant 表現ではなく、
-必要なら認証境界の adapter が capability chain へ変換する位置付けである。
+The current Kototama admission core evaluates a closed Kotoba predicate. It does not execute user Datalog rules there. Biscuit is not the core grant representation either; an authentication-boundary adapter can transcode it into a capability chain where needed.
 
-## 安全性を支える境界
+## Boundaries that support safety
 
-コンパイラは型・effect・対応 target・資源の条件を検査する。
-grant と local authorizer は許可を決める。host と provider は具体的な endpoint、パス、quota を強制する。
-native のメモリ保護やプロセス隔離も別の責任である。
-コンパイラが安全な言語を受け付けるだけで、host/provider の不備までなくなるわけではない。
+The compiler checks types, effects, target support, and resource conditions. Grant and the local authorizer decide permission. Hosts and providers enforce concrete endpoints, paths, and quotas. Native memory protection and process isolation have their own responsibilities. A checked language does not eliminate host or provider bugs.
 
-ブラウザアプリでは、operation ごとの利用者の承認もそのアプリの契約に従う。
-コンパイラや Bot が持つ tool 権限から、利用者のサービス操作の承認は作れない。
+Browser apps must also obtain operation-specific user consent under their own contracts. A compiler's or bot's tool authority cannot manufacture consent for the user's service operation.
 
-## 読む契約とソース
+## Read the contracts and source
 
-[effect と capability の言語契約](../../../lang/capability-semantics.edn)、
-[elaboration pipeline](../../../lang/elaboration-pipeline.edn)、
-[Kototama admission](https://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/src/kototama/admission.kotoba)。
-`eligible?` と `admit` の引数、拒否理由の順序を読むと、どの所有者が何を供給するか分かる。
+Read the [effect and capability contract](../../../lang/capability-semantics.edn), [elaboration pipeline](../../../lang/elaboration-pipeline.edn), and [Kototama admission](https://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/src/kototama/admission.kotoba). The arguments and refusal ordering in `eligible?` and `admit` show which owner supplies each condition.
 
-## 小課題と解説
+## Exercise and answer
 
-同じ artifact と同じ DefCID でも、grant が失効した後にもう一度操作できるだろうか。
-できない。内容は同じでも、現在の実行条件が許可しない。
-このため immutable code の cache は使えても、過去の許可判断をそのまま再利用してはいけない。
+Can an unchanged artifact and DefCID perform an operation after its grant expires? No. The content is unchanged, but the current execution conditions deny it. Immutable code can be cached; an old permission decision cannot simply be carried forward.
 
-[前へ](06-definition-identity.md) · [目次](README.md) · [次へ コード生成](08-code-generation.md)
+[Previous](06-definition-identity.md) · [Contents](README.md) · [Next: code generation](08-code-generation.md)

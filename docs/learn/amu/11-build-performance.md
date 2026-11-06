@@ -1,67 +1,44 @@
-# 11 ビルドの高速化と selfhost
+# 11 Faster builds and selfhosting
 
-生成したプログラムの実行時間と、コンパイラが artifact を作る時間は別の性能である。
-AI が生成・検査・修正を繰り返すと、後者の待ち時間も作業全体の費用になる。
+**English** | [日本語](11-build-performance.ja.md)
 
-## compiler 自身の仕事を減らす
+Generated-program runtime and compiler build time are different performance questions. Repeated AI generation, checking, and repair makes build latency part of the total workflow cost too.
 
-Amu の native 作業では、大きい SIR の label を繰り返し探す走査、型推論の反復、
-compiler を丸ごと再生成する mutation tests 等に費用がある。
-例えば immutable な SIR の label index を一度作れば、同じ範囲の再走査を減らせる。
-ただし SIR を変更したら古い index は使えない。配置を決める mutable な CODE/FIX の証明を、
-単に件数が同じという理由で cache することもできない。
+## Reduce the compiler's own work
 
-実装パラメータに明示型を付け、同じ型を何度も推論する仕事を避ける変更もある。
-これは新しい型推論アルゴリズムや生成コードの高速化とは区別する。
-source annotation が意味を変えていないことを、unannotated counterpart の whole-image bytes と動作で確認する。
+Native Amu work has investigated repeated label scans over large SIR, inference rounds, and mutation tests that rebuild whole compiler images. An index over immutable SIR can avoid repeated scans, but changing the SIR invalidates it. Equal CODE/FIX counts do not justify caching proofs over mutable emission state.
 
-これらの具体的な条件は [Amu の shared rules](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/AGENTS.md) の
-Immutable SIR label proofs と Explicit selfhost parameter types にまとまっている。
-並列 gate の longest-first scheduling や同時 build 数の制限は、compiler algorithm とは別の運用上の工夫である。
+Explicit parameter types can avoid repeated inference work. This is distinct from a new inference algorithm or faster generated code. Whole-image equality and execution comparisons against an unannotated counterpart check that the annotation did not change behavior.
 
-## DefCID による再利用が必要とするもの
+The [Amu shared rules](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/AGENTS.md) document these conditions under Immutable SIR label proofs and Explicit selfhost parameter types. Longest-first gate scheduling and limits on concurrent builds are operational improvements, separate from compiler algorithms.
 
-定義の内容が同じなら、前に作った object を使いたくなる。
-しかし build key は少なくとも定義または SCC の identity、compiler image、target/ABI、layout、
-最適化設定、依存/interface closure、resource proof の契約を結び付けなければならない。
+## What DefCID-based reuse needs
+
+An unchanged definition suggests reusing an object. A build key must also bind the definition or SCC identity, compiler image, target/ABI, layout, optimization settings, dependency/interface closure, and resource-proof contract.
 
 ```text
 DefCID/SCC + compiler + target/ABI + options + dependencies + proof contract
-    → build key → 検証した relocatable object → 今回の配置で link
+    → build key → verified relocatable object → link in the current layout
 ```
 
-以前 link したアドレスは今回の配置で同じとは限らないので、symbolic relocation を残す。
-cache の破損や key 不一致は再構築または拒否へ進める。
-current admission、effect、grant、mutable な残り fuel は、immutable code と一緒に再利用しない。
+Previously linked addresses may not fit the current layout, so symbolic relocations must remain. Corrupt or mismatched cache entries lead to rebuild or refusal. Current admission, effects, grants, and mutable remaining fuel are not reusable immutable code.
 
-native の identity／SCC／object-store prototype には、それぞれ bounded な検証がある。
-完全な source→checked KIR producer、全 compiler の依存、永続 store、cold/warm mutation build、
-end-to-end CI 時間は別の受入条件を持つ。
-現時点の [incremental build の記録](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/native-incremental-build.md) を確認し、
-「内容アドレスだから全ビルドが速い」と結論付けない。
+Native identity, SCC, and object-store prototypes each have bounded checks. Complete source-to-checked-KIR production, whole-compiler dependencies, persistent storage, cold/warm mutation builds, and end-to-end CI timing have separate acceptance criteria. Consult the [incremental-build record](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/native-incremental-build.md); content addressing alone does not establish fast builds throughout the system.
 
-## selfhost が確かめること
+## What selfhosting checks
 
-selfhost は、Amu が Amu のソースをコンパイルすることである。
-一つの実行例が動くことより大きい closure を扱う必要があり、compiler・CLI・build・packaging の依存も含む。
-現在の方針は canonical Kotoba と Amu-built native compiler でその closure を作り、
-Node／JVM／C compiler や loader への fallback を置かないことである。
+Selfhosting means Amu compiles Amu's source. Its closure is larger than a tiny example: compiler, CLI, build, and packaging dependencies matter too. The current direction uses canonical Kotoba and an Amu-built native compiler without falling back to Node, JVM, or a C compiler/loader.
 
 ```text
-起点 compiler → source を build → F1
-F1            → 同じ source を build → F2
-F2            → 同じ source を build → F3
+initial compiler → build source → F1
+F1               → build the same source → F2
+F2               → build the same source → F3
 ```
 
-F1/F2/F3 の一致は、記録した source と条件で生成が安定した強い観測になる。
-それだけで compiler の正しさ、全言語機能、全 target、独立した初回 bootstrap の信頼を証明するわけではない。
-元の semantic corpus、拒否例、実行・資源の観測も必要になる。
-historical C-loader の固定点と現在の loaderless native の固定点も別の記録として読む。
+Matching generations are strong observations of stable production for those sources and conditions. They do not alone prove compiler correctness, all language features or targets, or the trustworthiness of an independent initial bootstrap. Semantic corpora, refusals, execution, and resource observations remain necessary. Historical C-loader fixed points and current loaderless native fixed points are separate records.
 
-## 小課題と解説
+## Exercise and answer
 
-同じ DefCID、同じ CPU でも compiler image が更新された。古い object を cache hit として使えるだろうか。
-この key 設計では使わない。compiler の生成規則や修正が変わった可能性があるためである。
-cache hit は再利用条件の一致を意味し、今回の安全性の判定を済ませたことは意味しない。
+The DefCID and CPU are unchanged, but the compiler image changed. Can the old object be a hit under this build-key design? No. The compiler's emission rules or fixes may differ. A hit establishes matching reuse conditions, not a completed current safety decision.
 
-[前へ](10-runtime-performance.md) · [目次](README.md) · [次へ 読解と実験](12-reading-and-experiments.md)
+[Previous](10-runtime-performance.md) · [Contents](README.md) · [Next: reading and experiments](12-reading-and-experiments.md)

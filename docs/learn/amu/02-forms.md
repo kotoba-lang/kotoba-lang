@@ -1,12 +1,12 @@
-# 02 ソースと Kotoba form
+# 02 Source and Kotoba forms
 
-コンパイラは文字列を直接「理解」するのではなく、まず式の構造をデータにする。
-Lisp の S 式はその構造を人も読みやすい形で表している。
+**English** | [日本語](02-forms.ja.md)
 
-## 動かす例
+A compiler first turns source text into structured data. Lisp's S-expressions make much of that structure readable to people too.
 
-[01-arithmetic.kotoba](examples/01-arithmetic.kotoba) は本体を `(+ 40 2)` に変える。実行結果は `42`。
-括弧の中で最初の要素が演算、残りがその引数である。この式は概念的には次の木になる。
+## Run the example
+
+[01-arithmetic.kotoba](examples/01-arithmetic.kotoba) changes the body to `(+ 40 2)` and still returns `42`. The first list element names the operation; the remaining elements are its arguments. Conceptually, the tree is:
 
 ```text
 list
@@ -15,47 +15,28 @@ list
 └─ integer 2
 ```
 
-`+` という文字列と、加算という検査済み操作はまだ同じではない。
-reader の後で、何を参照しているか、どんな型に使えるかを確かめる。
+The text `+` is not yet a checked addition operation. After reading, the compiler must resolve the reference and determine which types it accepts.
 
-## form という語の三つの使われ方
+## Three uses of the word form
 
-**ソース form** は作者が書いた一つの式や宣言である。
-**フロントエンドの Form 値**は、それを扱う構文木である。
-**canonical なプログラム form** は、意味・表現の契約に従って解決・検査されたプログラムを表す。
-同じ語が現れても、文字列・一時 AST・保存用の正規形のどれかを確認しよう。
+A **source form** is an expression or declaration written by an author. A **frontend Form value** is a syntax tree used to process it. A **canonical program form** represents a resolved, checked program under a defined semantic and representation contract. Identify which meaning is intended: text, temporary AST, or canonical stored representation.
 
-Amu の `src/kotoba/form.kotoba` は `:form/r` レコードを持つ。
-`tag`、文字列 `s`、整数 `n`、keyword `k`、子の `kids`、位置の `span`、生バイトの `data` で構成される。
-子はソース順、map の子は key/value の交互の並びである。
-`with-children` は子を取り替えても span やスカラー・浮動小数点の bit を保つ。
-エラーを元の場所へ戻したり、変換で値を壊さないために必要な情報である。
+Amu's `src/kotoba/form.kotoba` defines a `:form/r` record with a `tag`, string `s`, integer `n`, keyword `k`, child list `kids`, source `span`, and raw bytes `data`. Children preserve source order; map children alternate keys and values. `with-children` replaces children while preserving spans, scalar payloads, and floating-point bits. Those details support useful error locations and faithful transformations.
 
-一方、採用された native Seed core は `NODE` 等の表を一つの明示的なメモリ領域に持つ。
-この教材で native pipeline を読むときは、その表を追う。
-`kotoba.form` のレコードが現在の全 native 工程を通ると考えてはいけない。
+The adopted native Seed core instead uses tables such as `NODE` in an explicit memory area. Follow those tables when reading the native pipeline in this course. The `kotoba.form` record does not pass through every current native stage.
 
-## 表記と意味を分ける
+## Separate spelling from meaning
 
-canonical `.kotoba` と CLJK／EDN の reader sugar は、言語契約上、同じ core form に到達するべき表記である。
-入力の sugar を受け取ることは、コンパイラ自身を JVM や nbb 上で動かすこととは別の話である。
-具体的な表記の対応は [surface equivalence corpus](../../../lang/surface-equivalence-corpus.edn) で確認する。
-その契約があることと、公開 Mac CLI が全表記を実装したことも区別する。
+The language contract requires canonical `.kotoba` and its CLJK/EDN reader sugar to reach the same core forms. Accepting input sugar is separate from running the compiler itself on JVM or nbb. Consult the [surface equivalence corpus](../../../lang/surface-equivalence-corpus.edn) for concrete pairs. A contract also does not establish that the public Mac CLI implements every spelling.
 
-構文がデータだからといって、任意の式を host `eval` に渡す権限は得られない。
-quote、desugar、typed eval はそれぞれ許される位置と入力が定まっている。
+Representing syntax as data grants no permission to call unrestricted host `eval`. Quote, desugaring, and typed eval each have their own permitted positions and inputs.
 
-## 読むソース
+## Read the source
 
-[Form の schema と constructor](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/src/kotoba/form.kotoba)、
-[Seed のメモリ配置](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/MEMORY-MAP)、
-[elaboration pipeline](../../../lang/elaboration-pipeline.edn)。
+Read the [Form schema and constructors](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/src/kotoba/form.kotoba), [Seed memory layout](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/MEMORY-MAP), and [elaboration pipeline](../../../lang/elaboration-pipeline.edn).
 
-## 小課題と解説
+## Exercise and answer
 
-`(+ 40 2)` と `(+  40\n 2)` はどこが同じで、どこが違うだろうか。
-読んだ式の構造と意味は同じだが、元のバイト列と span は違う。
-したがってソースのハッシュは変わる。一方、同じ契約で検査・正規化された定義の identity は、
-この空白の違いでは変わらない設計になっている。第5・6章で理由を追う。
+Compare `(+ 40 2)` with `(+  40\n 2)`, where `\n` denotes a newline in the source. The expression structure and meaning agree, but source bytes and spans differ. The source hash changes. The definition identity is designed to ignore that whitespace after checking and normalization under the same contract. Chapters 5 and 6 explain how.
 
-[前へ](01-first-program.md) · [目次](README.md) · [次へ 読み取りと名前解決](03-reader-and-names.md)
+[Previous](01-first-program.md) · [Contents](README.md) · [Next: reading and names](03-reader-and-names.md)

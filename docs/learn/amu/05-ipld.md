@@ -1,59 +1,44 @@
-# 05 IPLD と内容アドレス
+# 05 IPLD and content addressing
 
-内容アドレスは「どこにあるか」ではなく「どの内容か」で値を指す方法である。
-Kotoba は定義・値・状態・artifact の識別を明示し、保存や転送で内容を検証できるようにする。
+**English** | [日本語](05-ipld.ja.md)
 
-## データから CID まで
+Content addressing identifies data by what it contains rather than where it resides. Kotoba distinguishes identities for definitions, values, state, and artifacts so that stored or transferred content can be verified.
 
-[IPLD Data Model](https://ipld.io/docs/data-model/) は、整数・文字列・list・map・bytes・link 等でデータを表す。
-link は別の内容を CID で指す。構造をバイトにする規約が codec、
-[DAG-CBOR](https://ipld.io/specs/codecs/dag-cbor/spec/) はその一つである。
+## From data to a CID
+
+The [IPLD Data Model](https://ipld.io/docs/data-model/) describes data using kinds such as integers, strings, lists, maps, bytes, and links. A link identifies other content by CID. A codec defines a byte representation; [DAG-CBOR](https://ipld.io/specs/codecs/dag-cbor/spec/) is one such codec.
 
 ```text
-論理的な値 → 契約に従う正規化 → DAG-CBOR bytes
-          → SHA-256 digest → CIDv1（codec と hash の情報を含む）
+logical value → contract-defined normalization → DAG-CBOR bytes
+              → SHA-256 digest → CIDv1 including codec and hash information
 ```
 
-これは導出の概念図である。実際には version、型タグ、整数・float の精度、link の encoding まで揃える。
-EDN を `pr-str` したテキストに DAG-CBOR というラベルを付けても、DAG-CBOR の block にはならない。
-Kotoba の keyword や set 等も、IPLD の基本 kind そのものではなく、言語の codec 規約で表す。
+This is a conceptual derivation. An implementation must also agree on versions, type tags, numeric precision, and link encoding. Printing EDN with `pr-str` and labeling it DAG-CBOR does not produce a DAG-CBOR block. Kotoba keywords and sets likewise need language codec rules; they are not primitive IPLD kinds themselves.
 
-## 同じハッシュで全部を表さない
+## Keep the identities separate
 
-| 識別対象 | 内容 | 何が変わると変化するか |
+| Identity | Content | What changes it |
 |---|---|---|
-| ソースの CID／digest | 作者が書いた正確なバイト列 | 空白・コメントも含めた bytes |
-| Definition CID | 検査・正規化した定義と六つの sealed input | 型・effect・依存・契約・正規化した本体 |
-| artifact の CID／digest | target 用に生成した bytes | compiler・target・ABI・最適化・配置等 |
-| Value CID | codec 契約で正規化した値 | 値または encoding の契約 |
-| Admission CID | 実行を許す条件を束縛した対象 | grant や実行条件。DefCID だけでは決まらない |
+| Source CID or digest | Exact authored bytes | Whitespace and comments as well as other byte changes |
+| Definition CID | A checked, normalized definition with six sealed inputs | Types, effects, dependencies, contracts, or normalized body |
+| Artifact CID or digest | Generated target bytes | Compiler, target, ABI, optimization, layout, and related inputs |
+| Value CID | A value normalized under its codec contract | The value or encoding contract |
+| Admission CID | An object binding execution conditions | Grants and execution conditions; a DefCID alone is insufficient |
 
-ここでソース一般の内容アドレスと、言語契約上の特定の source-tree identity の実装状況は別である。
-単に sha256 を計算しただけの SIR やソースを Definition CID と呼んではいけない。
+A generic content address for source is separate from the implementation status of a specific language source-tree identity contract. A hash of arbitrary source or SIR must not be relabeled a Definition CID.
 
-## node と block と実行メモリ
+## Nodes, blocks, and execution memory
 
-一つの IPLD block に複数の node を入れられる。式の各要素が一つの block、一つの通信になる必要はない。
-小さい block は共有や部分取得に向き、大きい block はリンク・lookup の負担を減らす。
-どちらが速いかはアクセスと更新のパターンで変わる。
+One IPLD block can contain multiple nodes. Each expression element need not become a separate block or network request. Smaller blocks help sharing and partial retrieval; larger blocks can reduce link and lookup overhead. Access and update patterns determine the tradeoff.
 
-IPLD は CPU の物理ポインタ配置を定めない。
-値を検証して実行用の handle や連続 buffer にした後、要素を読むたびに CID を計算し直す必要はない。
-CID は内容の識別、handle は一回の実行内の参照、capability は操作の権限という別の役割を持つ。
-CID の一致から、取得可能性・秘密性・実行許可は導けない。
+IPLD does not prescribe CPU pointer layout. After verifying and hydrating a value into a local handle or contiguous buffer, execution need not compute a CID for every element access. A CID identifies content, a handle refers to a value within an execution, and a capability grants an operation. CID equality does not establish availability, confidentiality, or execution permission.
 
-## 読む契約
+## Read the contracts
 
-[物理コストと IPLD の解説](../../lang/physical-model-and-ipld.ja.md)、
-[value codec](../../../lang/value-codec.edn)、
-[code identity](../../../lang/code-identity.edn)。
-保存表現と実行用の配置の関係は [CID と handle の契約](../../adr/ADR-kotoba-cid-handle-cap-runtime.md) で追える。
+Read [physical costs and IPLD](../../lang/physical-model-and-ipld.md), the [value codec](../../../lang/value-codec.edn), and [code identity](../../../lang/code-identity.edn). The [CID and handle contract](../../adr/ADR-kotoba-cid-handle-cap-runtime.md) explains stored representations and execution layouts.
 
-## 小課題と解説
+## Exercise and answer
 
-同じ定義を ARM64 と x86-64 にコンパイルした。DefCID が同じなら機械語も同じだろうか。
-異なる命令セットなので同じ bytes は要求されない。
-定義の identity は計算の内容を束縛し、artifact の identity はその実現方法を束縛する。
-この分離が、意味を共有しつつ target を変えるために必要になる。
+If a definition has the same DefCID when compiled for ARM64 and x86-64, must its machine-code bytes agree? No. Definition identity binds the computation, while artifact identity binds a particular realization. Separating them allows shared meaning across different targets.
 
-[前へ](04-checking-and-ir.md) · [目次](README.md) · [次へ 定義の識別](06-definition-identity.md)
+[Previous](04-checking-and-ir.md) · [Contents](README.md) · [Next: definition identity](06-definition-identity.md)
