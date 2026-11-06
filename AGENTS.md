@@ -58,6 +58,15 @@ hosted runtime permissions in the earlier whole-component Q9 contract.
   blocked. Do not replace missing component behavior with a smaller slice or
   silently fall back. CDCI has only the Amu selfhost and Kotoba native gates;
   both and their controller use loaderless `x86_64-linux-static` ELF.
+- Generated targets (owner decision 2026-11-07, JUN-949,
+  `docs/adr/ADR-target-portable-canonical-form.md`): routes other than Amu are
+  official when they pass the conformance corpus, and target toolchains may run
+  generated output in a separate, non-required tier. That tier never feeds the
+  compiler, its build or the required gates, and is never a fallback.
+- `.kotoba` is headed to a pure form: IPLD-representable data, one spelling per
+  meaning, and identity from the Definition CID rather than names. Selfhost does
+  not admit `lam` or `app` yet, so Clojure-shaped `.kotoba` stays admitted until
+  the pure form lands and its migration is complete.
 
 
 ## Local reference oracle (owner decision 2026-10-29, JUN-579 / JUN-588; C and Python added 2026-11-06)
