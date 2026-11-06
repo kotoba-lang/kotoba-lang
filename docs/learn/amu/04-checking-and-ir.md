@@ -1,38 +1,32 @@
-# 04 型検査と中間表現
+# 04 Type checking and intermediate representations
 
-型検査は、プログラムが使う値と操作が噛み合うかを調べる。
-中間表現 IR は、検査や変換やコード生成に適した形にしたプログラムである。
-一つのコンパイラに複数の IR があってよい。
+**English** | [日本語](04-checking-and-ir.ja.md)
 
-## 動かす例
+Type checking establishes that values and operations fit together. An intermediate representation, or IR, expresses a program in a form suitable for checking, transforming, or generating code. A compiler can use several IRs.
 
-[03-branch.kotoba](examples/03-branch.kotoba) は let に条件分岐を加える。
+## Run the example
+
+[03-branch.kotoba](examples/03-branch.kotoba) adds a conditional:
 
 ```clojure
 (let [x 40]
   (if (= x 40) (+ x 2) 0))
 ```
 
-比較の結果は bool、if の両分岐は i64 である。結果は `42`。
-一方 [negative-type.kotoba](examples/negative-type.kotoba) の `(+ 40 true)` は、
-観測した CLI で `E2104 type mismatch in '+'` として拒否された。
-bool の bit を整数として扱って実行する経路には進まない。
+The comparison produces a bool, and both branches produce i64 values. The result is `42`. In contrast, `(+ 40 true)` in [negative-type.kotoba](examples/negative-type.kotoba) produced `E2104 type mismatch in '+'` in the observed CLI. It does not proceed by treating the bool's bits as an integer.
 
-## KIR と Seed tree と SIR
+## KIR, the Seed tree, and SIR
 
-| 表現 | 主な役割 |
+| Representation | Main purpose |
 |---|---|
-| typed KIR | 検査された意味を表し、interface・effect・定義 identity の契約に結び付ける |
-| Seed の checked tree と表 | native frontend が名前・型などの検査結果を記録し、lowering に渡す |
-| SIR | native core がコード生成へ渡す命令列。local、temporary、label、call、fuel 等を明示する |
-| machine code | target の実際の命令と配置 |
+| Typed KIR | Represents checked meaning and connects it to interface, effect, and definition-identity contracts |
+| Seed checked tree and tables | Record native frontend resolution and checking information for lowering |
+| SIR | Provides instructions for native code generation, including locals, temporaries, labels, calls, and fuel |
+| Machine code | Contains actual target instructions and layout |
 
-`seed/12-kirread` は KIR 入力を Seed の tree へ読む別の入口であり、
-通常のソースを読む `11-read` と同じ仕事ではない。
-ソースの全経路が「KIR を一度ファイルに保存して読む」と考える必要はない。
+`seed/12-kirread` is a separate entry that reads KIR into a Seed tree. It is not the source reader `11-read`. Ordinary source compilation need not save a KIR file and read it back.
 
-`30-lower` は checked tree の解決情報を読み、SIR を作る。
-次は加算の説明用の擬似 IR であり、実際の dump の文法や最適化結果ではない。
+`30-lower` reads checked-tree resolution information and constructs SIR. This is explanatory pseudo-IR, not a real dump syntax or observed optimization result:
 
 ```text
 t0 = CONST 40
@@ -41,21 +35,14 @@ t2 = ADD t0 t1
 RET t2
 ```
 
-実際の SIR は `OP-CONST`、`OP-BIN`、`OP-LGET`、`OP-LSET`、`OP-BRZ` 等を持つ。
-`if` には label と分岐、`loop/recur` には反復と束縛の更新が要る。
-SIR を作った段階と、backend で定数畳込み等を行った後を混同しないようにする。
+Actual SIR has operations such as `OP-CONST`, `OP-BIN`, `OP-LGET`, `OP-LSET`, and `OP-BRZ`. An if needs labels and branches; a loop/recur needs iteration and binding updates. Keep the output of lowering separate from later backend transformations such as constant folding.
 
-## 読むソース
+## Read the source
 
-[21-check](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/21-check.kotoba)、
-[30-lower](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/30-lower.kotoba)、
-[SIR 契約](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/SIR)。
-型の名前と許される操作は [HEADS](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/HEADS) にある。
+Read [21-check](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/21-check.kotoba), [30-lower](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/30-lower.kotoba), and the [SIR contract](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/SIR). [HEADS](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/HEADS) describes types and admitted operations.
 
-## 小課題と解説
+## Exercise and answer
 
-if の片側を bool に変えた場合、両方の分岐を実行してから型を選べるだろうか。
-選べない。この main の戻り値は i64 であり、実行され得る分岐の型もそれに整合する必要がある。
-検査の意味を理解すると、後段が型を毎回推測し直さずに命令を選べる理由も分かる。
+If one branch returns a bool, can the compiler execute first and select the result type afterward? No: this main promises an i64, so reachable branch results must satisfy that contract. Checking gives the backend information it can use without rediscovering types during each operation.
 
-[前へ](03-reader-and-names.md) · [目次](README.md) · [次へ IPLD](05-ipld.md)
+[Previous](03-reader-and-names.md) · [Contents](README.md) · [Next: IPLD](05-ipld.md)

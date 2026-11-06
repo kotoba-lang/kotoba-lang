@@ -1,59 +1,47 @@
-# 12 実装を読み検証する
+# 12 Reading the implementation and running experiments
 
-ここまでで、ソース・form・検査・IR・identity・artifact・実行という流れを一周した。
-次は自分が知りたい振る舞いを一つ選び、入力から観測までを結ぶ。
+**English** | [日本語](12-reading-and-experiments.ja.md)
 
-## 実装を読む順序
+You have followed source, forms, checking, IR, identity, artifacts, and execution. Next, choose one behavior and connect its input to an observable result.
 
-最初に `seed/MANIFEST` と `FULL-MANIFEST` を見て、そのファイルが採用 closure に入るか確認する。
-次に `90-drv` の入口から `lex → read → names → check → lower → gen → layout → out` を追う。
-各モジュール冒頭の契約、成功・失敗の戻り方、対応する unit fixture の順で読むと、
-大きい backend のすべてを一度に読まずに済む。
+## Read in this order
 
-| 知りたいこと | 読む場所 | 観測する対象 |
+Start with `seed/MANIFEST` and `FULL-MANIFEST` to determine whether a file belongs to the adopted closure. Follow `90-drv` through `lex → read → names → check → lower → gen → layout → out`. Read module contracts, success/refusal behavior, and corresponding unit fixtures before attempting the entire backend.
+
+| Question | Where to look | What to observe |
 |---|---|---|
-| 名前の誤り | `20-names`、`21-check` | check の拒否と source position |
-| loop の意味 | `30-lower` と `seed/SIR` | 並行な recur 更新、結果、fuel |
-| 定数の生成 | `41-a64gen`、`40-a64enc` | artifact bytes と機械語、実行結果 |
-| 分岐距離 | `42-layout` | fixup と範囲外の拒否 |
-| 定義の同一性 | code-identity と standalone native producer | canonical payload bytes と DefCID |
-| 実行許可 | Kototama `eligible?`／`admit` | 欠けた origin ごとの拒否 |
+| Name errors | `20-names`, `21-check` | Check refusal and source position |
+| Loop semantics | `30-lower`, `seed/SIR` | Parallel recur updates, result, fuel |
+| Constant emission | `41-a64gen`, `40-a64enc` | Artifact bytes, instructions, execution |
+| Branch distances | `42-layout` | Fixups and out-of-range refusals |
+| Definition identity | code-identity and standalone native producer | Canonical payload bytes and DefCIDs |
+| Execution permission | Kototama `eligible?` and `admit` | Refusals for missing origins |
 
-## Simple と対応させる
+## Connect this course to Simple
 
-[Simple](https://github.com/SeaOfNodes/Simple) は独立した動く compiler を章ごとに育て、
-Sea-of-Nodes の IR、SSA、型、最適化、backend を詳しく説明する。
-Amu を読むときにも「整数→算術→local→if→loop→call→codegen」という順番を借りられる。
-ただし Amu の native core が全体として Simple と同じ SoN 表現を使うという意味にはならない。
+[Simple](https://github.com/SeaOfNodes/Simple) grows a complete working compiler chapter by chapter, explaining Sea-of-Nodes IR, SSA, types, optimizations, and backends. You can borrow its progression from integers through arithmetic, locals, conditionals, loops, calls, and code generation. That does not mean Amu's native core uses the same SoN representation throughout.
 
-Amu には [Simple Chapter 9 を参照した rooted rewrite 診断](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/coscientist-rewrite-proof-20261006.md) がある。
-逆向きの利用関係を持つ worklist で、ある node の変更をその利用者へ伝える考えを学べる。
-この診断は完全な SoN／SSA 変換や製品 emitter の高速化を主張しない。
+Amu has a [rooted-rewrite diagnostic referencing Simple chapter 9](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/coscientist-rewrite-proof-20261006.md). Its reverse-use worklist illustrates how a changed node causes dependent users to be reconsidered. It does not claim a complete SoN/SSA conversion or a faster product emitter.
 
-## 小さな実験を完成させる
+## Complete a small experiment
 
-1. 仮説を一文にする。例は「local の改名は結果を変えない」。
-2. 入力と expected output を先に固定する。元の全体を残し、都合のよい部分だけに縮めない。
-3. 間違った変更も作る。例は束縛だけを改名し、使用箇所を変え忘れた入力。
-4. 同じ compiler で検査・実行し、exit、stdout、stderr と入力・artifact の digest を記録する。
-5. 結果を仮説の範囲で述べる。DefCID を観測していないなら identity の実証とはしない。
+1. State a hypothesis, such as: renaming a local does not change the result.
+2. Fix the inputs and expected outputs first. Keep the complete original case instead of shrinking it to a convenient fragment.
+3. Include an incorrect change, such as renaming the binding but not its use.
+4. Check and run with the same compiler, recording exit, stdout, stderr, input hashes, and artifact hashes.
+5. State a conclusion within the hypothesis's scope. Without observing DefCIDs, you have not demonstrated identity equality.
 
-速度を調べるときは正しさを確認した後、compiler と source、target と CPU、最適化設定、
-runtime profile、入力、warm/cold、試行の順序、host の負荷、除外条件を固定する。
-時間の集計だけでなく全採用・不採用サンプルを残す。
-ノイズより小さい差や、命令が短くなっただけの結果を速度改善にしない。
+For performance, establish correctness first, then pin compiler and source, target and CPU, optimization settings, runtime profile, input, warm/cold conditions, trial ordering, host load, and exclusion rules. Keep accepted and rejected samples, not just aggregates. Differences below noise and smaller code alone do not establish a speed improvement.
 
-## 最終課題と解説
+## Final exercise and answer
 
-`double` を使う例について、次の四つを説明してみよう。
+Explain four things about the `double` example:
 
-- `double` の局所引数を改名しただけなら、結果と正規化した定義の関係はどうなるか。
-- `double` の計算を変更すると、その依存を seal した `main` に何が起きるか。
-- 同じ定義から別の target の machine code を作れるのはなぜか。
-- 同じ machine code を cache から得ても、失効した grant で外部操作できないのはなぜか。
+- How does renaming its local argument affect the result and normalized definition?
+- How does changing `double`'s computation affect a `main` that seals its dependency?
+- Why can the same definition generate machine code for a different target?
+- Why does retrieving cached machine code not authorize an operation under an expired grant?
 
-解説は順に、束縛関係を保つ α 正規化、依存 CID の伝播、意味と artifact の分離、
-immutable code identity と現在の admission の分離である。
-この四つを一つの例でつなげられれば、Amu の compiler と IPLD と Kototama を役割ごとに理解できている。
+The answers connect binding-preserving alpha normalization, dependency-CID propagation, separation of meaning from artifacts, and separation of immutable code identity from current admission. Explaining them together connects the compiler, IPLD, and Kototama by their responsibilities.
 
-[前へ](11-build-performance.md) · [目次](README.md) · [例の観測結果](examples/README.md)
+[Previous](11-build-performance.md) · [Contents](README.md) · [Example observations](examples/README.md)

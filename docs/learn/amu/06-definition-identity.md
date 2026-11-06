@@ -1,76 +1,56 @@
-# 06 Unison に通じる定義の識別
+# 06 Unison-inspired definition identity
 
-[Unison の中心的な考え](https://www.unison-lang.org/docs/the-big-idea/)は、定義を内容から識別し、
-人が使う名前をその識別から分けることである。
-Kotoba はこの考えを、検査済み定義の CID と IPLD に接続する。
-Unison の構文や codebase manager をそのまま採用するという意味ではない。
+**English** | [日本語](06-definition-identity.ja.md)
 
-## 名前を変えても参照関係を保つ
+[Unison's central idea](https://www.unison-lang.org/docs/the-big-idea/) is to identify definitions by content and keep human-readable names separate. Kotoba connects this idea to checked definition CIDs and IPLD. It does not adopt Unison's syntax or codebase manager wholesale.
 
-次の二つは説明用の関数本体である。
+## Rename while preserving references
+
+These are explanatory function expressions:
 
 ```clojure
 (fn [x] (+ x 1))
 (fn [y] (+ y 1))
 ```
 
-`x` と `y` は、どちらも自分の引数を指す。α 正規化はこの束縛関係を保ちながら名前の違いを取り除く。
-概念的には「引数0を読む」のような表現になる。名前の置換だけで、自由変数や別の束縛まで同じにしてはいけない。
-空白や局所名は identity の偶然の差にならない一方、参照先や型が変われば内容は変わる。
+Both `x` and `y` refer to their own argument. Alpha normalization removes the spelling difference while preserving the binding relationship, conceptually using a reference such as argument 0. It must not confuse free variables or distinct bindings. Whitespace and local names need not create accidental identity differences; changing a referenced definition or type changes the content.
 
-## Definition CID の六つの入力
+## Six inputs to a Definition CID
 
-現在の payload-v2 の契約は次を seal する。
+The current payload-v2 contract seals:
 
-1. 正規化した typed KIR。
-2. language profile version。
-3. desugar contract version。
-4. semantic な名前で表す effect row。
-5. interface。
-6. 直接参照する定義の CID 群。
+1. Normalized typed KIR.
+2. The language profile version.
+3. The desugar contract version.
+4. An effect row expressed using semantic operation names.
+5. The interface.
+6. Direct definition dependency CIDs.
 
-検査前の文字列を hash する方式と違い、「何を呼び、何を返し、何を行い得るか」が identity に入る。
-effectful な関数にも CID はある。effect が空かどうかも識別されるが、その CID は effect を実行する許可ではない。
-またこれは任意の二つのプログラムの意味的同値性を決定する仕組みではない。
-`(+ x x)` と `(* x 2)` が必ず同じ CID になる、という約束もない。
+Unlike hashing unchecked text, this binds what a definition calls, returns, and may do. Effectful definitions also have CIDs; the effect row distinguishes them without granting permission to perform those effects. This is not a decision procedure for arbitrary program equivalence: `(+ x x)` and `(* x 2)` are not guaranteed to share a CID.
 
-## 依存を名前から CID へ
+## Replace dependency names with CIDs
 
-`main` が `double` を呼ぶとき、保存する定義の依存は名前だけでなく、その `double` の定義 CID を指す。
-`double` の意味が変わればその CID が変わり、それを参照する `main` の identity にも影響する。
-名前空間は人が読むための mapping として扱える。
+When `main` calls `double`, the stored dependency points to the particular definition CID, not merely the name. A change to `double`'s meaning changes its CID and affects the identity of a `main` that seals that dependency. Namespaces can remain human-readable mappings.
 
 ```mermaid
 flowchart LR
-  M[main の定義] --> D[double の DefCID]
-  N[double という名前] -.-> D
-  P[別の表示名] -.-> D
+  M[main definition] --> D[double DefCID]
+  N[Name double] -.-> D
+  P[Another display name] -.-> D
 ```
 
-互いに呼び合う関数は、片方の hash がないともう片方を hash できない。
-そこで strongly connected component（SCC、強連結成分）として一群を正規化する。
-IPLD の block link 自体を循環させるのではなく、群の内部参照を canonical な member index で表す。
-native 候補の `scc-v1` は最大8 member という境界を持つ。大きな call graph を分割できることと、
-大きな再帰群の canonical identity を認めることは別である。
+Mutually recursive definitions cannot wait for one another's individual hashes. A strongly connected component, or SCC, is normalized as a group. Internal references become canonical member indices rather than cyclic IPLD block links. The native `scc-v1` candidate bounds groups to eight members. Partitioning a large call graph is separate from admitting canonical identity for a large recursive group.
 
-## native 実装の到達範囲
+## Native implementation scope
 
-言語側の識別契約・参照実装と、採用された native compile path を分ける。
-Amu の native `definition-cids` producer／codec／SCC は、確認した revision では standalone 候補で、
-通常の `MANIFEST`／`FULL-MANIFEST` に入っていない。
-公開 Mac `check/run` の成功から、その経路が毎回 canonical DefCID を発行したとは言えない。
-DefCID 単位の全 compiler の永続 object reuse も、この性質だけで完成しない。
+Distinguish the language identity contract and reference implementation from the adopted native compile path. At the pinned revision, the native `definition-cids` producer, codec, and SCC path are standalone candidates outside the ordinary `MANIFEST` and `FULL-MANIFEST`. A successful public Mac `check/run` does not establish that it minted a canonical DefCID. Persistent object reuse across the whole compiler also needs more than identity alone.
 
-## 読む契約とソース
+## Read the contracts and source
 
-[code identity](../../../lang/code-identity.edn)、
-[native definition-cids の範囲](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/definition-cids-native.md)、
-[SCC の候補実装](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/06-definition-groups.kotoba)。
+Read [code identity](../../../lang/code-identity.edn), the [native definition-cids scope](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/docs/definition-cids-native.md), and the [SCC candidate](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/06-definition-groups.kotoba).
 
-## 小課題と解説
+## Exercise and answer
 
-依存定義は同じまま、compiler の最適化設定だけを変えたら何が変わるだろうか。
-意味の契約が同じなら DefCID は同じでよいが、build key と artifact bytes は変わり得る。
-「同じ定義だから以前の機械語を無条件に使う」は安全な cache key ではない。
+What changes if only compiler optimization settings change? Under the same semantic contract, the DefCID can remain the same while the build key and artifact bytes change. Reusing old machine code merely because the definition is unchanged is not a sufficient cache policy.
 
-[前へ](05-ipld.md) · [目次](README.md) · [次へ effects と権限](07-effects-and-authority.md)
+[Previous](05-ipld.md) · [Contents](README.md) · [Next: effects and authority](07-effects-and-authority.md)
