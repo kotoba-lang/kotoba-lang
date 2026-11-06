@@ -39,12 +39,17 @@ hosted runtime permissions in the earlier whole-component Q9 contract.
   shrink the component to avoid a missing language or backend feature; mark
   that migration blocked.
 - Final source is canonical `.kotoba`. CLJC/CLJS source and host adapters
-  are migration inputs to port and retire. CLJK and EDN are retained as
-  reader syntax sugar (owner decision 2026-10-29, JUN-579; supersedes the
-  2026-10-22 "CLJK is not retained" wording): each sugar spelling must
-  desugar to the same canonical Kotoba form and mint the same Definition CID
-  as its pure `.kotoba` spelling. Equivalence is asserted by
-  `lang/surface-equivalence-corpus.edn`, with a negative control per pair.
+  are migration inputs to port and retire; `.clj`, `.cljc` and `.cljs` may
+  remain only as a local reference oracle under a project-root `oracle/`
+  holding an `ORACLE.edn` (owner decision 2026-11-06, JUN-579). CLJK and EDN
+  are retained as reader syntax sugar (owner decisions 2026-10-29 and
+  2026-11-06, JUN-579; supersedes the 2026-10-22 "CLJK is not retained"
+  wording): each sugar spelling must desugar to the same canonical Kotoba form
+  and mint the same Definition CID as its pure `.kotoba` spelling. Equivalence
+  is asserted by `lang/surface-equivalence-corpus.edn`, with a negative control
+  per pair. Native entry so far (amu#1848): a lone `check FILE.cljk` and
+  `definition-cids FILE.cljk`; compile, run, lock and project routes are
+  `.kotoba` only, and `.edn` has no native entry yet.
 - Every target uses the qualified Amu selfhost-built Kotoba and Amu CLI for
   source checks, project builds, packaging and execution. `--jvm-free` alone
   does not qualify the compiler or exclude Node/NBB/C.
@@ -77,8 +82,8 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
 - A reference value is evidence of the reference's behavior. It is not proof
   that a native implementation is correct, and a mismatch is reported, not
   forced to agree.
-- The oracle languages are nbb, JVM, C and Python (owner decision 2026-11-06): the
-  old reference implementations and prototypes in those languages. The same rules apply
+- The oracle languages are nbb, JVM, C, Python, Hy, jank and Fennel (owner decision
+  2026-11-06): reference implementations and prototypes in those languages. The same rules apply
   to every use, including a Workflow subagent running one on a developer machine: one-off,
   dated evidence, never in CI, gates, builds or runtime paths.
 

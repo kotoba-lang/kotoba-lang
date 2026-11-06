@@ -458,8 +458,12 @@ chain explicitly: `kotoba id account --address 0x… --chain-id 8453`.
 - `.kotoba` is canonical Kotoba component source.
 - `.cljc` is portable Clojure-family source and may use a `:kotoba` reader
   branch.
-- `.cljk` is CLJ Kotoba source; it is not a JVM target.
+- `.cljk` is CLJ Kotoba source: input sugar that must mint the same Definition
+  CID as its pure `.kotoba` spelling. It is not a JVM target. The native route
+  currently reads it in a lone `check` and in `definition-cids` only.
 - `.clj` and `.cljs` keep their normal single-target meaning.
+- The native route refuses `.clj`, `.cljc` and `.cljs`. They remain only as
+  local reference oracles under a project-root `oracle/`.
 
 Kotoba is not a promise that arbitrary JVM Clojure or ClojureScript programs
 will run. The admitted grammar is
