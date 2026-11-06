@@ -47,7 +47,7 @@ def main():
     d, h = [json.loads(p.read_text()) for p in (deps, html_deps)]
     if (d['dependencies'][0]['sha256'] != sha(sha_source) or
         [x['sha256'] for x in h['dependencies']] != [sha(core), sha(hiccup)] or
-        sha(ROOT/'site/generate.cljk') != 'ca2955ee08ec6891787d7636238b1bc7b0ab64b807c4c8ce653ec03657d6c072' or
+        sha(ROOT/'site/generate.cljk') != 'c69982760682f834d96fd0f20c9dffd1c92681a9ddb1a3687b488117360d5c67' or
         sha(ROOT/'site/src/kotoba/site/locales.cljk') != 'ef97ede6b5a4f2bf0d0efc467780b305e1cf54afa5c2800b659f613180bc0aaf'):
         raise ValueError('dependency or source drift')
     component_spec = json.loads((ROOT / 'site/native/dds-dependencies.json').read_text())
