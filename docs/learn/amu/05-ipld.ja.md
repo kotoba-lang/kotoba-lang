@@ -44,6 +44,10 @@ IPLD は CPU の物理ポインタ配置を定めない。
 CID は内容の識別、handle は一回の実行内の参照、capability は操作の権限という別の役割を持つ。
 CID の一致から、取得可能性・秘密性・実行許可は導けない。
 
+## 一次資料
+
+[IPLD Docs](https://ipld.io/docs/)を全体の入口とし、[Data Model](https://ipld.io/docs/data-model/) と [DAG-CBOR 仕様](https://ipld.io/specs/codecs/dag-cbor/spec/)へ進む。Data Model では値の意味を、codec の仕様ではその値を表すバイト列を確認する。Kotoba が追加する正規化や identity の規則は、以下の契約で確認する。
+
 ## 読む契約
 
 [物理コストと IPLD の解説](../../lang/physical-model-and-ipld.ja.md)、

@@ -56,6 +56,18 @@ Apple Silicon Mac の native CLI を使う。Amu の checkout で、公開入口
 また native の小例が動くことと、Kototama VM の状態・権限・receipt をすべて実装したことは別である。
 各章はこの違いを、その機能を説明する箇所で示す。
 
+## 参考資料と読み方
+
+以下は教材で扱う考え方を確認できる一次資料である。各章では Kotoba 自身の契約と revision を固定した実装へ対応付ける。類似した役割や互換 profile を持つことと、実装の検証結果は区別する。
+
+| テーマ | 一次資料 | この教材との関係 |
+|---|---|---|
+| S式と Lisp | [McCarthy の Lisp 論文、1960年](https://www-formal.stanford.edu/jmc/recursive.html) | 記号式と再帰的な計算。第2章ではソース表記・フロントエンドの木・canonical form を区別する。 |
+| IPLD | [IPLD Docs](https://ipld.io/docs/)、[Data Model](https://ipld.io/docs/data-model/)、[DAG-CBOR 仕様](https://ipld.io/specs/codecs/dag-cbor/spec/) | 値・内容アドレスの link・符号化。第5章では source・definition・artifact・value の識別を区別する。 |
+| Unison | [The big idea](https://www.unison-lang.org/docs/the-big-idea/) | 定義の identity と人が読む名前。第6章では Kotoba の検査済み定義の契約と実装範囲へつなげる。 |
+| Simple | [SeaOfNodes/Simple](https://github.com/SeaOfNodes/Simple) | 章ごとに進む compiler 学習。第12章では Amu を読むときに参考となる学習順序と graph の考え方を説明する。 |
+| Filecoin の実行モデル | [Filecoin Virtual Machine](https://docs.filecoin.io/core-concepts/filecoin-virtual-machine)、[Filecoin EVM runtime](https://docs.filecoin.io/core-concepts/filecoin-evm-runtime) | 実行基盤と、その上に載る runtime。第9章では FVM／FEVM と Kototama の VM・互換 profile の境界を対応付ける。 |
+
 ## 参照の基準
 
 本教材の確認日は 2026年11月6日。Amu の実装参照は

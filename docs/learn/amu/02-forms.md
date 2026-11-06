@@ -31,6 +31,10 @@ The language contract requires canonical `.kotoba` and its CLJK/EDN reader sugar
 
 Representing syntax as data grants no permission to call unrestricted host `eval`. Quote, desugaring, and typed eval each have their own permitted positions and inputs.
 
+## Background reference: S-expressions
+
+John McCarthy's [Recursive Functions of Symbolic Expressions and Their Computation by Machine, Part I](https://www-formal.stanford.edu/jmc/recursive.html), published in 1960, is a primary source for Lisp's symbolic expressions and recursive computation. Read it alongside the tree above. Kotoba's typed forms, representation contracts, and effect admission are defined by Kotoba's own specifications.
+
 ## Read the source
 
 Read the [Form schema and constructors](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/src/kotoba/form.kotoba), [Seed memory layout](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/seed/MEMORY-MAP), and [elaboration pipeline](../../../lang/elaboration-pipeline.edn).

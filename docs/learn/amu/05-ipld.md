@@ -33,6 +33,10 @@ One IPLD block can contain multiple nodes. Each expression element need not beco
 
 IPLD does not prescribe CPU pointer layout. After verifying and hydrating a value into a local handle or contiguous buffer, execution need not compute a CID for every element access. A CID identifies content, a handle refers to a value within an execution, and a capability grants an operation. CID equality does not establish availability, confidentiality, or execution permission.
 
+## Primary sources
+
+Start with [IPLD Docs](https://ipld.io/docs/) for the documentation map, then follow the [Data Model](https://ipld.io/docs/data-model/) and [DAG-CBOR specification](https://ipld.io/specs/codecs/dag-cbor/spec/). Use the data model to ask what a value means and the codec specification to ask which bytes encode it. Kotoba's additional normalization and identity rules are in the contracts linked below.
+
 ## Read the contracts
 
 Read [physical costs and IPLD](../../lang/physical-model-and-ipld.md), the [value codec](../../../lang/value-codec.edn), and [code identity](../../../lang/code-identity.edn). The [CID and handle contract](../../adr/ADR-kotoba-cid-handle-cap-runtime.md) explains stored representations and execution layouts.
