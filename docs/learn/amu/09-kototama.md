@@ -32,9 +32,15 @@ The pure-result cache contract binds the Admission CID and input Value CIDs. It 
 
 ## Separate the VM contract from implementation profiles
 
-`core/v1` and Ehttps://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/FVM-related profiles each need their own compatibility scope and evidence. An EVM-like architectural role does not establish Ethereum bytecode, state, or consensus compatibility. Emitting Wasm does not establish the full Kototama state-transition contract either.
+`core/v1`, `fvm-actor/v1`, `evm/v1`, and `fevm/v1` each need their own compatibility scope and evidence. An EVM-like architectural role does not establish Ethereum bytecode, state, or consensus compatibility. Emitting Wasm does not establish the full Kototama state-transition contract either.
 
 Amu's `kototama.pure-i64-aot/v1` and `kototama.pure-i64-receipt/v2` are separately defined bounded profiles for closed integer computation with empty guest authority. The course's `main → 42` examples do not qualify IPLD worlds, every operation, or every target.
+
+## Related execution models: Filecoin FVM and FEVM
+
+The [Filecoin Virtual Machine overview](https://docs.filecoin.io/core-concepts/filecoin-virtual-machine) describes a Wasm-based execution environment for actors with IPLD data primitives. The [Filecoin EVM runtime documentation](https://docs.filecoin.io/core-concepts/filecoin-evm-runtime) describes FEVM as an EVM runtime layered on FVM. These sources help distinguish an execution platform from a compatibility runtime on that platform.
+
+Kototama's [VM specification and profile definitions](https://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/docs/kototama-virtual-machine.md) explicitly relate its architectural role to EVM/FVM. Its FVM-shaped profile covers actor messages, IPLD state, nested calls, gas and rollback. Read each profile's declared scope and evidence before making a compatibility claim. Filecoin consensus and storage proofs are outside Kototama's VM contract.
 
 ## Read the authorities
 

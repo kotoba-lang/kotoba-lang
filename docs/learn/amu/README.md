@@ -42,6 +42,18 @@ A **language or VM contract** defines the behavior an implementation must preser
 
 For example, the existence of a DefCID contract does not mean every native build uses a persistent per-definition cache. Running a small native example also does not establish the complete Kototama state, authority, and receipt contract. Each chapter keeps these distinctions beside the feature concerned.
 
+## References and reading guide
+
+These primary sources explain the ideas used in the course. Each chapter connects them to Kotoba's own contracts and pinned implementation; a comparison or compatibility profile needs its own implementation evidence.
+
+| Topic | Primary source | Connection to this course |
+|---|---|---|
+| S-expressions and Lisp | [McCarthy's Lisp paper, 1960](https://www-formal.stanford.edu/jmc/recursive.html) | Symbolic expressions and recursive computation; chapter 2 distinguishes source syntax, frontend trees, and canonical forms. |
+| IPLD | [IPLD Docs](https://ipld.io/docs/), [Data Model](https://ipld.io/docs/data-model/), [DAG-CBOR specification](https://ipld.io/specs/codecs/dag-cbor/spec/) | Values, content-addressed links, and encoding; chapter 5 separates source, definition, artifact, and value identities. |
+| Unison | [The big idea](https://www.unison-lang.org/docs/the-big-idea/) | Definition identity and human-readable names; chapter 6 explains Kotoba's checked definition contract and its implementation scope. |
+| Simple | [SeaOfNodes/Simple](https://github.com/SeaOfNodes/Simple) | A chapter-by-chapter compiler learning path; chapter 12 explains which progression and graph ideas are useful when reading Amu. |
+| Filecoin execution models | [Filecoin Virtual Machine](https://docs.filecoin.io/core-concepts/filecoin-virtual-machine), [Filecoin EVM runtime](https://docs.filecoin.io/core-concepts/filecoin-evm-runtime) | An execution platform and a runtime layered on it; chapter 9 relates FVM/FEVM to Kototama's VM and compatibility-profile boundaries. |
+
 ## Reference baseline
 
 The reference date is 6 November 2026. Amu implementation links are pinned to [`a4c16e7c`](https://github.com/kotoba-lang/amu/tree/a4c16e7c47005d2235dc48d3f69569773a1606e7), and Kototama links to [`b7bbcc44`](https://github.com/kotoba-lang/kototama/tree/b7bbcc44d08913fee69074ad70f92d341df2be92). Relative links lead to language contracts in this repository. Pinned links keep the explanation reproducible when files later move. Check the owning contracts, manifests, and execution evidence when using a newer version.

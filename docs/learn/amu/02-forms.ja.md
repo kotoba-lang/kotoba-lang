@@ -47,6 +47,10 @@ canonical `.kotoba` と CLJK／EDN の reader sugar は、言語契約上、同�
 構文がデータだからといって、任意の式を host `eval` に渡す権限は得られない。
 quote、desugar、typed eval はそれぞれ許される位置と入力が定まっている。
 
+## 背景となる一次資料: S式
+
+John McCarthy の [1960年の Lisp 論文](https://www-formal.stanford.edu/jmc/recursive.html)は、記号式と再帰的な計算を学ぶ一次資料である。上の式の木と対応付けて読むとよい。Kotoba の typed form、表現の契約、effect の admission は Kotoba 自身の仕様で定める。
+
 ## 読むソース
 
 [Form の schema と constructor](https://github.com/kotoba-lang/amu/blob/a4c16e7c47005d2235dc48d3f69569773a1606e7/src/kotoba/form.kotoba)、

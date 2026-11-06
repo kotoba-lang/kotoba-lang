@@ -49,13 +49,19 @@ HTTP や支払いの effect を過去の結果で黙って代用することは�
 
 ## VM 契約と実装 profile を区別する
 
-`core/v1`、EVM／FVM 系の profile は、それぞれ必要な互換性と証拠を持つ。
+`core/v1`、`fvm-actor/v1`、`evm/v1`、`fevm/v1` の profile は、それぞれ必要な互換性と証拠を持つ。
 EVM に似た立ち位置という説明だけで Ethereum の bytecode・state・consensus 互換にはならない。
 Wasm を出力できることも、Kototama のすべての状態遷移を実装した証拠にはならない。
 
 Amu の `kototama.pure-i64-aot/v1` や `kototama.pure-i64-receipt/v2` は、
 空の guest authority・閉じた整数計算という別途定めた bounded profile である。
 この教材の `main → 42` の成功を、IPLD world・全 operation・全 target の conformance に広げない。
+
+## 関連する実行モデル: Filecoin FVM と FEVM
+
+[Filecoin Virtual Machine の概要](https://docs.filecoin.io/core-concepts/filecoin-virtual-machine)は、actor と IPLD のデータ操作を扱う Wasm ベースの実行環境を説明する。[Filecoin EVM runtime の資料](https://docs.filecoin.io/core-concepts/filecoin-evm-runtime)は、FVM の上で EVM を実行する runtime である FEVM を説明する。実行基盤と、その基盤上の互換 runtime を区別するための参照となる。
+
+Kototama の [VM 仕様と profile の定義](https://github.com/kotoba-lang/kototama/blob/b7bbcc44d08913fee69074ad70f92d341df2be92/docs/kototama-virtual-machine.md)にも、EVM／FVM と対応する役割が明記されている。FVM 型の profile では actor のメッセージ、IPLD state、入れ子の呼出し、gas、rollback 等を扱う。互換性を述べる際は各 profile の範囲と検証結果を確認する。Filecoin の consensus や storage proof は Kototama の VM 契約の外にある。
 
 ## 読む正本
 
