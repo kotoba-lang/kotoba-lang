@@ -30,6 +30,15 @@ def integrate_job(build,names,group):
   write_bytes(build/'docs-base-pages'/name,original)
   write_bytes(folder/'page.html',original)
   write_bytes(build/'candidate'/name,native_run(program_image(build/'docs_page'),folder,['integrate','ja' if name.startswith('ja/') else 'en','']))
+def validate_existing_program(program,built):
+ # Linux locks contain absolute staging paths. Each artifact must match its
+ # own lock; equivalence across directories uses source/data content pins.
+ records=[]
+ for folder in (program,built):
+  record=json.loads((folder/'build.json').read_text())
+  if sha(program_image(folder))!=record['binarySha256'] or sha(folder/'project.ksl')!=record['sourceLockSha256']:raise ValueError('Docs program/lock drift')
+  records.append({k:record.get(k) for k in ('profile','sources','data')})
+ if records[0]!=records[1]:raise ValueError('existing Docs source/data differs')
 def extend(build,compiler,packager,libraries,grammar,linux_inputs=None):
  build=Path(build).resolve(strict=True);base=json.loads((build/'receipt.json').read_text());candidate=build/'candidate'
  actual={str(p.relative_to(candidate)):sha(p) for p in candidate.rglob('*') if p.is_file()}
@@ -42,8 +51,7 @@ def extend(build,compiler,packager,libraries,grammar,linux_inputs=None):
  else:b=Build(build/'docs-build',compiler,packager,libraries,grammar)
  built=b.compile('docs_page')
  program=build/'docs_page'
- if program.exists():
-  if sha(program_image(program))!=sha(program_image(built)) or sha(program/'project.ksl')!=sha(built/'project.ksl'):raise ValueError('existing Docs program differs')
+ if program.exists():validate_existing_program(program,built)
  else:shutil.copytree(built,program)
  examples=tuple(p for p in sorted((ROOT/'docs/learn/amu/examples').iterdir()) if p.suffix in ('.kotoba','.py','.json'))
  # Bind source bytes before workers read them; finish rejects mid-build edits.

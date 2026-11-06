@@ -200,6 +200,9 @@ pages at `/docs/amu/` and 14 Japanese pages at `/ja/docs/amu/`: the index,
 12 chapters, and examples guide. Each page has matching language links,
 canonical/alternate metadata, a course sidebar, and previous/next navigation.
 The existing Markdown remains the content source for both GitHub and the site.
+Linux source locks contain absolute staging paths. Reused producer admission
+compares source/data content bindings and validates each image against its own
+lock; it does not require locks from different directories to have one digest.
 
 The renderer admits the course's headings, paragraphs, lists, tables, inline
 code/emphasis/links, and sh/clojure/text fences. Its bounded flowchart subset
