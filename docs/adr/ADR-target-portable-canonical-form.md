@@ -90,9 +90,9 @@ Unison-like. Rules:
 1. **One spelling per meaning.** `.kotoba` carries no sugar. `->`, `cond`,
    destructuring, `#?(...)` and `defdesugar` belong to the `.cljk` and `.edn`
    surfaces, which must normalize to the same Definition CID.
-2. **Source is inert data with an IPLD representation.** Every pure form has one
-   defined, lossless mapping onto the IPLD Data Model, with `:i64` as exact
-   integers and floats as exact bits. S1 writes that mapping down.
+2. **Source is inert data on the IPLD Data Model.** Every pure form has one
+   representation, pinned by the IPLD Schema
+   [`lang/pure-form.ipldsch`](../../lang/pure-form.ipldsch) (§2.2).
 3. **No second identity.** The Definition CID stays where
    [`lang/code-identity.edn`](../../lang/code-identity.edn) puts it: DAG-CBOR over
    checked typed KIR, effect row, interface and dependencies. The pure form is how
@@ -100,37 +100,78 @@ Unison-like. Rules:
    canonical S-expression in
    [`ADR-kotoba-syntax-layers-and-quote-position.md`](ADR-kotoba-syntax-layers-and-quote-position.md).
 4. **Names are metadata.** Binders are alpha-normalized and callees are sealed by
-   CID, as already implemented, so renaming changes no identity. `(ref name)` is
-   module-local today; `(ref <cid>)` is the target for cross-definition references.
+   CID, as already implemented, so renaming changes no identity. A name is a bare
+   symbol; `(ref "bafy...")` reads a definition by CID and is an IPLD Link.
 5. **Effects are visible and typed.** Effects occur only through `perform` and are
    sealed in the effect row. A CID never grants authority.
 
-The owner approved the direction. The following spelling is drafted to fit it and
-is reviewed at the start of S1:
+The spelling is settled in [`lang/pure-form.edn`](../../lang/pure-form.edn). The
+owner set the direction and asked for the spelling to be settled, and these choices
+were made under that instruction. It is decided but not implemented.
 
 ```clojure
+(ns example (:export [run]))
 (def inc1 (lam [n :i64] :i64 (+ n 1)))
+(def run (lam [] :i64 (inc1 41)))
 ```
 
-| Part | Spelling | Why |
+A spelling counts as sugar when it has the same Definition CID as a pure spelling.
+That test was measured, and it decided the less obvious cases:
+
+| Choice | Decision | Reason |
 |---|---|---|
-| Top level | `(def NAME VALUE)` | Replaces `defn`; a function is a value |
-| Function | `(lam [x T ...] R BODY)`, with `T` and `R` optional where inference decides | Keeps today's binder and result order, so conversion from `defn` is mechanical |
-| Types | Data: `:i64`, `[:option T]`, `[:fn [T] R]` | Already plain data, so already representable in IPLD |
-| Other heads | `app`, `ref`, `let`, `if`, `do`, `perform`, `handle` | From the 2026-09-04 ADR, minus `rel` and `query` (D6) |
+| Parameter types | Required at the top level, absent on an inner `lam` | Position decides, so there is one spelling, and today's checker already refuses annotations on `fn` literals (E2139) |
+| Calls | Prefix for a named head; `app` only for a computed operator | Prefix is what the source already uses, and one spelling per case |
+| `defn-` | None; visibility is `:export` | `defn` and `defn-` measure the same CID |
+| `loop` / `recur` | None; a tail-recursive `def` | Measured the same CID as the lifted helper, and proper tail calls are in §3 |
+| `and` / `or` | Stay core | No other spelling measured has their CID |
+| Variadic `(+ a b c)` | Binary only in `.kotoba` | It matches neither nesting, so its desugaring needs its own decision |
+| Records, variants | Existing descriptor forms such as `record-new` | They already reach KIR; `defrecord` and `->T` are sugar |
+| Protocols, multi-arity | No pure spelling; one `def` per arity | Both resolve statically |
+| Module header | `(ns NAME (:export ...) ...)` only | `{:kotoba/export ...}` attribute maps are sugar |
 
-To settle at S1, because the sources do not decide them:
+**Migration cost.** In the compiler's own seed (169,268 forms), the sugar to convert
+includes 6,883 `defn`/`defn-`, 3,757 `inc`, 2,513 `->`, 1,648 `not=`, 1,619 `cond`,
+1,606 `loop` and 468 `case`. JUN-579 keeps `.cljk` out of the compiler's own
+dependencies, so these sites become pure source that people then edit. S1 has to
+weigh that readability cost before `.kotoba` refuses sugar.
 
-- Prefix `(f a)` or `(app f a)`. The 2026-09-04 ADR allows both, which breaks rule
-  1. The recommendation is prefix for a named head and `app` only for a computed
-  operator.
-- The canonical form of records, variants, protocols, multi-arity functions,
-  `loop`/`recur` and the module header (`ns`, exports).
+**Order.** Selfhost admits the pure forms; sources convert mechanically with
+Definition CID equality and a negative control per pair; only then does `.kotoba`
+refuse sugar. Until then, today's Clojure-shaped `.kotoba` stays admitted, as the
+2026-09-04 ADR permits.
 
-**Migration.** Today's `.kotoba` files, including the compiler's own seed, are
-Clojure-shaped, and the 2026-09-04 ADR permits that until its step 3. So the order
-is: selfhost admits the pure forms; sources convert mechanically with Definition
-CID equality and a negative control per pair; only then does `.kotoba` refuse sugar.
+### 2.2 The three IPLD specifications
+
+Each pure form follows the [Data Model](https://ipld.io/docs/data-model/kinds/)
+kinds, and its shape is pinned with an
+[IPLD Schema](https://ipld.io/docs/schemas/). [ADLs](https://ipld.io/docs/advanced-data-layouts/)
+stay outside the grammar.
+
+| Layer | Pure form | Why |
+|---|---|---|
+| Data Model | Integer, String, Boolean, Bytes, Link and Null are their own kinds; a call is a List: `(+ 1 2)` is `[{"sym": "+"}, 1, 2]` | Tools see real kinds, and paths and selectors work on them |
+| Data Model, no kind | Symbol, keyword, vector, set, map and `f64` are single-entry maps | The kinds do not include them. Float excludes NaN and infinities and is advised against. Map keys are strings in DAG-CBOR, while a form's key can be any form |
+| Schema | A `kinded` union over kinds, with a `keyed` union for the maps | Every node is discriminated by the schema itself, which the KIR schema cannot do |
+| ADL | Not in the grammar. A schema declares `representation advanced`, and a module pinned by CID implements it | An ADL is a lens over data, and it holds code, so it stays behind the existing boundary |
+
+The schema pins shape, not checkedness: passing it is not being valid Kotoba (root
+`adr-2609076000`, decision 4). Evidence: 16 positive forms unify and 8 negative forms
+are refused, through `ipld.schema`.
+
+**What is not spec-based today.** The pure form is new; the code that exists differs:
+
+| Part | State on 2026-11-07 |
+|---|---|
+| `io-ipld` library (`ipld.schema`, `ipld.schema-dsl`, ADL view, FBL) | Implements the specs as a hosted library. Its own coverage table shows 24 of 26 DSL constructs round-tripping, and `copy` and `unit representation empty` refused; that table states it is not conformance |
+| Amu selfhost | Contains none of it: no IPLD module in `seed/FULL-MANIFEST`. The `.kotoba` ports stop at E6002 or E1005, and `document-link` is refused (E2101) |
+| Definition CID (payload v2) | Valid DAG-CBOR, but a private model: every node is a tagged list such as `["int", "5"]`, with integers as decimal text. Its schema admits it cannot pin the discriminator |
+| `kotoba.value.v1` | Also tagged pairs such as `[2, 5]`, disagreeing with payload v2 on every byte |
+| ``(:schemas ...)`` | Kotoba's own `[:record ...]` vocabulary, not IPLD Schema |
+
+So the pure form does not change the Definition CID. Moving identity onto native
+Data Model kinds is payload v3, which root `adr-2609076000` measured as moving every
+Definition CID, module lock and cache key, and left to the owner.
 
 ### 3. Meaning is specified at the form, without naming an ISA
 
@@ -223,17 +264,18 @@ Claims are made per target. As an expectation to be tested, not a result:
 Each stage has its own exit evidence, and none implies the next.
 
 1. **S0**: Owner decisions D1–D7. Done 2026-11-07.
-2. **S1**: The pure form is written down per §2.1, including its IPLD mapping, and
-   the self-hosted frontend admits it. Conversion and the `.kotoba` sugar refusal
+2. **S1**: The spelling and IPLD mapping are written down (done, §2.1 and §2.2), and
+   the self-hosted frontend admits them. Conversion and the `.kotoba` sugar refusal
    follow in that order. Exit: every pure head admitted, surface-equivalence pairs
    measured with their controls.
 3. **S2**: `core-semantics` and the three profiles land, including the named trap
    for resource exhaustion; the checker reports a program's profile. Exit: every
    conformance file classified, and deep recursion gives the named trap natively.
 4. **S3**: Close `kotoba-core` gaps on the existing targets: floats on Wasm and
-   JS (E7101), and the export-clause refusal (E2004) that stops 35 positive files
-   on browser targets, 9 of which compile on aarch64-macos. Exit: wasm and JS match
-   native on `kotoba-core`, by execution.
+   JS (E7101), and the header refusal (E2004) that stops 35 positive files on browser
+   targets, 9 of which compile on aarch64-macos. Of all 39 E2004 files, 31 use the
+   `{:kotoba/export ...}` attribute map, which §2.1 makes sugar. Exit: wasm and JS
+   match native on `kotoba-core`, by execution.
 5. **S4**: Linkable runtime. Exit: a constant `main` reaches only the runtime it
    uses, with fuel and trap results unchanged.
 6. **S5**: Rust from SIR (D7), in the D4 tier. Exit: the full `kotoba-core` corpus

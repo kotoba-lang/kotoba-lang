@@ -35,6 +35,8 @@ so the baseline could not be retaken on origin.
 | [`naive/`](naive/) | Hand-written primitives per language, and [`naive/output.txt`](naive/output.txt) |
 | [`conformance-compile.tsv`](conformance-compile.tsv) | Target, code, file, first error line for 112 files in `lang/conformance` on 3 targets |
 | [`core-head-admission.tsv`](core-head-admission.tsv) | Name, source, result per probed head on js-browser |
+| [`pure-form-schema-check.cljs`](pure-form-schema-check.cljs) | Positive and negative forms against `lang/pure-form.ipldsch` |
+| [`pure-form-schema-check.txt`](pure-form-schema-check.txt) | Its output |
 
 ## Commands
 
@@ -105,3 +107,43 @@ Kotoba, `noinline` in C, ordinary variables in the others):
 | `bin/amu`, Java, JS, Python | 0 |
 | clang `-O2` | -5084563979301289984 |
 | clang `-O2 -ffp-contract=off` | 0 |
+
+### Sugar test: Definition CIDs
+
+`<amu-full-root.macho> definition-cids FILE.kotoba 3<.`, amu origin/main `1754ff26f`.
+
+| Compared | Result |
+|---|---|
+| `(-> 1 g g)` and `(g (g 1))` | Same; control `(g (g 2))` differs |
+| `(inc 1)` and `(+ 1 1)` | Same |
+| `(not= 1 2)` and `(not (= 1 2))` | Same |
+| `(cond (< 1 2) 1 :else 0)` and `(if (< 1 2) 1 0)` | Same |
+| `defn-` and `defn` | Same, for both definitions |
+| `loop` and a tail-recursive `defn` | Same, for both the helper and `main` |
+| `(+ 1 2 3)`, `(+ (+ 1 2) 3)` and `(+ 1 (+ 2 3))` | All three differ |
+| `(and a b)`, `(if a b false)` and `(let [t a] (if t b t))` | All three differ |
+
+The tail-recursive pure spelling cannot be measured directly, since selfhost refuses
+`lam`; this uses `defn`, whose conversion to `def` and `lam` is still to be built.
+
+### Pure form on IPLD Schema
+
+Run once through the hosted reference route under the local-oracle rule, from
+`lib/kotoba.ioIpld` in `kotoba-lang/kotoba` at `fc58f414c`, with `kbb` (nbb v1.4.208),
+via `ipld.schema-dsl/parse`, `ipld.schema/compile-schema` and `ipld.schema/unify!`.
+
+16 positive forms unify. 8 negative forms are refused, for different reasons
+(`unknown-union-kind`, `invalid-keyed-union`, `unknown-union-discriminant`,
+`kind-mismatch`, `invalid-struct-tuple`). A `def` form round-trips through DAG-CBOR.
+
+This is Kotoba's own implementation of the spec, and its coverage table says it is not
+a conformance claim. The schema has **not** been checked with an independent IPLD
+implementation such as go-ipld-prime or js-ipld.
+
+### Seed usage
+
+Counts of forms by head, from `seed` at amu `1754ff26f` with comments and strings
+removed: 169,268 forms in 148 files, including `defn-` 6,807, `defn` 76, `inc` 3,757,
+`and` 3,668, `or` 2,598, `->` 2,513, `not=` 1,648, `cond` 1,619, `loop` 1,606, `case` 468.
+This is a text scan, and it also counts preserved and non-manifest files outside the
+excluded directories, so it sizes the migration only roughly.
