@@ -60,7 +60,7 @@ hosted runtime permissions in the earlier whole-component Q9 contract.
   both and their controller use loaderless `x86_64-linux-static` ELF.
 
 
-## Local reference oracle (owner decision 2026-10-29, JUN-579 / JUN-588)
+## Local reference oracle (owner decision 2026-10-29, JUN-579 / JUN-588; C and Python added 2026-11-06)
 
 The legacy cljk / JVM / nbb reference route (kotoba-sema, osaho, the nbb
 `definition-cids`, `.cljk` test suites) may be run on a developer machine as a
@@ -77,6 +77,10 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
 - A reference value is evidence of the reference's behavior. It is not proof
   that a native implementation is correct, and a mismatch is reported, not
   forced to agree.
+- The oracle languages are nbb, JVM, C and Python (owner decision 2026-11-06): the
+  old reference implementations and prototypes in those languages. The same rules apply
+  to every use, including a Workflow subagent running one on a developer machine: one-off,
+  dated evidence, never in CI, gates, builds or runtime paths.
 
 ## Shared agent rule
 
