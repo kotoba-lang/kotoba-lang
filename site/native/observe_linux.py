@@ -237,7 +237,7 @@ def main():
     baseline = False
     if a.profile == 'release-source':
         baseline = all(x['exit']==0 and not x['stderrTail'] for x in report['cliCommands']) and len(report['cliCommands'])==2
-        baseline &= len(report['components'])==52 and all(not x['compiled'] and x['exit']==1 and 'E7101' in x['stderrTail'] and not x['artifactExists'] for x in report['components'])
+        baseline &= len(report['components'])==len(recipes) and all(not x['compiled'] and x['exit']==1 and 'E7101' in x['stderrTail'] and not x['artifactExists'] for x in report['components'])
         for check in report['nativeChecks']:
             if check['name']=='scoped-read':
                 compile=check['compilation']

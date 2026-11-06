@@ -8,6 +8,14 @@ after a successful Play run, the page queues a `trial_started` conversion when
 `window.freebuff` is present. The tag's own network behavior and data handling
 are outside the local generator code and are not established by this description.
 
+## Amu course Docs
+
+The Amu compiler course is served directly on the site: [English](https://kotoba-lang.org/docs/amu/)
+(default) and [日本語](https://kotoba-lang.org/ja/docs/amu/). Each of the 12
+chapters, the index and examples guide links to its matching language version.
+`docs/learn/amu` remains the shared Markdown source. The native renderer and
+publication checks are documented in [native/BUILD.md](native/BUILD.md).
+
 ## What makes this page different from a README
 
 `generate.cljk` **derives the language claims from this repository's own authority files**

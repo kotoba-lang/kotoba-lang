@@ -119,4 +119,6 @@ def main():
  if len(files)!=189 or len(pages)!=133:raise ValueError(('release route count',len(files),len(pages)))
  receipt={'status':'BUILT_NATIVE_SITE_CANDIDATE','files':files,'htmlPages':len(pages),'locales':list(TAGS),'compilerSha256':sha(b.compiler),'packagerSha256':sha(b.packager),'inputsSha256':sha(b.output/'inputs.json'),'cljkInvoked':False,'published':False,'profile':getattr(b,'profile','macOS-ARM64')}
  (b.output/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'],len(files),flush=True)
+ from docs_build import extend
+ extend(b.output,a.compiler,a.packager,a.libraries,a.grammar,a.linux_inputs)
 if __name__=='__main__':main()

@@ -1,6 +1,6 @@
 # Native static site build
 
-`build_site.py` generates the current 189-file site (133 HTML files, including
+`build_site.py` generates the current 229-file site (161 HTML files, including
 2 authored static anatomy pages) on macOS ARM64. All authority parsing,
 localization, CSS/script extraction, JSON rendering and HTML composition run
 in compiled Kotoba programs. Python stages bytes, computes digests and observes
@@ -114,7 +114,7 @@ profile does not implement that option. No compiler flags or admission checks
 are patched in memory.
 
 It runs a negative-number float comparison, scoped file reads and the sitemap
-unit/mutation pair as native programs, then observes compilation of all 52
+unit/mutation pair as native programs, then observes compilation of all 53
 actual producer closures. Python stages bytes and records native process
 results. No CLJK, package install, C compiler, emulator or publication is run.
 
@@ -190,3 +190,46 @@ do not establish Cloudflare integrated Builds compatibility: that environment
 has a separate [20-minute build limit](https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/).
 No Workers Builds configuration or production trigger is created by this
 workflow. The explicit local CLJK route remains unchanged.
+
+## Native Amu course Docs
+
+The default build also runs `docs_build.py` after the 189-file base candidate.
+`docs_page.kotoba`, compiled with the same pinned native toolchain and source
+lock, reads hash-bound Markdown from `docs/learn/amu`. It produces 14 English
+pages at `/docs/amu/` and 14 Japanese pages at `/ja/docs/amu/`: the index,
+12 chapters, and examples guide. Each page has matching language links,
+canonical/alternate metadata, a course sidebar, and previous/next navigation.
+The existing Markdown remains the content source for both GitHub and the site.
+Linux source locks contain absolute staging paths. Reused producer admission
+compares source/data content bindings and validates each image against its own
+lock; it does not require locks from different directories to have one digest.
+
+The renderer admits the course's headings, paragraphs, lists, tables, inline
+code/emphasis/links, and sh/clojure/text fences. Its bounded flowchart subset
+renders labeled relationships as accessible HTML/CSS diagrams. Unsupported
+fences/diagrams and unsafe or undeclared relative links refuse. HTML in the
+source is escaped. There is no browser Markdown renderer or third-party script.
+
+Python stages bytes and observes native processes. It does not render Markdown,
+rewrite HTML, or derive the sitemap. The new native program rewrites only exact
+Docs href attributes in existing pages; the existing native sitemap program
+then derives the complete sitemap from actual page canonicals. Shared example
+files and `docs-course.css` are copied as static assets with input hashes.
+The complete candidate has 229 files and 161 HTML pages; existing native locale
+and page gates still cover their original 119 pages and 16 catalogs.
+
+Run the additional observer and real native refusal controls before publication:
+
+```sh
+python3 site/native/check_docs.py --build /absolute/path/new-build-directory
+```
+
+It checks all 28 Docs pages against the Markdown content, exact code-block
+bytes, same-origin chapter/download links, per-chapter language pairs and
+metadata. It also compares the DOM/content of all 133 original pages with
+their hash-bound pre-integration copies, admitting only the declared Docs
+href changes. Real native controls exercise unknown locales/chapters, changed
+source hashes, unsafe links, unterminated fences, unsupported diagrams, escaped
+HTML, UTF-8 text starting with digits, and the source-size bound. Candidate files must remain unchanged by those
+controls. `verify_site.py` includes the Docs content observation, and
+`publish_site.py` requires its successful receipt bound to the final build.

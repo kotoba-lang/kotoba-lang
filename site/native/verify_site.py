@@ -105,7 +105,7 @@ def observe(build,reference=None,port_reference=None):
  if sha(build/'inputs.json')!=receipt['inputsSha256']:raise ValueError('input manifest drift')
  if receipt.get('status')!='BUILT_NATIVE_SITE_CANDIDATE' or receipt.get('cljkInvoked') is not False:raise ValueError('not a native build receipt')
  files={str(p.relative_to(root)):sha(p) for p in root.rglob('*') if p.is_file()}
- if files!=receipt['files'] or len(files)!=189:raise ValueError('candidate file/hash drift')
+ if files!=receipt['files'] or len(files)!=189+len(receipt.get('docsFiles',[])):raise ValueError('candidate file/hash drift')
  sitemap=ET.parse(root/'sitemap.xml');canonical_urls=set();json.loads((root/'.well-known/kotoba-libraries.json').read_text())
  report={'status':'PASS_NATIVE_SITE_OBSERVATION','buildReceiptSha256':sha(build/'receipt.json'),'files':files,'reference':{},'differences':{},'generatorStampNormalization':sorted(STAMPS),'published':False,'reviewedPortDifferences':{},'normalizationRules':['URL resolution','explicit native generator stamps','head metadata field order (style/script order retained)','equivalent hreflang aria-current true/page','LTR English source islands']}
  programs={}
@@ -165,6 +165,9 @@ def observe(build,reference=None,port_reference=None):
    if not equal:report['differences'][name]=[('bytes',hashlib.sha256(data).hexdigest(),hashlib.sha256(expected).hexdigest())]
  listed=[e.text for e in sitemap.iter('{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
  if set(listed)!=canonical_urls or len(listed)!=len(canonical_urls):raise ValueError('sitemap differs from actual page canonicals')
+ if receipt.get('docsFiles'):
+  from check_docs import observe_pages
+  report['docs']=observe_pages(build)
  if report['differences']:report['status']='NATIVE_SITE_DIFFERENCES_REVIEW_REQUIRED'
  (build/'observation.json').write_text(json.dumps(report,indent=2,ensure_ascii=False)+'\n')
  return report

@@ -13,6 +13,10 @@ def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--build',type=Path,required=True);p.add_argument('--wrangler',type=Path,required=True);p.add_argument('--dry-run',action='store_true');a=p.parse_args()
  build=a.build.resolve(strict=True);candidate=build/'candidate';receipt=json.loads((build/'receipt.json').read_text());observation=json.loads((build/'observation.json').read_text());negative=json.loads((build/'negative-controls.json').read_text())
  files={str(p.relative_to(candidate)):sha(p) for p in candidate.rglob('*') if p.is_file()}
+ if receipt.get('docsFiles'):
+  docs=json.loads((build/'docs-validation.json').read_text())
+  if docs.get('rendererManifestSha256')!=sha(build/'docs_page/build.json'):raise ValueError('Docs renderer manifest changed')
+  if docs.get('status')!='PASS_NATIVE_DOCS' or docs.get('buildReceiptSha256')!=sha(build/'receipt.json') or docs.get('pages')!=receipt.get('docsPages') or not all(x['passed'] for x in docs.get('controls',[])) or len(docs.get('controls',[]))<6:raise ValueError('candidate lacks Docs qualification')
  if receipt.get('profile')=='Linux-x86_64':raise ValueError('Linux candidates are observation-only; automatic publication is not qualified')
  if receipt.get('status')!='BUILT_NATIVE_SITE_CANDIDATE' or receipt.get('cljkInvoked') is not False or files!=receipt['files']:raise ValueError('native candidate drift')
  if observation.get('status')!='PASS_NATIVE_SITE_OBSERVATION' or observation.get('buildReceiptSha256')!=sha(build/'receipt.json') or observation.get('files')!=files:raise ValueError('candidate lacks successful observation')
@@ -45,7 +49,7 @@ def main():
     if hashlib.sha256(data).hexdigest()!=pin:raise ValueError('candidate differs from main '+str(file.relative_to(ROOT)))
  else:main=git('rev-parse','HEAD').decode().strip()
  wrangler=a.wrangler.resolve(strict=True)
- argv=[str(wrangler),'deploy','--config',str(ROOT/'site/wrangler.jsonc'),'--assets',str(candidate),'--no-bundle','--message','KOTOBA-160 JUN-851 native site '+main[:12]]
+ argv=[str(wrangler),'deploy','--config',str(ROOT/'site/wrangler.jsonc'),'--assets',str(candidate),'--no-bundle','--message',('JUN-865 native Amu Docs ' if receipt.get('docsFiles') else 'KOTOBA-160 JUN-851 native site ')+main[:12]]
  if a.dry_run:argv+=['--dry-run','--outdir',str(build/'upload-dry-run')]
  result=subprocess.run(argv,cwd=ROOT,env={**os.environ,'WRANGLER_SEND_METRICS':'false'},capture_output=True,timeout=900)
  (build/('upload-dry-run.log' if a.dry_run else 'upload.log')).write_bytes(result.stdout+result.stderr)

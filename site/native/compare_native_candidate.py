@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare complete candidate bytes with the committed, published Mac receipt."""
+"""Compare complete candidate bytes with the dated native Mac Docs candidate."""
 import argparse
 import json
 from pathlib import Path
@@ -11,7 +11,7 @@ def main():
     p.add_argument('--build',type=Path,required=True)
     a=p.parse_args()
     build=a.build.resolve(strict=True)
-    baseline=ROOT/'docs/evidence/native-site-candidate-20261105.json'
+    baseline=ROOT/'docs/evidence/native-site-docs-candidate-20261106.json'
     expected=json.loads(baseline.read_text())['files']
     actual={str(p.relative_to(build/'candidate')):sha(p) for p in (build/'candidate').rglob('*') if p.is_file()}
     changed={n:dict(expected=expected.get(n),actual=actual.get(n)) for n in sorted(expected.keys()|actual.keys()) if expected.get(n)!=actual.get(n)}
