@@ -58,6 +58,11 @@ hosted runtime permissions in the earlier whole-component Q9 contract.
   blocked. Do not replace missing component behavior with a smaller slice or
   silently fall back. CDCI has only the Amu selfhost and Kotoba native gates;
   both and their controller use loaderless `x86_64-linux-static` ELF.
+- Kotoba and AIUEOS stay a Kotoba / Amu selfhost-only Lisp machine, language and
+  compiler (owner decision 2026-11-07, AWAI-160). Apps and OS features are built
+  first in `.cljc` as Otehon, which may use NixOS and other stacks, and are used
+  later as an oracle for the selfhost implementation under the rules below. See
+  network-awai-apex ADR 0026 D18. Otehon never enters a native route.
 - Generated targets (owner decision 2026-11-07, JUN-949,
   `docs/adr/ADR-target-portable-canonical-form.md`): routes other than Amu are
   official when they pass the conformance corpus, and target toolchains may run
