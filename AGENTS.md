@@ -86,10 +86,24 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
 - A reference value is evidence of the reference's behavior. It is not proof
   that a native implementation is correct, and a mismatch is reported, not
   forced to agree.
-- The oracle languages are nbb, JVM, C and Python (owner decision 2026-11-06): the
-  old reference implementations and prototypes in those languages. The same rules apply
+- The oracle languages are nbb, JVM, C, Python, Basilisp, jank and Fennel (owner decision
+  2026-11-06; Hy replaced by Basilisp 2026-11-07): the old reference implementations and
+  prototypes in those languages. The same rules apply
   to every use, including a Workflow subagent running one on a developer machine: one-off,
   dated evidence, never in CI, gates, builds or runtime paths.
+- Every language that supports `.cljc` is also an oracle language (owner decision 2026-11-07), for
+  example Clojure, ClojureScript, ClojureCLR, Babashka, Squint, Cherry, ClojureDart, jank, Clojerl, Lokke
+  and Phel. The unverified candidate table is `docs/oracle-cljc-dialects-20261107.md`; confirm the tool
+  version, feature key and `.cljc` handling at first use and record it. The CI ban on Babashka and JVM
+  tools is unchanged.
+- Before a selfhost refactor of a cljk component, take its reference values first from the JVM and
+  node (nbb) oracles (owner decision 2026-11-07). Hand an oracle the source as `.cljc`; Basilisp reads
+  `.cljc` with the `:lpy` feature key and does not read the `.cljk` extension. Record versions,
+  inputs and outputs with the date.
+- CLJK is treated as CLJC (owner decision 2026-11-07, JUN-579; supersedes the 2026-11-06 "CLJC is
+  refused" wording): both are the same reader sugar, `#?(:kotoba …)` selects the Kotoba branch, and
+  `#?@` is not read. This is the target contract; where the code disagrees, the code is the state
+  and the disagreement is reported.
 
 ## Shared agent rule
 
