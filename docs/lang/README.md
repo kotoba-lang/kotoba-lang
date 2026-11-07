@@ -63,6 +63,12 @@ compatibility examples are the conformance fixtures under `lang/conformance/`.
 
 ## Source Contract
 
+The list below is the language profile's reader contract. The native route
+admits less (owner decision 2026-11-06, JUN-579): `.kotoba` everywhere, `.cljk`
+in a lone `check` and in `definition-cids`, and it refuses `.clj`, `.cljc` and
+`.cljs`, which remain only as local reference oracles under a project-root
+`oracle/`.
+
 - Accepted extensions: `.kotoba`, `.cljc`, `.cljk`, `.clj`, `.cljs`.
 - `.cljk` means CLJ Kotoba and selects the `:kotoba` reader/compiler target.
 - `.cljc` is common source for `:clj`, `:cljs`, and `:kotoba`.
