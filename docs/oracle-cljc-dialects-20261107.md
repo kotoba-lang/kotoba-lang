@@ -45,6 +45,9 @@ oracle is first used, then record that evidence with the date.
 
 ## Relation to the CDCI rule
 
-Babashka, GraalVM-based tools and any JVM tool stay out of CI and gates as
-before. Being on this list permits a developer to run them once by hand to
-obtain a reference value; it does not permit a workflow to start them.
+Updated 2026-11-07 (owner decision): JVM, nbb and Babashka may run in CI, but
+only as separate oracle jobs. Native build, gates, packaging and runtime do not
+depend on them, there is no silent fallback to them, and an oracle job is not a
+required check until the owner decides so. Any other use of Babashka, GraalVM
+or JVM tools in CI or gates stays banned (JUN-290). The other dialects in this
+table are still run by hand, one-off.
