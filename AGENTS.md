@@ -107,6 +107,9 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
   native result must not silently fall back to it. Making an oracle job a required check is a separate
   owner decision; until then it is not required. The ban on JVM, nbb, Babashka and GraalVM in CI for any
   other purpose (JUN-290) is unchanged.
+- `scripts/oracle-stage-cljc.py SRC DEST` stages a copy of a tree with `.cljk` renamed to `.cljc` (or the extension
+  recorded in `cljk-origin.edn`) so the JVM, Babashka and Basilisp can read it. It is a byte stager for local one-off
+  oracle runs only; see `docs/oracle-stage-cljc.md`.
 - Before a selfhost refactor of a cljk component, take its reference values first from the JVM and
   node (nbb) oracles (owner decision 2026-11-07). Hand an oracle the source as `.cljc`; Basilisp reads
   `.cljc` with the `:lpy` feature key and does not read the `.cljk` extension. Record versions,
