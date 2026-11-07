@@ -1,0 +1,17 @@
+(ns check (:require [ipld.schema :as schema] [ipld.schema-dsl :as dsl] [ipld.core :as core] ["fs" :as fs]))
+(def src (.readFileSync fs (str js/process.env.PF "/pure-form.ipldsch") "utf8"))
+(def compiled (schema/compile-schema (dsl/parse src)))
+(defn sym [s] {"sym" s})
+(defn bytes8 [] (js/Uint8Array. #js [63 248 0 0 0 0 0 0]))
+(def def-inc [(sym "def") (sym "inc1") [(sym "lam") {"vec" [(sym "n") {"kw" "i64"}]} {"kw" "i64"} [(sym "+") (sym "n") 1]]])
+(def link (core/link "bafyreiblk5vo3dme2m5e6ttjhmusiqdoebofp4zrzc7fsgx2mmxinaej6a"))
+(def pos {"int" 5 "str" "a" "nil-arg" [(sym "f") nil] "nil-entry" {"map" [[{"kw" "a"} nil]]} "bool" true "bytes" (bytes8) "sym" (sym "x") "kw" {"kw" "a"} "f64" {"f64" (bytes8)}
+          "vec" {"vec" [1 2]} "set" {"set" [1 2]} "map" {"map" [[{"kw" "a"} 1]]} "call" [(sym "+") 1 2] "def-inc" def-inc
+          "ref-link" [(sym "ref") link] "nested-type" {"vec" [{"kw" "option"} {"kw" "i64"}]}})
+(def neg {"root-nil" nil "float-kind" 1.5 "two-keys" {"sym" "a" "kw" "b"} "unknown-tag" {"quote" "x"} "sym-not-string" {"sym" 1} "entry-arity" {"map" [[1]]} "f64-string" {"f64" "3ff8000000000000"} "nested-bad" [(sym "f") {"nope" 1}]})
+(def lim {:max-depth 64 :max-nodes 4096})
+(defn ok? [v] (try (schema/unify! compiled "Form" v lim) true (catch :default e (str "refused " (:problem (ex-data e))))))
+(doseq [[k v] pos] (println "pos" k (ok? v)))
+(doseq [[k v] neg] (println "neg" k (ok? v)))
+(println "module" (schema/valid? compiled "Module" [def-inc] lim))
+(println "roundtrip" (let [b (core/encode def-inc)] (= (pr-str def-inc) (pr-str (core/decode b)))) "bytes" (.-length (core/encode def-inc)) "hex" (apply str (map (fn [b] (.padStart (.toString b 16) 2 "0")) (js/Array.from (core/encode def-inc)))))
