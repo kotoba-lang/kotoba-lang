@@ -105,10 +105,12 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
   node (nbb) oracles (owner decision 2026-11-07). Hand an oracle the source as `.cljc`; Basilisp reads
   `.cljc` with the `:lpy` feature key and does not read the `.cljk` extension. Record versions,
   inputs and outputs with the date.
-- CLJK is treated as CLJC (owner decision 2026-11-07, JUN-579; supersedes the 2026-11-06 "CLJC is
-  refused" wording): both are the same reader sugar, `#?(:kotoba …)` selects the Kotoba branch, and
-  `#?@` is not read. This is the target contract; where the code disagrees, the code is the state
-  and the disagreement is reported.
+- CLJK stays as a reference oracle source and is treated as CLJC-equivalent for oracle runs (owner
+  decision 2026-11-07, JUN-579): `#?(:kotoba …)` selects the Kotoba branch, `#?@` is not read, and an
+  oracle is handed the source as `.cljc`. The route stays `.kotoba`; native input rules are unchanged
+  (CLJC/CLJS/CLJ refused natively, CLJK sugar only through the existing entries) and native `.cljc`
+  acceptance is not pursued. This replaces the earlier 2026-11-07 wording that made it the target.
+  Where the code disagrees, the code is the state and the disagreement is reported.
 
 ## Shared agent rule
 
