@@ -45,9 +45,8 @@ oracle is first used, then record that evidence with the date.
 
 ## Relation to the CDCI rule
 
-Updated 2026-11-07 (owner decision): JVM, nbb and Babashka may run in CI, but
-only as separate oracle jobs. Native build, gates, packaging and runtime do not
-depend on them, there is no silent fallback to them, and an oracle job is not a
-required check until the owner decides so. Any other use of Babashka, GraalVM
-or JVM tools in CI or gates stays banned (JUN-290). The other dialects in this
-table are still run by hand, one-off.
+Updated 2026-11-07 (owner decision): JVM, nbb, Babashka and every other runtime in this table may run in CI,
+but only as separate oracle jobs. Native build, gates, packaging and runtime do not depend on them, there is no
+silent fallback to them, and an oracle job is not a required check until the owner decides so. Any other use of
+Babashka, GraalVM or JVM tools in CI or gates stays banned (JUN-290). Until a CI job exists, these are still run
+by hand, one-off (JUN-970).
