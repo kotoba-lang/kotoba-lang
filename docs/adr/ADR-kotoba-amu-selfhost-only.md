@@ -2,6 +2,14 @@
 
 Status: accepted owner decision, 2026-10-22.
 
+Amended 2026-11-07 by owner decisions D3 and D4 in
+[`ADR-target-portable-canonical-form.md`](ADR-target-portable-canonical-form.md).
+The compiler, its build and the required gates still use Amu selfhost only, as
+below. For generated targets only: other routes that pass the conformance corpus
+are official, and target toolchains may run generated output in a separate,
+non-required qualification tier that cannot feed the compiler or its gates. There
+is no fallback between routes.
+
 Canonical authored source is `.kotoba`. Required compiler, CLI, input
 resolution, build orchestration, packaging, validation and execution use Amu
 selfhost-produced native artifacts. Remove CLJK/CLJC/CLJS, NBB, KBB,
