@@ -94,8 +94,13 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
 - Every language that supports `.cljc` is also an oracle language (owner decision 2026-11-07), for
   example Clojure, ClojureScript, ClojureCLR, Babashka, Squint, Cherry, ClojureDart, jank, Clojerl, Lokke
   and Phel. The unverified candidate table is `docs/oracle-cljc-dialects-20261107.md`; confirm the tool
-  version, feature key and `.cljc` handling at first use and record it. The CI ban on Babashka and JVM
-  tools is unchanged.
+  version, feature key and `.cljc` handling at first use and record it.
+- CI exception (owner decision 2026-11-07; relaxes the "never in CI" and CDCI JVM/nbb wording above for
+  oracle use only): JVM, nbb and Babashka may run in CI as oracle jobs. Keep each in its own job, named
+  and reported as an oracle. Native build, gates, packaging and runtime must not depend on it, and a
+  native result must not silently fall back to it. Making an oracle job a required check is a separate
+  owner decision; until then it is not required. The ban on JVM, nbb, Babashka and GraalVM in CI for any
+  other purpose (JUN-290) is unchanged.
 - Before a selfhost refactor of a cljk component, take its reference values first from the JVM and
   node (nbb) oracles (owner decision 2026-11-07). Hand an oracle the source as `.cljc`; Basilisp reads
   `.cljc` with the `:lpy` feature key and does not read the `.cljk` extension. Record versions,
