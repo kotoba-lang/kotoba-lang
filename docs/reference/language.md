@@ -8,10 +8,14 @@ This is the reader-oriented map of the language. Normative details live in the
 ## Source and modules
 
 - `.kotoba`: canonical Kotoba component source.
-- `.cljk`: CLJ Kotoba source; it is not a JVM compilation target.
+- `.cljk`: CLJ Kotoba source, input sugar that must mint the same Definition CID
+  as its pure `.kotoba` spelling; it is not a JVM compilation target. The native
+  route currently reads it in a lone `check` and in `definition-cids` only.
 - `.cljc`: common source across Clojure, ClojureScript, and Kotoba readers.
 - `.clj` / `.cljs`: compatibility inputs retaining their host-language reader
-  meanings; they do not imply runtime compatibility.
+  meanings; they do not imply runtime compatibility. The native route refuses
+  `.clj`, `.cljc` and `.cljs`; they remain only as local reference oracles under
+  a project-root `oracle/`.
 - A module uses `ns`, declares exports, and obtains effects only through
   declared capability imports.
 

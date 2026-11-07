@@ -89,6 +89,8 @@ def main():
                 implementation = implementation.replace(needle, 'true')
             (src / 'locale_pages.kotoba').write_text(implementation)
             shutil.copyfile(entry, src / entry.name)
+            if entry == FILE_ENTRY:
+                shutil.copyfile(ROOT / 'site/native/input.kotoba', src / 'input.kotoba')
             base = '/' + name
             entry_virtual = base + '/site/native/' + entry.name
             inputs = [(base + '/site/native/' + p.name, p) for p in src.iterdir()]

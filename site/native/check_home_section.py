@@ -107,6 +107,12 @@ def main():
             r = invoke(image, tag, which, expected=42)
             reference = ROOT / 'site/dist' / ('' if tag == 'en' else tag) / 'index.html'
             expected = reference.read_text()
+            # The authored Japanese catalog is the translation authority. The
+            # historical generated homepage predates this one heading change.
+            if tag == 'ja' and which == 'cloud':
+                catalog = json.loads((ROOT / 'site/i18n/ja.json').read_text())
+                heading = catalog['95342850ce2983e9d6aef64a14be408eefdccb69ab73d58347ba69466028798c']
+                expected = expected.replace('スローガンの前の証拠', heading)
             if which == 'community':
                 marker = 'href="https://github.com/orgs/kotoba-lang/repositories"'
                 start = expected.find(marker)
