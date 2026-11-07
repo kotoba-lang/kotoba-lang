@@ -14,38 +14,52 @@ the place the code lives now: `lib/` of `kotoba-lang/kotoba`.
   JDK 21.0.1). The sources are `.cljk`, which the JVM cannot read. 300 s timeout. Dependencies are fetched from
   `github.com/kotoba-lang` by `kbb`. Machine: macOS arm64.
 
+## Correction (2026-11-07, later the same day)
+
+The first version of this document attributed the stops to pinned dependencies that cannot be cloned. That was
+wrong. `kbb` prints those as warnings and carries on; the real stop in 39 of the 40 libraries is
+`aliases [:test] declare no :main-opts; nothing to run (this is a classpath-only alias)`, and the remaining one
+(kotoba.sysTms) has no `:test` alias. A monorepo library's `:test` alias only adds `test` to the classpath, so
+`kbb -M:test` is not how these libraries are run. The measurement method was wrong for this population; the
+"0 of 40" below says nothing about whether the libraries work.
+
 ## Result
 
-**0 of 40 libraries ran a test.** All 40 stopped before any test ran.
+Run 1, `kbb -M:test` in each library directory: 0 of 40 ran a test, because there is nothing for that command to
+run (see the correction above). Do not read this as a failure of the libraries.
 
-| Reason | Libraries |
-|---|---|
-| transitive git dependency `io.github.kotoba-lang/kotoba-io-len` cannot be cloned | 28 |
-| transitive git dependency `io.github.kotoba-lang/process-exec` cannot be cloned | 5 |
-| transitive git dependency `io.github.kotoba-lang/io-ipld` cannot be cloned | 2 |
-| `:test` alias declares no `:main-opts` | 2 |
-| transitive git dependency `io.github.kotoba-lang/dag-cbor` cannot be cloned | 1 |
-| transitive git dependency `io.github.kotoba-lang/org-w3-did` cannot be cloned | 1 |
-| no `:test` alias in deps.edn | 1 |
+Run 2, the library's own entry point `kbb --backend sci --classpath src:test run-tests.cljk` from the library
+directory. Only 5 of the 40 sampled libraries have a `run-tests.cljk` (115 of the 926 in the population, about
+12%); the other 35 have no runner entry point in the library and were not run.
 
-Every `transitive git dependency` stop is a coordinate that is not declared in the library's own `deps.edn` or
-`nbb.edn` (a search of `lib/` for `kotoba-io-len` in those files finds none): `kbb` follows the pinned
-dependencies of the libraries a library depends on, and those pins still name standalone repositories that no
-longer exist on GitHub (see the correction in `oracle-cljk-sample-20261107.md`).
+| library | exit | result |
+|---|---|---|
+| kotoba.ioIpniSpecs | 0 | 39 tests, 138 assertions, 0 failures, 0 errors |
+| org.ietf.cbor | 1 | 25 tests, 120 assertions, 0 failures, 1 error: `ENOENT lib/org.ietf.cbor/test/cbor/golden.edn` (a path relative to the repository root; the run used the library directory) |
+| kotoba.pay | 1 | stopped: `Could not find namespace: kotoba.lang.base-l2.paymaster` (sibling library not on the `src:test` classpath) |
+| kotoba.scheduler | 1 | stopped: `Could not find namespace: kotoba.lang.async` (same) |
+| org.w3.woff | 1 | stopped: `Could not find namespace: brotli.core` (same) |
 
 ## What this does and does not show
 
-- It shows that `kbb -M:test` cannot run the monorepo libraries' tests today. It does not show that the code is
-  broken: nothing executed, so there is no pass or fail count for any library.
-- A different runner, or overriding the dead coordinates with the monorepo's own paths, could change the result.
-  Neither was tried here; the earlier repair work found that doing it by hand per repository needs many overrides.
-- 40 of 926 is a sample. All 40 failing for the same few reasons makes a systematic cause (the dead pins), not a
-  per-library cause, the likely explanation.
+- Of 40 sampled libraries, one ran its suite cleanly. Four runs were affected by how they were launched (working
+  directory, classpath). The other 35 were not run because no entry point exists in the library.
+- The canonical way the monorepo runs library tests was not established here. The repository's own
+  `run-tests.cljk` covers the portable slice at the root; the retired JVM and JS CI jobs are archived under
+  `docs/retired/native-ci-20261024/` in the monorepo; the supported route is Amu selfhost.
+- Nothing here shows that the libraries are complete or broken. The question "are most libraries implemented in
+  cljk" is not answered by this measurement.
+- Separate from running tests: 22 of the 36 distinct `amu` commits pinned from `lib/` (behind 74 libraries)
+  declare direct coordinates of kotoba-lang repositories that no longer exist (abi, provider, kotoba-wasm,
+  kotoba-verifier, kotoba-component, kotoba-kir, kotoba-hir, io-ipld, kotoba-object, tender-native and others).
+  That is an inventory of stale pins. It was not shown to be what stops anything.
 - The JVM route was not available for `.cljk`. No second runtime was compared.
 
-## Per library
+## Per library (run 1, `kbb -M:test`)
 
-| library | exit | seconds | stopped because |
+The last column is the first line the log matched; dependency-clone lines are warnings, not the cause of the stop.
+
+| library | exit | seconds | first matched line |
 |---|---|---|---|
 | kotoba.designQuality | 64 | 4 | transitive git dependency `io.github.kotoba-lang/kotoba-io-len` cannot be cloned |
 | kotoba.dxf | 64 | 5 | transitive git dependency `io.github.kotoba-lang/kotoba-io-len` cannot be cloned |
