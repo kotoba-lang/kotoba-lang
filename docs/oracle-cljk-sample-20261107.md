@@ -4,9 +4,21 @@ One-off local measurement under the oracle rules (JUN-579). Not CI, not a gate,
 not a qualification of the native route. It answers one question: of a seeded
 sample of repos holding cljk/cljc source, how many run their own tests today.
 
+## Correction (2026-11-07, later the same day)
+
+The population below was local directories under `/Users/junkawasaki/github/kotoba-lang`, not live GitHub
+repositories. Checked against `gh api orgs/kotoba-lang/repos` (639 repositories, 580 archived, 19 private;
+the `gh` account is an org admin): only 570 of the 2275 local cljk/cljc directories have a repository of that
+name on GitHub, and all 7 of the 30 sampled repositories that do (capability-net-connect,
+capability-net-transport, coll-prewalk, edn-max-nodes, tayori, test, xml) are archived. The other 23 have no
+GitHub repository at all (their code was consolidated into the monorepo `kotoba-lang/kotoba` under `lib/`, or
+removed), so those directories are stale clones. Read the result below as "stale local clones run under kbb",
+not as "the live kotoba-lang repositories". It says nothing about the monorepo libraries, which is where the
+code now lives. Repairing those stale repositories was started and stopped for this reason.
+
 ## Method
 
-- Population: 2275 of 2749 repos under `kotoba-lang` with `.cljk` or `.cljc`
+- Population: 2275 of 2749 local directories under `kotoba-lang` with `.cljk` or `.cljc`
   tracked source (the tracked `.nbb/` cache excluded).
 - Sample: 30 repos, `random.Random(20261107).shuffle`, first 30, sorted.
 - Run: `git archive HEAD` of each repo into a scratch directory, then
