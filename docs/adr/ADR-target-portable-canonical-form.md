@@ -3,6 +3,10 @@
 - **Status**: Accepted, owner decision 2026-11-07 (D1–D7 below). This decides the
   direction. No stage is implemented or qualified, and the exact spelling in §2.1
   is reviewed at S1.
+- **Priority**: Deferred, owner decision 2026-11-07. For now `.cljc` dialects are the
+  multi-language reference and oracle, so S1–S5 and JUN-962 wait. D1–D7 stand. Only
+  part of S1 has landed: amu#1854 admits `lam`, `app` and `ref` in selfhost. The
+  oracle rules are in `AGENTS.md`; they do not change the `.kotoba` route.
 - **Date**: 2026-11-07
 - **Tracking**: Linear JUN-949 (this ADR), JUN-947 (investigation)
 - **Evidence**: [`docs/evidence/target-portable-core-20261107/`](../evidence/target-portable-core-20261107/README.md)

@@ -96,7 +96,7 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
   and Phel. The unverified candidate table is `docs/oracle-cljc-dialects-20261107.md`; confirm the tool
   version, feature key and `.cljc` handling at first use and record it.
 - CI exception (owner decision 2026-11-07; relaxes the "never in CI" and CDCI JVM/nbb wording above for
-  oracle use only): JVM, nbb and Babashka may run in CI as oracle jobs. Keep each in its own job, named
+  oracle use only): JVM, nbb, Babashka and every other `.cljc` language above may run in CI as oracle jobs. Keep each in its own job, named
   and reported as an oracle. Native build, gates, packaging and runtime must not depend on it, and a
   native result must not silently fall back to it. Making an oracle job a required check is a separate
   owner decision; until then it is not required. The ban on JVM, nbb, Babashka and GraalVM in CI for any
