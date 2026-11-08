@@ -5,7 +5,7 @@ Python stages bytes, hashes files, and observes child exit codes. Kotoba owns
 all authority parsing, localization, HTML/JSON rendering and composition.
 The new output directory is private until every native producer succeeds.
 """
-import argparse,concurrent.futures,hashlib,json,os,shutil
+import argparse,concurrent.futures,hashlib,json,os,shutil,time
 from pathlib import Path
 from build_support import Build,ROOT,TAGS,native_run,sha,write_bytes,program_image
 
@@ -64,6 +64,7 @@ def locale_job(output,tag):
  j=Job(output,tag);j.home();j.library();j.sections();return tag
 
 def main():
+ start_time=time.monotonic()
  p=argparse.ArgumentParser(description=__doc__)
  for name in ['compiler','libraries','grammar','output']:p.add_argument('--'+name,type=Path,required=True)
  p.add_argument('--packager',type=Path);p.add_argument('--linux-inputs',type=Path)
@@ -77,13 +78,15 @@ def main():
  else:
   if not a.packager:raise ValueError('macOS profile requires --packager')
   b=Build(a.output,a.compiler,a.packager,a.libraries,a.grammar)
- for name in b.recipes:b.compile(name)
+ with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as pool:
+  for _ in pool.map(b.compile,b.recipes):pass
  (b.output/'data.json').write_text(json.dumps({n:str(p) for n,p in b.data.items()},indent=2)+'\n')
  # Catalogue rows are rendered once natively and reused without translation.
  write_bytes(b.output/'rows.html',b.run('library_rows'))
+ ordered_tags=sorted(TAGS,key=lambda t:0 if t in ('en','ja') else 1)
  with concurrent.futures.ProcessPoolExecutor(max_workers=a.jobs) as pool:
-  pending={pool.submit(locale_job,str(b.output),t):t for t in TAGS[:a.jobs]}
-  rest=iter(TAGS[a.jobs:]);completed=[]
+  pending={pool.submit(locale_job,str(b.output),t):t for t in ordered_tags[:a.jobs]}
+  rest=iter(ordered_tags[a.jobs:]);completed=[]
   while pending:
    done,_=concurrent.futures.wait(pending,return_when=concurrent.futures.FIRST_COMPLETED)
    for future in done:
@@ -117,7 +120,7 @@ def main():
  b.finish()
  files={str(f.relative_to(b.output/'candidate')):sha(f) for f in sorted((b.output/'candidate').rglob('*')) if f.is_file()}
  if len(files)!=189 or len(pages)!=133:raise ValueError(('release route count',len(files),len(pages)))
- receipt={'status':'BUILT_NATIVE_SITE_CANDIDATE','files':files,'htmlPages':len(pages),'locales':list(TAGS),'compilerSha256':sha(b.compiler),'packagerSha256':sha(b.packager),'inputsSha256':sha(b.output/'inputs.json'),'cljkInvoked':False,'published':False,'profile':getattr(b,'profile','macOS-ARM64')}
+ receipt={'status':'BUILT_NATIVE_SITE_CANDIDATE','files':files,'htmlPages':len(pages),'locales':list(TAGS),'compilerSha256':sha(b.compiler),'packagerSha256':sha(b.packager),'inputsSha256':sha(b.output/'inputs.json'),'cljkInvoked':False,'published':False,'profile':getattr(b,'profile','macOS-ARM64'),'elapsedSeconds':round(time.monotonic()-start_time,2)}
  (b.output/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'],len(files),flush=True)
  from docs_build import extend
  extend(b.output,a.compiler,a.packager,a.libraries,a.grammar,a.linux_inputs)
