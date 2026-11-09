@@ -507,6 +507,83 @@ The direction is intentionally incremental and fail-closed.
 Roadmap items are not promises of shipped capability. Current status remains
 authoritative in machine-readable contracts and qualification evidence.
 
+### Workstreams and tracking
+
+Each row maps a direction above to the issues that track it. The links point
+to the internal Linear workspace and are not publicly readable; status lives
+there and is not repeated here. Awai Network applications built on Kotoba are
+tracked on the [Awai Network roadmap](https://awai.network/network/roadmap/).
+
+**Language and compiler (Amu selfhost)**
+
+| Work | Tracking |
+|---|---|
+| Compiler and runtime core on the selfhost path only | [KOTOBA-13](https://linear.app/kotobalabs/issue/KOTOBA-13), [KOTOBA-174](https://linear.app/kotobalabs/issue/KOTOBA-174) |
+| Static targets, f64 admission, plain-emitter flattening | [KOTOBA-161](https://linear.app/kotobalabs/issue/KOTOBA-161), [KOTOBA-168](https://linear.app/kotobalabs/issue/KOTOBA-168) |
+| Descriptor flags and native CI receipts, source-locked static ELF | [KOTOBA-157](https://linear.app/kotobalabs/issue/KOTOBA-157), [KOTOBA-166](https://linear.app/kotobalabs/issue/KOTOBA-166) |
+| Reader and interpreter surface gaps | [KOTOBA-153](https://linear.app/kotobalabs/issue/KOTOBA-153), [KOTOBA-47](https://linear.app/kotobalabs/issue/KOTOBA-47), [KOTOBA-48](https://linear.app/kotobalabs/issue/KOTOBA-48) |
+
+**kotoba-lang.org on the selfhost toolchain**
+
+| Work | Tracking |
+|---|---|
+| Generate and verify the whole site with Amu selfhost | [KOTOBA-160](https://linear.app/kotobalabs/issue/KOTOBA-160), [KOTOBA-179](https://linear.app/kotobalabs/issue/KOTOBA-179) |
+| Measurement scripts, Play and per-operation consent | [KOTOBA-164](https://linear.app/kotobalabs/issue/KOTOBA-164) |
+| Real GUI and app screens on the AIUEOS page | [KOTOBA-167](https://linear.app/kotobalabs/issue/KOTOBA-167) |
+
+**First run and continued use**
+
+| Work | Tracking |
+|---|---|
+| Qualified first-run starter and 20 external successes | [KOTOBA-154](https://linear.app/kotobalabs/issue/KOTOBA-154), [KOTOBA-162](https://linear.app/kotobalabs/issue/KOTOBA-162) |
+| Isolated QEMU trial of the AIUEOS Lisp Machine with 5 people | [KOTOBA-155](https://linear.app/kotobalabs/issue/KOTOBA-155) |
+| Articles and demos that lead to trials; targets and positioning | [KOTOBA-106](https://linear.app/kotobalabs/issue/KOTOBA-106), [KOTOBA-104](https://linear.app/kotobalabs/issue/KOTOBA-104) |
+| Trial cohorts, D7/D30 retention and outside contributions | [KOTOBA-108](https://linear.app/kotobalabs/issue/KOTOBA-108), [KOTOBA-156](https://linear.app/kotobalabs/issue/KOTOBA-156) |
+| Organizational evaluation and embedding | [KOTOBA-107](https://linear.app/kotobalabs/issue/KOTOBA-107) |
+
+**Performance evidence**
+
+| Work | Tracking |
+|---|---|
+| Correctness-qualified same-host benchmarks and Embench workloads | [KOTOBA-138](https://linear.app/kotobalabs/issue/KOTOBA-138), [KOTOBA-140](https://linear.app/kotobalabs/issue/KOTOBA-140), [KOTOBA-144](https://linear.app/kotobalabs/issue/KOTOBA-144), [KOTOBA-152](https://linear.app/kotobalabs/issue/KOTOBA-152) |
+| One-command reproduction kit and independent reruns | [KOTOBA-141](https://linear.app/kotobalabs/issue/KOTOBA-141), [KOTOBA-142](https://linear.app/kotobalabs/issue/KOTOBA-142), [KOTOBA-143](https://linear.app/kotobalabs/issue/KOTOBA-143) |
+| Benchmarks Game, OpenBenchmarking, Embench upstream review, SPEC | [KOTOBA-121](https://linear.app/kotobalabs/issue/KOTOBA-121), [KOTOBA-123](https://linear.app/kotobalabs/issue/KOTOBA-123), [KOTOBA-119](https://linear.app/kotobalabs/issue/KOTOBA-119), [KOTOBA-122](https://linear.app/kotobalabs/issue/KOTOBA-122) |
+
+**Community**
+
+| Work | Tracking |
+|---|---|
+| Evidence-gated submissions (awesome lists, ELS and FOSDEM 2027) | [KOTOBA-118](https://linear.app/kotobalabs/issue/KOTOBA-118), [KOTOBA-120](https://linear.app/kotobalabs/issue/KOTOBA-120) |
+| CNCF Sandbox fit assessment | [KOTOBA-116](https://linear.app/kotobalabs/issue/KOTOBA-116) |
+
+**Browser targets**
+
+| Work | Tracking |
+|---|---|
+| Kotoba forms to browser artifacts: target decision, compiler, Shinkansen binding, Kumade pilot, qualification | [KOTOBA-127](https://linear.app/kotobalabs/issue/KOTOBA-127), [KOTOBA-128](https://linear.app/kotobalabs/issue/KOTOBA-128), [KOTOBA-129](https://linear.app/kotobalabs/issue/KOTOBA-129), [KOTOBA-130](https://linear.app/kotobalabs/issue/KOTOBA-130), [KOTOBA-131](https://linear.app/kotobalabs/issue/KOTOBA-131), [KOTOBA-132](https://linear.app/kotobalabs/issue/KOTOBA-132), [KOTOBA-133](https://linear.app/kotobalabs/issue/KOTOBA-133) |
+| Independent review of the shared client runtime broker | [KOTOBA-159](https://linear.app/kotobalabs/issue/KOTOBA-159) |
+
+**Kotoba browser**
+
+| Work | Tracking |
+|---|---|
+| Plan and phases 1–5: scope ADR, conformance scores, web layer, WebExtensions, shell | [KOTOBA-146](https://linear.app/kotobalabs/issue/KOTOBA-146), [KOTOBA-147](https://linear.app/kotobalabs/issue/KOTOBA-147), [KOTOBA-148](https://linear.app/kotobalabs/issue/KOTOBA-148), [KOTOBA-149](https://linear.app/kotobalabs/issue/KOTOBA-149), [KOTOBA-150](https://linear.app/kotobalabs/issue/KOTOBA-150), [KOTOBA-151](https://linear.app/kotobalabs/issue/KOTOBA-151) |
+| Dapp delivery and consent, origin isolation and updates, product acceptance | [KOTOBA-176](https://linear.app/kotobalabs/issue/KOTOBA-176), [KOTOBA-177](https://linear.app/kotobalabs/issue/KOTOBA-177), [KOTOBA-178](https://linear.app/kotobalabs/issue/KOTOBA-178) |
+
+**Library and OS integration**
+
+| Work | Tracking |
+|---|---|
+| Consolidate library repositories into kotoba-lang/kotoba lib/ | [JUN-380](https://linear.app/kotobalabs/issue/JUN-380) |
+| Native SQLite engine for selfhost consumers | [JUN-768](https://linear.app/kotobalabs/issue/JUN-768) |
+| AIUEOS, Kototama and Amu integration gaps (P0/P1) | [JUN-1025](https://linear.app/kotobalabs/issue/JUN-1025), [JUN-1026](https://linear.app/kotobalabs/issue/JUN-1026), [JUN-1027](https://linear.app/kotobalabs/issue/JUN-1027), [JUN-1028](https://linear.app/kotobalabs/issue/JUN-1028), [JUN-1029](https://linear.app/kotobalabs/issue/JUN-1029), [JUN-1030](https://linear.app/kotobalabs/issue/JUN-1030), [JUN-1031](https://linear.app/kotobalabs/issue/JUN-1031) |
+
+**re-disasm**
+
+| Work | Tracking |
+|---|---|
+| Selfhost build path and typed-KIR decompiler research | [KOTOBA-46](https://linear.app/kotobalabs/issue/KOTOBA-46), [KOTOBA-50](https://linear.app/kotobalabs/issue/KOTOBA-50) |
+
 ## Documentation
 
 - [Getting started](docs/getting-started.md)
