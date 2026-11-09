@@ -522,6 +522,13 @@ tracked on the [Awai Network roadmap](https://awai.network/network/roadmap/).
 | Static targets, f64 admission, plain-emitter flattening | [KOTOBA-161](https://linear.app/kotobalabs/issue/KOTOBA-161), [KOTOBA-168](https://linear.app/kotobalabs/issue/KOTOBA-168) |
 | Descriptor flags and native CI receipts, source-locked static ELF | [KOTOBA-157](https://linear.app/kotobalabs/issue/KOTOBA-157), [KOTOBA-166](https://linear.app/kotobalabs/issue/KOTOBA-166) |
 | Reader and interpreter surface gaps | [KOTOBA-153](https://linear.app/kotobalabs/issue/KOTOBA-153), [KOTOBA-47](https://linear.app/kotobalabs/issue/KOTOBA-47), [KOTOBA-48](https://linear.app/kotobalabs/issue/KOTOBA-48) |
+| CLJK/EDN input sugar equivalence and native definition CIDs | [JUN-579](https://linear.app/kotobalabs/issue/JUN-579), [JUN-582](https://linear.app/kotobalabs/issue/JUN-582), [JUN-588](https://linear.app/kotobalabs/issue/JUN-588) |
+| Pure Kotoba form, core semantics, Wasm/JS gaps, IPLD within selfhost reach | [JUN-950](https://linear.app/kotobalabs/issue/JUN-950), [JUN-951](https://linear.app/kotobalabs/issue/JUN-951), [JUN-952](https://linear.app/kotobalabs/issue/JUN-952), [JUN-962](https://linear.app/kotobalabs/issue/JUN-962) |
+| Native compiler gaps and crashes (records, typed maps, sets, large inputs, macOS ARM arguments, non-ASCII strings) | [JUN-651](https://linear.app/kotobalabs/issue/JUN-651), [JUN-733](https://linear.app/kotobalabs/issue/JUN-733), [JUN-735](https://linear.app/kotobalabs/issue/JUN-735), [JUN-754](https://linear.app/kotobalabs/issue/JUN-754), [JUN-743](https://linear.app/kotobalabs/issue/JUN-743), [JUN-781](https://linear.app/kotobalabs/issue/JUN-781), [JUN-934](https://linear.app/kotobalabs/issue/JUN-934), [JUN-589](https://linear.app/kotobalabs/issue/JUN-589) |
+| Native JS output, wasm32-browser target, x86 multi-module CLI | [JUN-706](https://linear.app/kotobalabs/issue/JUN-706), [JUN-353](https://linear.app/kotobalabs/issue/JUN-353), [JUN-384](https://linear.app/kotobalabs/issue/JUN-384) |
+| Multi-language compilation and common VM, inference-first spec, 99% hardware coverage | [JUN-792](https://linear.app/kotobalabs/issue/JUN-792), [JUN-804](https://linear.app/kotobalabs/issue/JUN-804), [JUN-889](https://linear.app/kotobalabs/issue/JUN-889) |
+| Static runtime wires: spawn and TCP, clock, capability refusals, scoped fs, unlink, macOS TCP | [JUN-292](https://linear.app/kotobalabs/issue/JUN-292), [JUN-360](https://linear.app/kotobalabs/issue/JUN-360), [JUN-364](https://linear.app/kotobalabs/issue/JUN-364), [JUN-752](https://linear.app/kotobalabs/issue/JUN-752), [JUN-758](https://linear.app/kotobalabs/issue/JUN-758), [JUN-817](https://linear.app/kotobalabs/issue/JUN-817) |
+| GPU vendor dispatch and Cortex-M bare-metal output | [JUN-85](https://linear.app/kotobalabs/issue/JUN-85), [JUN-499](https://linear.app/kotobalabs/issue/JUN-499), [JUN-500](https://linear.app/kotobalabs/issue/JUN-500) |
 
 **kotoba-lang.org on the selfhost toolchain**
 
@@ -530,6 +537,7 @@ tracked on the [Awai Network roadmap](https://awai.network/network/roadmap/).
 | Generate and verify the whole site with Amu selfhost | [KOTOBA-160](https://linear.app/kotobalabs/issue/KOTOBA-160), [KOTOBA-179](https://linear.app/kotobalabs/issue/KOTOBA-179) |
 | Measurement scripts, Play and per-operation consent | [KOTOBA-164](https://linear.app/kotobalabs/issue/KOTOBA-164) |
 | Real GUI and app screens on the AIUEOS page | [KOTOBA-167](https://linear.app/kotobalabs/issue/KOTOBA-167) |
+| Top page relabel and benchmark follow-ups | [JUN-573](https://linear.app/kotobalabs/issue/JUN-573), [JUN-580](https://linear.app/kotobalabs/issue/JUN-580) |
 
 **First run and continued use**
 
@@ -540,6 +548,14 @@ tracked on the [Awai Network roadmap](https://awai.network/network/roadmap/).
 | Articles and demos that lead to trials; targets and positioning | [KOTOBA-106](https://linear.app/kotobalabs/issue/KOTOBA-106), [KOTOBA-104](https://linear.app/kotobalabs/issue/KOTOBA-104) |
 | Trial cohorts, D7/D30 retention and outside contributions | [KOTOBA-108](https://linear.app/kotobalabs/issue/KOTOBA-108), [KOTOBA-156](https://linear.app/kotobalabs/issue/KOTOBA-156) |
 | Organizational evaluation and embedding | [KOTOBA-107](https://linear.app/kotobalabs/issue/KOTOBA-107) |
+
+**CI and release**
+
+| Work | Tracking |
+|---|---|
+| Fast native CDCI, merge queue, pin regeneration, ephemeral runners | [JUN-332](https://linear.app/kotobalabs/issue/JUN-332), [JUN-358](https://linear.app/kotobalabs/issue/JUN-358), [JUN-629](https://linear.app/kotobalabs/issue/JUN-629), [JUN-631](https://linear.app/kotobalabs/issue/JUN-631), [JUN-818](https://linear.app/kotobalabs/issue/JUN-818), [JUN-759](https://linear.app/kotobalabs/issue/JUN-759), [JUN-852](https://linear.app/kotobalabs/issue/JUN-852), [JUN-1013](https://linear.app/kotobalabs/issue/JUN-1013), [JUN-945](https://linear.app/kotobalabs/issue/JUN-945) |
+| Python gates to Basilisp, native gates without the JVM, landing restored selfhost slices | [JUN-974](https://linear.app/kotobalabs/issue/JUN-974), [JUN-506](https://linear.app/kotobalabs/issue/JUN-506), [JUN-280](https://linear.app/kotobalabs/issue/JUN-280), [JUN-532](https://linear.app/kotobalabs/issue/JUN-532) |
+| Native replacements for the removed hosted CLI and tooling | [JUN-829](https://linear.app/kotobalabs/issue/JUN-829) |
 
 **Performance evidence**
 
@@ -555,6 +571,7 @@ tracked on the [Awai Network roadmap](https://awai.network/network/roadmap/).
 |---|---|
 | Evidence-gated submissions (awesome lists, ELS and FOSDEM 2027) | [KOTOBA-118](https://linear.app/kotobalabs/issue/KOTOBA-118), [KOTOBA-120](https://linear.app/kotobalabs/issue/KOTOBA-120) |
 | CNCF Sandbox fit assessment | [KOTOBA-116](https://linear.app/kotobalabs/issue/KOTOBA-116) |
+| Reddit awareness ads for Kotoba and Amu | [JUN-760](https://linear.app/kotobalabs/issue/JUN-760) |
 
 **Browser targets**
 
@@ -577,6 +594,7 @@ tracked on the [Awai Network roadmap](https://awai.network/network/roadmap/).
 | Consolidate library repositories into kotoba-lang/kotoba lib/ | [JUN-380](https://linear.app/kotobalabs/issue/JUN-380) |
 | Native SQLite engine for selfhost consumers | [JUN-768](https://linear.app/kotobalabs/issue/JUN-768) |
 | AIUEOS, Kototama and Amu integration gaps (P0/P1) | [JUN-1025](https://linear.app/kotobalabs/issue/JUN-1025), [JUN-1026](https://linear.app/kotobalabs/issue/JUN-1026), [JUN-1027](https://linear.app/kotobalabs/issue/JUN-1027), [JUN-1028](https://linear.app/kotobalabs/issue/JUN-1028), [JUN-1029](https://linear.app/kotobalabs/issue/JUN-1029), [JUN-1030](https://linear.app/kotobalabs/issue/JUN-1030), [JUN-1031](https://linear.app/kotobalabs/issue/JUN-1031) |
+| kami engine onto Kotoba/Amu and its upstream ports | [JUN-639](https://linear.app/kotobalabs/issue/JUN-639), [JUN-718](https://linear.app/kotobalabs/issue/JUN-718), [JUN-719](https://linear.app/kotobalabs/issue/JUN-719), [JUN-720](https://linear.app/kotobalabs/issue/JUN-720), [JUN-721](https://linear.app/kotobalabs/issue/JUN-721) |
 
 **re-disasm**
 
