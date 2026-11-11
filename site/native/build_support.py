@@ -5,13 +5,18 @@ in Kotoba. This module copies declared source/data bytes and launches pinned
 native tools; it never invokes the retained CLJK path.
 """
 from pathlib import Path
-import hashlib,json,os,platform,re,shutil,subprocess,time
+import hashlib,json,os,platform,re,shutil,subprocess,threading,time
 ROOT=Path(__file__).resolve().parents[2]
 TAGS=('en','ar','arz','bn','de','es','fr','hi','id','ja','ko','mr','pcm','pt','ru','ur','zh-Hans')
 COMPILER_SHA='2b4ac12a77f156ccc2790eb0cf5453e57b9cac8669a2dce9779095579f7994a2'
 PACKAGER_SHA='e95284408f091c8979ef74ece57116a4df2250e61e42074da5dc95ca30264142'
 ALIASES={'html_core.kotoba':'kotoba.html/kotoba/html_core.kotoba','html_hiccup.kotoba':'kotoba.html/kotoba/html_hiccup.kotoba','components.kotoba':'kotoba.jpGoDigitalDesignSystem/kotoba/components.kotoba','button.kotoba':'kotoba.jpGoDigitalDesignSystem/kotoba/button.kotoba','table.kotoba':'kotoba.jpGoDigitalDesignSystem/kotoba/table.kotoba','theme_toggle.kotoba':'kotoba.jpGoDigitalDesignSystem/kotoba/theme_toggle.kotoba','language_selector.kotoba':'kotoba.jpGoDigitalDesignSystem/kotoba/language_selector.kotoba','css_sheet.kotoba':'kotoba.css/kotoba/css_sheet.kotoba','json_scalar.kotoba':'kotoba.json/kotoba/json_scalar.kotoba','json/core.kotoba':'kotoba.json/src/json/core.kotoba','multiformats/sha256.kotoba':'kotoba.ioMultiformats/src/multiformats/sha256.kotoba','multiformats/cid.kotoba':'kotoba.ioMultiformats/src/multiformats/cid.kotoba'}
+_RUNNER_CACHE={}
 def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def cached_sha(p):
+ p=Path(p);st=p.stat();key=(str(p),st.st_mtime_ns,st.st_size);v=_RUNNER_CACHE.get(key)
+ if v is None:v=sha(p);_RUNNER_CACHE[key]=v
+ return v
 def write_bytes(path,data):
  path=Path(path);path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
 def program_image(folder):
@@ -43,7 +48,7 @@ def native_run(image,folder,args=(),expected=42,timeout=900):
 def linux_run(image,folder,args=(),expected=42,timeout=900):
  image,folder=Path(image),Path(folder)
  record=json.loads((image.parent/'build.json').read_text());runner=Path(record['runner']['path'])
- if sha(image)!=record['binarySha256'] or sha(runner)!=record['runner']['sha256']:raise ValueError('Linux native program/runner drift')
+ if sha(image)!=record['binarySha256'] or cached_sha(runner)!=record['runner']['sha256']:raise ValueError('Linux native program/runner drift')
  env={'PATH':'/nonexistent','LANG':'C','KEXE_ALLOW':'35,37,38,39','KEXE_CAP_RESOURCES_35':str(folder),'KEXE_STACK_BYTES':'8388608','KEXE_FUEL':'off','KEXE_STRING_POOL':'268435456','KEXE_STRUCTURED_REPORT':'1'}
  argv=[str(runner),str(image),'0','0','x86_64','35,37,38,39','--',*map(str,args)]
  start=time.monotonic();r=subprocess.run(argv,cwd=folder,env=env,capture_output=True,timeout=timeout)
@@ -67,7 +72,7 @@ class Build:
   pins=json.loads((ROOT/'site/native/build-library-pins.json').read_text())
   for name,path in ALIASES.items():
    if pins[name]['path']!=path or sha(self.libs/path)!=pins[name]['sha256']:raise ValueError('native library pin drift '+name)
-  self.inputs={};self.data={};self.components={};self.prepare_data()
+  self.inputs={};self.data={};self.components={};self._lock=threading.Lock();self.prepare_data()
  def add(self,name,path,expected=None):
   p=Path(path).resolve(strict=True)
   if expected and sha(p)!=expected:raise ValueError('input pin mismatch '+str(p))
@@ -95,7 +100,8 @@ class Build:
   for n in recipe['entries']:sources[n]=ROOT/'test/site/native'/Path(n).name
   for n in recipe['aliases']:sources['src/'+n]=self.libs/ALIASES[n]
   for target,source in sources.items():
-   write_bytes(folder/target,source.read_bytes());self.inputs[str(source)]=sha(source)
+   write_bytes(folder/target,source.read_bytes())
+   with self._lock:self.inputs[str(source)]=sha(source)
   for target,source in self.data.items():write_bytes(folder/target,source.read_bytes())
   entry=recipe.get('entry') or recipe['entries'][0];lock=folder/'project.ksl'
   lock.write_text('KSL1\nentry /'+entry+'\nroot /src\n'+''.join('file '+sha(folder/n)+' /'+n+'\n' for n in sorted(sources)))
@@ -106,7 +112,8 @@ class Build:
   native_run(self.packager,folder,['entry-unsigned.macho','entry.raw','fs2-cli-stdio-general',match[1].decode()],expected=0)
   image=folder/'entry.macho';shutil.copyfile(folder/'entry-unsigned.macho',image);image.chmod(0o700);subprocess.run(['/usr/bin/codesign','--force','--sign','-',str(image)],check=True,capture_output=True,timeout=30)
   record={'sourceLockSha256':sha(lock),'binarySha256':sha(image),'sources':{n:sha(folder/n) for n in sources},'data':{n:sha(p) for n,p in self.data.items()}}
-  (folder/'build.json').write_text(json.dumps(record,indent=2)+'\n');self.components[name]=folder
+  (folder/'build.json').write_text(json.dumps(record,indent=2)+'\n')
+  with self._lock:self.components[name]=folder
   print('compiled',name,flush=True);return folder
  def run(self,name,args=(),output=None):
   folder=self.components.get(name) or self.compile(name)

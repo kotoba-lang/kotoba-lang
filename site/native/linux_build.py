@@ -2,6 +2,7 @@
 import json
 import platform
 import shutil
+import threading
 from pathlib import Path
 from build_support import Build, ROOT, ALIASES, sha, write_bytes, native_run
 from observe_linux import Observation, static_elf
@@ -44,6 +45,7 @@ class LinuxBuild(Build):
                        str(ROOT/'site/native/input_linux.kotoba'):sha(ROOT/'site/native/input_linux.kotoba')}
         self.data, self.components = {}, {}
         self.source_overrides = {}
+        self._lock = threading.Lock()
         self.prepare_data()
 
     def compile(self, name):
@@ -58,7 +60,8 @@ class LinuxBuild(Build):
             originals['src/'+n] = self.libs/ALIASES[n]
         for n, original in originals.items():
             sources[n] = self.source_overrides.get(n, original.read_bytes())
-            self.inputs[str(original)] = sha(original)
+            with self._lock:
+                self.inputs[str(original)] = sha(original)
         row, image, folder = self.observer.compile(name, sources, recipe.get('entry') or recipe['entries'][0])
         if not row['compiled']:
             raise ValueError('native producer compile failed '+name+': '+row['stderrTail'])
@@ -70,7 +73,8 @@ class LinuxBuild(Build):
                       data={n:sha(p) for n,p in self.data.items()},
                       runner=dict(path=str(self.packager), sha256=sha(self.packager)))
         (folder/'build.json').write_text(json.dumps(record, indent=2)+'\n')
-        self.components[name] = folder
+        with self._lock:
+            self.components[name] = folder
         print('compiled Linux', name, flush=True)
         return folder
 
