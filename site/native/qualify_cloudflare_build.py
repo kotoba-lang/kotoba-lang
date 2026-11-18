@@ -10,6 +10,7 @@ and Linux publication refusal).
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -86,7 +87,7 @@ def aggregate_stage_seconds(build_path):
 
 
 def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, stage_budgets=None,
-                             simulated_total_seconds=None, simulated_memory_bytes=None):
+                             simulated_memory_bytes=None):
     """Verify build integrity, stage budgets, and ceiling constraints."""
     build_path = Path(build_path).resolve(strict=True)
     candidate = build_path / 'candidate'
@@ -116,17 +117,16 @@ def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, st
     budgets = stage_budgets or DEFAULT_STAGE_BUDGETS
     stage_times, total_calls = aggregate_stage_seconds(build_path)
 
-    # Total duration check
-    total_seconds = simulated_total_seconds
-    if total_seconds is None:
-        timing_path = build_path / 'timing.json'
-        if timing_path.is_file():
-            timing_data = json.loads(timing_path.read_text())
-            total_seconds = float(timing_data.get('totalSeconds', 0.0))
-        elif receipt.get('fullGenerationAndQualificationSeconds'):
-            total_seconds = float(receipt['fullGenerationAndQualificationSeconds'])
-        else:
-            total_seconds = sum(stage_times.values())
+    # Stage records sum child-process durations, which overlap on parallel builds.
+    timing_path = build_path / 'timing.json'
+    if not timing_path.is_file():
+        raise ValueError('FAIL_CLOUDFLARE_TIMING_UNAVAILABLE: missing timing.json')
+    timing = json.loads(timing_path.read_text())
+    total_seconds = timing.get('totalSeconds') if isinstance(timing, dict) else None
+    if (total_seconds is None or timing.get('clock') != 'monotonic'
+            or type(total_seconds) not in (int, float)
+            or not math.isfinite(total_seconds) or total_seconds <= 0):
+        raise ValueError('FAIL_CLOUDFLARE_TIMING_UNAVAILABLE: invalid monotonic wall-clock measurement')
 
     if total_seconds > budget_seconds:
         raise ValueError(f'FAIL_CLOUDFLARE_20M_TIMEOUT_EXCEEDED: build duration {total_seconds:.1f}s '
@@ -193,7 +193,7 @@ def exercise_negative_controls():
         }))
 
         def write_measurements(total, locale, memory):
-            (build_path / 'timing.json').write_text(json.dumps({'totalSeconds': total}))
+            (build_path / 'timing.json').write_text(json.dumps({'clock': 'monotonic', 'totalSeconds': total}))
             (build_path / 'calls.json').write_text(json.dumps([{
                 'name': 'render-locale',
                 'seconds': locale,
