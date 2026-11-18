@@ -48,11 +48,12 @@ def native_run(image,folder,args=(),expected=42,timeout=900):
 def linux_run(image,folder,args=(),expected=42,timeout=900):
  image,folder=Path(image),Path(folder)
  record=json.loads((image.parent/'build.json').read_text());runner=Path(record['runner']['path'])
- if sha(image)!=record['binarySha256'] or cached_sha(runner)!=record['runner']['sha256']:raise ValueError('Linux native program/runner drift')
+ image_sha=sha(image);runner_sha=cached_sha(runner)
+ if image_sha!=record['binarySha256'] or runner_sha!=record['runner']['sha256']:raise ValueError('Linux native program/runner drift')
  env={'PATH':'/nonexistent','LANG':'C','KEXE_ALLOW':'35,37,38,39','KEXE_CAP_RESOURCES_35':str(folder),'KEXE_STACK_BYTES':'8388608','KEXE_FUEL':'off','KEXE_STRING_POOL':'268435456','KEXE_STRUCTURED_REPORT':'1'}
  argv=[str(runner),str(image),'0','0','x86_64','35,37,38,39','--',*map(str,args)]
  start=time.monotonic();r=subprocess.run(argv,cwd=folder,env=env,capture_output=True,timeout=timeout)
- call={'image':str(image),'argv':argv,'imageSha256':sha(image),'runnerSha256':sha(runner),'exit':r.returncode,'seconds':time.monotonic()-start,'stdoutSha256':hashlib.sha256(r.stdout).hexdigest(),'stderrSha256':hashlib.sha256(r.stderr).hexdigest(),'PATH':'/nonexistent','scope':str(folder)}
+ call={'image':str(image),'argv':argv,'imageSha256':image_sha,'runnerSha256':runner_sha,'exit':r.returncode,'seconds':time.monotonic()-start,'stdoutSha256':hashlib.sha256(r.stdout).hexdigest(),'stderrSha256':hashlib.sha256(r.stderr).hexdigest(),'PATH':'/nonexistent','scope':str(folder)}
  with (folder/'calls.jsonl').open('a') as f:f.write(json.dumps(call)+'\n')
  tail=re.search(rb'\{:status :ok :result '+str(expected).encode()+rb' :fuel [^\n]*\}\n?$',r.stdout)
  if r.returncode or r.stderr or not tail:

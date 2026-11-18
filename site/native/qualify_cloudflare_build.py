@@ -90,8 +90,58 @@ def valid_seconds(value):
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
-def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, stage_budgets=None,
-                             simulated_memory_bytes=None):
+def validate_resources(environment):
+    if not isinstance(environment, dict):
+        raise ValueError('FAIL_CLOUDFLARE_RESOURCE_UNAVAILABLE: invalid cgroup evidence')
+    memory = environment.get('memoryLimitBytes')
+    peak = environment.get('memoryPeakBytes')
+    if type(memory) is not int or memory <= 0:
+        raise ValueError('FAIL_CLOUDFLARE_RESOURCE_UNAVAILABLE: missing finite cgroup memory.max')
+    if memory > MAX_MEMORY_BYTES:
+        raise ValueError(f'FAIL_CLOUDFLARE_MEMORY_EXCEEDED: cgroup memory limit {memory} '
+                         f'exceeds build limit {MAX_MEMORY_BYTES}')
+    events = (environment.get('oomEvents'), environment.get('oomKillEvents'))
+    if (type(peak) is not int or not 0 < peak <= memory
+            or any(type(count) is not int or count != 0 for count in events)):
+        raise ValueError('FAIL_CLOUDFLARE_MEMORY_EXCEEDED: cgroup peak or OOM evidence is out of budget')
+
+    quota = environment.get('cpuQuotaMicros')
+    period = environment.get('cpuPeriodMicros')
+    if (type(quota) is not int or type(period) is not int
+            or period <= 0 or not 0 < quota <= MAX_VCPUS * period):
+        raise ValueError('FAIL_CLOUDFLARE_CPU_BUDGET: cgroup CPU quota is missing or exceeds the build limit')
+    group = environment.get('cgroup')
+    swap = environment.get('swapLimitBytes')
+    if (type(swap) is not int or swap != 0
+            or not isinstance(group, str) or not group.startswith('/') or group == '/'):
+        raise ValueError('FAIL_CLOUDFLARE_RESOURCE_UNAVAILABLE: a bounded cgroup without swap is required')
+
+
+def capture_resources(cgroup_root=Path('/sys/fs/cgroup'), membership=Path('/proc/self/cgroup')):
+    """Read resource controls and observations from this process's cgroup v2."""
+    try:
+        group, = (line[3:] for line in membership.read_text().splitlines() if line.startswith('0::'))
+        root = cgroup_root.resolve(strict=True)
+        scope = (root / group.lstrip('/')).resolve(strict=True)
+        if not group.startswith('/') or scope == root or not scope.is_relative_to(root):
+            raise ValueError('no qualifying process cgroup')
+        quota, period = (scope / 'cpu.max').read_text().split()
+        events = dict(line.split() for line in (scope / 'memory.events').read_text().splitlines())
+        return {
+            'cgroup': group,
+            'memoryLimitBytes': int((scope / 'memory.max').read_text()),
+            'memoryPeakBytes': int((scope / 'memory.peak').read_text()),
+            'swapLimitBytes': int((scope / 'memory.swap.max').read_text()),
+            'cpuQuotaMicros': int(quota),
+            'cpuPeriodMicros': int(period),
+            'oomEvents': int(events['oom']),
+            'oomKillEvents': int(events['oom_kill']),
+        }
+    except (KeyError, OSError, ValueError) as error:
+        raise ValueError('FAIL_CLOUDFLARE_RESOURCE_UNAVAILABLE: cannot read bounded cgroup v2 controls') from error
+
+
+def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, stage_budgets=None):
     """Verify build integrity, stage budgets, and ceiling constraints."""
     build_path = Path(build_path).resolve(strict=True)
     candidate = build_path / 'candidate'
@@ -144,16 +194,18 @@ def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, st
             raise ValueError(f'FAIL_STAGE_BUDGET_EXCEEDED: stage {stage_name} took {actual:.1f}s '
                              f'(budget {limit:.1f}s)')
 
-    memory_bytes = simulated_memory_bytes
-    if memory_bytes is None:
-        env_path = build_path / 'environment.json'
-        if env_path.is_file():
-            env_data = json.loads(env_path.read_text())
-            memory_bytes = env_data.get('physicalMemoryBytes')
-
-    if memory_bytes and memory_bytes > MAX_MEMORY_BYTES:
-        raise ValueError(f'FAIL_CLOUDFLARE_MEMORY_EXCEEDED: physical memory {memory_bytes} '
-                         f'exceeds Cloudflare container limit {MAX_MEMORY_BYTES}')
+    snapshots = []
+    for name in ('environment-start.json', 'environment.json'):
+        path = build_path / name
+        if not path.is_file():
+            raise ValueError(f'FAIL_CLOUDFLARE_RESOURCE_UNAVAILABLE: missing {name}')
+        environment = json.loads(path.read_text())
+        validate_resources(environment)
+        snapshots.append(environment)
+    start, finish = snapshots
+    controls = ('cgroup', 'memoryLimitBytes', 'swapLimitBytes', 'cpuQuotaMicros', 'cpuPeriodMicros')
+    if any(start[key] != finish[key] for key in controls) or start['memoryPeakBytes'] > finish['memoryPeakBytes']:
+        raise ValueError('FAIL_CLOUDFLARE_RESOURCE_UNAVAILABLE: build cgroup evidence changed')
 
     process_seconds, total_calls = aggregate_stage_seconds(build_path)
     result = {
@@ -167,7 +219,8 @@ def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, st
         'stageBudgets': budgets,
         'totalNativeCallsObserved': total_calls,
         'maxMemoryBytes': MAX_MEMORY_BYTES,
-        'observedMemoryBytes': memory_bytes,
+        'observedMemoryBytes': finish['memoryPeakBytes'],
+        'resources': finish,
         'cljkInvoked': False,
         'published': False,
         'linuxPublishRefusalEnforced': True,
@@ -210,7 +263,11 @@ def exercise_negative_controls():
                 'name': 'render-locale',
                 'seconds': 2000.0,
             }]))
-            (build_path / 'environment.json').write_text(json.dumps({'physicalMemoryBytes': memory}))
+            environment = {'cgroup': '/fixture.slice/build.scope', 'memoryLimitBytes': memory,
+                           'memoryPeakBytes': 1024, 'swapLimitBytes': 0, 'cpuQuotaMicros': 400000,
+                           'cpuPeriodMicros': 100000, 'oomEvents': 0, 'oomKillEvents': 0}
+            for name in ('environment-start.json', 'environment.json'):
+                (build_path / name).write_text(json.dumps(environment))
 
         write_measurements(500.0, 2.0, MAX_MEMORY_BYTES)
         qualify_candidate_budget(build_path)
@@ -245,7 +302,14 @@ def main():
     p.add_argument('--build', type=Path, help='Candidate build directory')
     p.add_argument('--budget', type=float, default=HARD_CEILING_SECONDS, help='Build timeout in seconds (default: 1200.0)')
     p.add_argument('--test-controls', action='store_true', help='Run negative refusal controls')
+    p.add_argument('--capture-environment', type=Path, help='Record this process cgroup v2 controls and peak')
     a = p.parse_args()
+
+    if a.capture_environment:
+        environment = capture_resources()
+        a.capture_environment.write_text(json.dumps(environment, indent=2) + '\n')
+        validate_resources(environment)
+        return
 
     controls = exercise_negative_controls()
     print(f'Exercised {len(controls)} negative refusal controls: all PASS')

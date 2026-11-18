@@ -197,6 +197,7 @@ Cloudflare Workers Builds enforces a [20-minute build limit](https://developers.
 - Native runner executable hashes are cached across invocations, eliminating 680 redundant 2MB file hashing passes.
 - Locales are scheduled with the heavier English and Japanese articles first (LPT scheduling), keeping all four workers saturated.
 - `qualify_cloudflare_build.py` requires monotonic elapsed measurements for the 1200s total ceiling and the individual stages (fetch 60s, compile 300s, locales and site assembly 600s, docs 180s, qualification 180s). Cumulative native subprocess durations are reported separately.
+- The Linux workflow runs generation and verification in a cgroup with at most 8 GiB RAM, zero swap, and a four-CPU quota. The gate requires start and end snapshots of the same limits, including peak memory and OOM counters.
 - Negative controls exercise timeout refusal (both marginal 1200.5s and historical 1850s), stage budget refusal, memory limit refusal, and candidate drift.
 - Linux candidates remain observation-only; `publish_site.py` refuses Linux publication. The active Mac native deployment remains live in production. No Workers Builds production trigger is created by this slice. The explicit local CLJK route remains unchanged.
 
