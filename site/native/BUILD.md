@@ -192,7 +192,8 @@ upstream compiler as a whole or a native automatic release controller.
 Cloudflare Workers Builds enforces a [20-minute build limit](https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/)
 (1200 seconds) in a Linux container with 8GB RAM and 4 vCPUs. To fit this envelope:
 
-- 53 native producer closures compile in parallel across `--jobs` workers via a thread pool, reducing closure compile time from ~240s to ~65s.
+- Native producer closures compile in parallel across `--jobs` workers via a thread pool, reducing closure compile time from ~240s to ~65s.
+- The native catalog summary is generated once per build. Locale producers verify its digest against the pinned catalog and taxonomy before using it.
 - Native runner executable hashes are cached across invocations, eliminating 680 redundant 2MB file hashing passes.
 - Locales are scheduled with the heavier English and Japanese articles first (LPT scheduling), keeping all four workers saturated.
 - `qualify_cloudflare_build.py` gates the total build against the 1200s hard ceiling and enforces per-stage budgets (preflight 60s, compile 300s, locales 600s, docs 180s, qualification 180s), failing closed with exit 7 if any budget is exceeded.

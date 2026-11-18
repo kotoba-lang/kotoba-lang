@@ -21,8 +21,9 @@ class Job:
   data=json.loads((self.output/'data.json').read_text())
   for name,path in data.items():write_bytes(self.folder/name,Path(path).read_bytes())
   self.fragments={}
- def run(self,name,*args):
-  result=native_run(program_image(self.output/name),self.folder,args)
+ def run(self,name,*args,catalog_summary=False):
+  run_args=('--catalog-summary',args[-1]) if catalog_summary else args
+  result=native_run(program_image(self.output/name),self.folder,run_args)
   write_bytes(self.output/'fragments'/self.tag/(name+'-'+('-'.join(args) or 'data')+'.html'),result)
   return result
  def compose(self,name,parts,document=False,tag=None):
@@ -37,14 +38,14 @@ class Job:
   grid=self.compose('home_benchmark_cards',cards)
   tail=self.compose('home_benchmark_tail',{'domain':self.run('home_benchmark_domain_section',t),'evidence':self.run('home_benchmark_evidence',t)})
   bench=self.compose('home_benchmark_compose',{'intro':self.run('home_benchmark_intro','intro',t),'cards':grid,'scaling':self.run('home_benchmark_scaling_section',t),'runtime':self.run('home_benchmark_runtime_section',t),'compile':self.run('home_benchmark_compile_section',t),'remainder':tail})
-  chapters=self.compose('home_chapters_compose',{'opening':self.run('home_opening_chapters','opening',t),'evidence':self.run('home_evidence_template',t),'benchmark':bench,'developer':self.run('home_developer_template',t),'library':self.run('home_library','library',t),'closing':self.run('home_closing_chapter','closing',t)})
+  chapters=self.compose('home_chapters_compose',{'opening':self.run('home_opening_chapters','opening',t),'evidence':self.run('home_evidence_template',t),'benchmark':bench,'developer':self.run('home_developer_template',t),'library':self.run('home_library','library',t,catalog_summary=True),'closing':self.run('home_closing_chapter','closing',t)})
   body=self.compose('home_body_compose',{'shell':self.run('home_body_shell',t),'hero':self.run('home_command','hero',t),'chapters':chapters,'scripts':self.run('home_script_bundle')})
   doc=self.compose('home_document',{'head':self.run('home_head',t),'body':body},True)
   self.publish(('' if t=='en' else t+'/')+'index.html',doc)
   print(t,'home',len(doc),flush=True)
  def library(self):
   t=self.tag;write_bytes(self.folder/'rows.html',(self.output/'rows.html').read_bytes())
-  body=self.compose('library_body_compose',{'shell':self.run('library_body_shell',t),'hero':self.run('library_hero','top',t),'identity':self.run('library_static_section','identity',t),'publish':self.run('library_publish','publish',t),'catalog':self.run('library_catalog_section',t),'status':self.run('library_status','status',t),'compare':self.run('library_static_section','compare',t)})
+  body=self.compose('library_body_compose',{'shell':self.run('library_body_shell',t),'hero':self.run('library_hero','top',t),'identity':self.run('library_static_section','identity',t),'publish':self.run('library_publish','publish',t),'catalog':self.run('library_catalog_section',t,catalog_summary=True),'status':self.run('library_status','status',t),'compare':self.run('library_static_section','compare',t)})
   doc=self.compose('library_document',{'head':self.run('library_head',t),'body':body},True)
   self.publish(('' if t=='en' else t+'/')+'libraries/index.html',doc)
   print(t,'libraries',len(doc),flush=True)
@@ -61,7 +62,9 @@ class Job:
   print(t,'sections complete',flush=True)
 
 def locale_job(output,tag):
- j=Job(output,tag);j.home();j.library();j.sections();return tag
+ j=Job(output,tag)
+ write_bytes(j.folder/'library-summary.tsv',(j.output/'library-summary.tsv').read_bytes())
+ j.home();j.library();j.sections();return tag
 
 def main():
  start_time=time.monotonic()
@@ -83,6 +86,7 @@ def main():
  (b.output/'data.json').write_text(json.dumps({n:str(p) for n,p in b.data.items()},indent=2)+'\n')
  # Catalogue rows are rendered once natively and reused without translation.
  write_bytes(b.output/'rows.html',b.run('library_rows'))
+ write_bytes(b.output/'library-summary.tsv',b.run('library_summary'))
  ordered_tags=sorted(TAGS,key=lambda t:0 if t in ('en','ja') else 1)
  with concurrent.futures.ProcessPoolExecutor(max_workers=a.jobs) as pool:
   pending={pool.submit(locale_job,str(b.output),t):t for t in ordered_tags[:a.jobs]}
