@@ -15,6 +15,7 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -167,49 +168,48 @@ def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, st
     return result
 
 
-def exercise_negative_controls(sample_build_path=None):
-    """Exercise negative controls to ensure all constraint violations fail closed."""
+def exercise_negative_controls():
+    """Exercise budget refusals with independent, otherwise passing inputs."""
+    cases = [
+        ('timeout-refusal-marginal-overrun-1200.5s', 1200.5, 2.0, MAX_MEMORY_BYTES,
+         'FAIL_CLOUDFLARE_20M_TIMEOUT_EXCEEDED'),
+        ('timeout-refusal-historical-overrun-1850s', 1850.0, 2.0, MAX_MEMORY_BYTES,
+         'FAIL_CLOUDFLARE_20M_TIMEOUT_EXCEEDED'),
+        ('stage-budget-refusal', 700.0, DEFAULT_STAGE_BUDGETS['locale_generation'] + 1.0,
+         MAX_MEMORY_BYTES, 'FAIL_STAGE_BUDGET_EXCEEDED'),
+        ('memory-ceiling-refusal', 500.0, 2.0, MAX_MEMORY_BYTES * 2,
+         'FAIL_CLOUDFLARE_MEMORY_EXCEEDED'),
+    ]
     controls = []
+    with TemporaryDirectory(prefix='cloudflare-budget-controls-') as directory:
+        build_path = Path(directory)
+        fixture = build_path / 'candidate' / 'budget-control.txt'
+        fixture.parent.mkdir()
+        fixture.write_text('budget control\n')
+        (build_path / 'receipt.json').write_text(json.dumps({
+            'status': 'BUILT_NATIVE_SITE_CANDIDATE',
+            'cljkInvoked': False,
+            'files': {fixture.name: sha(fixture)},
+        }))
 
-    # Control 1: Total duration exceeds 20-minute limit (1201s and historical 1850s)
-    for test_sec, label in [(1200.5, 'marginal-overrun-1200.5s'), (1850.0, 'historical-overrun-1850s')]:
-        passed = False
-        try:
-            if sample_build_path:
-                qualify_candidate_budget(sample_build_path, simulated_total_seconds=test_sec)
-            else:
-                if test_sec > HARD_CEILING_SECONDS:
-                    raise ValueError(f'FAIL_CLOUDFLARE_20M_TIMEOUT_EXCEEDED: {test_sec}s > {HARD_CEILING_SECONDS}s')
-        except ValueError as e:
-            if 'FAIL_CLOUDFLARE_20M_TIMEOUT_EXCEEDED' in str(e):
-                passed = True
-        controls.append({'name': f'timeout-refusal-{label}', 'passed': passed, 'exit': 7 if passed else 0})
+        def write_measurements(total, locale, memory):
+            (build_path / 'timing.json').write_text(json.dumps({'totalSeconds': total}))
+            (build_path / 'calls.json').write_text(json.dumps([{
+                'name': 'render-locale',
+                'seconds': locale,
+            }]))
+            (build_path / 'environment.json').write_text(json.dumps({'physicalMemoryBytes': memory}))
 
-    # Control 2: Stage budget exceeded (e.g. locale_generation exceeds 600s)
-    passed_stage = False
-    try:
-        strict_budget = dict(DEFAULT_STAGE_BUDGETS, locale_generation=1.0)
-        if sample_build_path:
-            qualify_candidate_budget(sample_build_path, stage_budgets=strict_budget, simulated_total_seconds=500.0)
-        else:
-            raise ValueError('FAIL_STAGE_BUDGET_EXCEEDED: locale_generation 650.0s > 1.0s')
-    except ValueError as e:
-        if 'FAIL_STAGE_BUDGET_EXCEEDED' in str(e):
-            passed_stage = True
-    controls.append({'name': 'stage-budget-refusal', 'passed': passed_stage, 'exit': 7 if passed_stage else 0})
-
-    # Control 3: Memory ceiling overrun (> 8GB)
-    passed_mem = False
-    try:
-        if sample_build_path:
-            qualify_candidate_budget(sample_build_path, simulated_memory_bytes=16 * 1024 * 1024 * 1024,
-                                     simulated_total_seconds=500.0)
-        else:
-            raise ValueError('FAIL_CLOUDFLARE_MEMORY_EXCEEDED: 16GB > 8GB')
-    except ValueError as e:
-        if 'FAIL_CLOUDFLARE_MEMORY_EXCEEDED' in str(e):
-            passed_mem = True
-    controls.append({'name': 'memory-ceiling-refusal', 'passed': passed_mem, 'exit': 7 if passed_mem else 0})
+        write_measurements(500.0, 2.0, MAX_MEMORY_BYTES)
+        qualify_candidate_budget(build_path)
+        for name, total, locale, memory, expected in cases:
+            passed = False
+            write_measurements(total, locale, memory)
+            try:
+                qualify_candidate_budget(build_path)
+            except ValueError as error:
+                passed = str(error).startswith(expected + ':')
+            controls.append({'name': name, 'passed': passed, 'exit': 7 if passed else 0})
 
     # Control 4: Linux publication guard refusal
     passed_pub = False
@@ -235,7 +235,7 @@ def main():
     p.add_argument('--test-controls', action='store_true', help='Run negative refusal controls')
     a = p.parse_args()
 
-    controls = exercise_negative_controls(a.build if a.build and a.build.exists() else None)
+    controls = exercise_negative_controls()
     print(f'Exercised {len(controls)} negative refusal controls: all PASS')
 
     if a.build:
