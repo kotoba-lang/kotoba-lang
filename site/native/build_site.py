@@ -39,7 +39,9 @@ class Job:
   tail=self.compose('home_benchmark_tail',{'domain':self.run('home_benchmark_domain_section',t),'evidence':self.run('home_benchmark_evidence',t)})
   bench=self.compose('home_benchmark_compose',{'intro':self.run('home_benchmark_intro','intro',t),'cards':grid,'scaling':self.run('home_benchmark_scaling_section',t),'runtime':self.run('home_benchmark_runtime_section',t),'compile':self.run('home_benchmark_compile_section',t),'remainder':tail})
   chapters=self.compose('home_chapters_compose',{'opening':self.run('home_opening_chapters','opening',t),'evidence':self.run('home_evidence_template',t),'benchmark':bench,'developer':self.run('home_developer_template',t),'library':self.run('home_library','library',t,catalog_summary=True),'closing':self.run('home_closing_chapter','closing',t)})
-  body=self.compose('home_body_compose',{'shell':self.run('home_body_shell',t),'hero':self.run('home_command','hero',t),'chapters':chapters,'scripts':self.run('home_script_bundle')})
+  scripts=(self.output/'home-scripts.html').read_bytes()
+  write_bytes(self.output/'fragments'/t/'home_script_bundle-data.html',scripts)
+  body=self.compose('home_body_compose',{'shell':self.run('home_body_shell',t),'hero':self.run('home_command','hero',t),'chapters':chapters,'scripts':scripts})
   doc=self.compose('home_document',{'head':self.run('home_head',t),'body':body},True)
   self.publish(('' if t=='en' else t+'/')+'index.html',doc)
   print(t,'home',len(doc),flush=True)
@@ -60,6 +62,10 @@ class Job:
    self.publish(prefix+'aiueos/index.html',self.compose('home_document',{'head':self.run('aiueos_head',t),'body':self.run('aiueos_body',t)},True))
   if t=='en':self.publish('spec/org-identity/index.html',self.run('article_page','identity','en'))
   print(t,'sections complete',flush=True)
+
+ def start_pages(self):
+  for tag,path in [('en','start'),('ta','ta'),('uk','uk')]:
+   self.publish(path+'/index.html',self.compose('start_document',{'head':self.run('start_card_head',tag),'body':self.run('start_card_body',tag)},True,tag))
 
 def locale_job(output,tag):
  j=Job(output,tag)
@@ -85,11 +91,15 @@ def main():
   for _ in pool.map(b.compile,b.recipes):pass
  closures_done=time.monotonic()
  (b.output/'data.json').write_text(json.dumps({n:str(p) for n,p in b.data.items()},indent=2)+'\n')
- # Catalogue rows are rendered once natively and reused without translation.
- write_bytes(b.output/'rows.html',b.run('library_rows'))
- write_bytes(b.output/'library-summary.tsv',b.run('library_summary'))
  ordered_tags=sorted(TAGS,key=lambda t:0 if t in ('en','ja') else 1)
+ j=Job(b.output,'extras')
  with concurrent.futures.ProcessPoolExecutor(max_workers=a.jobs) as pool:
+  # These producers use independent input directories. The same worker limit
+  # applies to the shared preparation, start pages and locale rendering.
+  shared_outputs={'library_rows':'rows.html','library_summary':'library-summary.tsv','home_script_bundle':'home-scripts.html'}
+  prep={name:pool.submit(native_run,program_image(b.output/name),b.output/name) for name in shared_outputs}
+  start_pages=pool.submit(j.start_pages)
+  for name,filename in shared_outputs.items():write_bytes(b.output/filename,prep[name].result())
   pending={pool.submit(locale_job,str(b.output),t):t for t in ordered_tags[:a.jobs]}
   rest=iter(ordered_tags[a.jobs:]);completed=[]
   while pending:
@@ -103,10 +113,8 @@ def main():
      raise
     following=next(rest,None)
     if following:pending[pool.submit(locale_job,str(b.output),following)]=following
+  start_pages.result()
  if set(completed)!=set(TAGS):raise ValueError('locale set mismatch')
- j=Job(b.output,'extras')
- for tag,path in [('en','start'),('ta','ta'),('uk','uk')]:
-  j.publish(path+'/index.html',j.compose('start_document',{'head':j.run('start_card_head',tag),'body':j.run('start_card_body',tag)},True,tag))
  static=json.loads((ROOT/'site/native/build-static-assets.json').read_text())
  for dest,source,pin in static:
   path=(ROOT/source).resolve(strict=True)
