@@ -196,7 +196,7 @@ Cloudflare Workers Builds enforces a [20-minute build limit](https://developers.
 - The native catalog summary is generated once per build. Locale producers verify its digest against the pinned catalog and taxonomy before using it.
 - Native runner executable hashes are cached across invocations, eliminating 680 redundant 2MB file hashing passes.
 - Locales are scheduled with the heavier English and Japanese articles first (LPT scheduling), keeping all four workers saturated.
-- `qualify_cloudflare_build.py` gates the total build against the 1200s hard ceiling and enforces per-stage budgets (preflight 60s, compile 300s, locales 600s, docs 180s, qualification 180s), failing closed with exit 7 if any budget is exceeded.
+- `qualify_cloudflare_build.py` requires monotonic elapsed measurements for the 1200s total ceiling and the individual stages (fetch 60s, compile 300s, locales and site assembly 600s, docs 180s, qualification 180s). Cumulative native subprocess durations are reported separately.
 - Negative controls exercise timeout refusal (both marginal 1200.5s and historical 1850s), stage budget refusal, memory limit refusal, and candidate drift.
 - Linux candidates remain observation-only; `publish_site.py` refuses Linux publication. The active Mac native deployment remains live in production. No Workers Builds production trigger is created by this slice. The explicit local CLJK route remains unchanged.
 

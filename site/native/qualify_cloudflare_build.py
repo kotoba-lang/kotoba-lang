@@ -86,6 +86,10 @@ def aggregate_stage_seconds(build_path):
     return stage_times, total_calls
 
 
+def valid_seconds(value):
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
 def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, stage_budgets=None,
                              simulated_memory_bytes=None):
     """Verify build integrity, stage budgets, and ceiling constraints."""
@@ -115,25 +119,27 @@ def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, st
             raise ValueError(f'candidate files differ from baseline: {mismatched[:5]}')
 
     budgets = stage_budgets or DEFAULT_STAGE_BUDGETS
-    stage_times, total_calls = aggregate_stage_seconds(build_path)
-
-    # Stage records sum child-process durations, which overlap on parallel builds.
+    # Process timings overlap on parallel builds and are diagnostics only.
     timing_path = build_path / 'timing.json'
     if not timing_path.is_file():
         raise ValueError('FAIL_CLOUDFLARE_TIMING_UNAVAILABLE: missing timing.json')
     timing = json.loads(timing_path.read_text())
     total_seconds = timing.get('totalSeconds') if isinstance(timing, dict) else None
     if (total_seconds is None or timing.get('clock') != 'monotonic'
-            or type(total_seconds) not in (int, float)
-            or not math.isfinite(total_seconds) or total_seconds <= 0):
+            or not valid_seconds(total_seconds)):
         raise ValueError('FAIL_CLOUDFLARE_TIMING_UNAVAILABLE: invalid monotonic wall-clock measurement')
+    stage_times = timing.get('stageSeconds')
+    if (not isinstance(stage_times, dict) or set(stage_times) != set(DEFAULT_STAGE_BUDGETS)
+            or not all(valid_seconds(seconds) for seconds in stage_times.values())
+            or sum(stage_times.values()) > total_seconds):
+        raise ValueError('FAIL_CLOUDFLARE_TIMING_UNAVAILABLE: invalid monotonic stage measurements')
 
     if total_seconds > budget_seconds:
         raise ValueError(f'FAIL_CLOUDFLARE_20M_TIMEOUT_EXCEEDED: build duration {total_seconds:.1f}s '
                          f'exceeds budget {budget_seconds:.1f}s')
 
     for stage_name, limit in budgets.items():
-        actual = stage_times.get(stage_name, 0.0)
+        actual = stage_times[stage_name]
         if actual > limit:
             raise ValueError(f'FAIL_STAGE_BUDGET_EXCEEDED: stage {stage_name} took {actual:.1f}s '
                              f'(budget {limit:.1f}s)')
@@ -149,6 +155,7 @@ def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, st
         raise ValueError(f'FAIL_CLOUDFLARE_MEMORY_EXCEEDED: physical memory {memory_bytes} '
                          f'exceeds Cloudflare container limit {MAX_MEMORY_BYTES}')
 
+    process_seconds, total_calls = aggregate_stage_seconds(build_path)
     result = {
         'status': 'PASS_CLOUDFLARE_20M_QUALIFICATION',
         'buildReceiptSha256': sha(receipt_path),
@@ -156,6 +163,7 @@ def qualify_candidate_budget(build_path, budget_seconds=HARD_CEILING_SECONDS, st
         'hardCeilingSeconds': budget_seconds,
         'totalElapsedSeconds': total_seconds,
         'stageTimings': stage_times,
+        'stageProcessSeconds': process_seconds,
         'stageBudgets': budgets,
         'totalNativeCallsObserved': total_calls,
         'maxMemoryBytes': MAX_MEMORY_BYTES,
@@ -193,10 +201,14 @@ def exercise_negative_controls():
         }))
 
         def write_measurements(total, locale, memory):
-            (build_path / 'timing.json').write_text(json.dumps({'clock': 'monotonic', 'totalSeconds': total}))
+            stage_times = dict.fromkeys(DEFAULT_STAGE_BUDGETS, 1.0)
+            stage_times['locale_generation'] = locale
+            (build_path / 'timing.json').write_text(json.dumps({
+                'clock': 'monotonic', 'totalSeconds': total, 'stageSeconds': stage_times,
+            }))
             (build_path / 'calls.json').write_text(json.dumps([{
                 'name': 'render-locale',
-                'seconds': locale,
+                'seconds': 2000.0,
             }]))
             (build_path / 'environment.json').write_text(json.dumps({'physicalMemoryBytes': memory}))
 

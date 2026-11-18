@@ -83,6 +83,7 @@ def main():
   b=Build(a.output,a.compiler,a.packager,a.libraries,a.grammar)
  with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as pool:
   for _ in pool.map(b.compile,b.recipes):pass
+ closures_done=time.monotonic()
  (b.output/'data.json').write_text(json.dumps({n:str(p) for n,p in b.data.items()},indent=2)+'\n')
  # Catalogue rows are rendered once natively and reused without translation.
  write_bytes(b.output/'rows.html',b.run('library_rows'))
@@ -126,6 +127,12 @@ def main():
  if len(files)!=189 or len(pages)!=133:raise ValueError(('release route count',len(files),len(pages)))
  receipt={'status':'BUILT_NATIVE_SITE_CANDIDATE','files':files,'htmlPages':len(pages),'locales':list(TAGS),'compilerSha256':sha(b.compiler),'packagerSha256':sha(b.packager),'inputsSha256':sha(b.output/'inputs.json'),'cljkInvoked':False,'published':False,'profile':getattr(b,'profile','macOS-ARM64'),'elapsedSeconds':round(time.monotonic()-start_time,2)}
  (b.output/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'],len(files),flush=True)
+ site_done=time.monotonic()
  from docs_build import extend
  extend(b.output,a.compiler,a.packager,a.libraries,a.grammar,a.linux_inputs)
+ (b.output/'builder-timing.json').write_text(json.dumps({
+  'closure_compilation':closures_done-start_time,
+  'locale_generation':site_done-closures_done,
+  'docs_generation':time.monotonic()-site_done,
+ },indent=2)+'\n')
 if __name__=='__main__':main()
