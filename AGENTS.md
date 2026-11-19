@@ -111,7 +111,15 @@ CIDs, outputs) when porting a construct or checking cljk/edn-sugar vs pure
   and reported as an oracle. Native build, gates, packaging and runtime must not depend on it, and a
   native result must not silently fall back to it. Making an oracle job a required check is a separate
   owner decision; until then it is not required. The ban on JVM, nbb, Babashka and GraalVM in CI for any
-  other purpose (JUN-290) is unchanged.
+  other purpose (JUN-290) was withdrawn by owner decision 2026-11-17 (see `com-junkawasaki/root/AGENTS.md`,
+  CDCI section); the native-closure and no-silent-fallback conditions above still apply to those tools.
+- Basilisp outside the oracle role (owner decision 2026-11-19, JUN-974; canonical text in
+  `com-junkawasaki/root/AGENTS.md`, CDCI section): Basilisp may run `.cljc` scripts as hosted CI tooling in any
+  job, including native-workflow check, gate-support and diagnostic scripts. Such a script may orchestrate or
+  inspect but must not replace a native check; artifacts and gate verdicts are still produced and verified by
+  Kotoba / Amu native tools. Basilisp is not part of the native compile, build, packaging or runtime closure, and
+  a native result must not silently fall back to it. A Basilisp job is not a required check until the owner
+  decides. No other language's rules change.
 - `scripts/oracle-stage-cljc.py SRC DEST` stages a copy of a tree with `.cljk` renamed to `.cljc` (or the extension
   recorded in `cljk-origin.edn`) so the JVM, Babashka and Basilisp can read it. It is a byte stager for local one-off
   oracle runs only; see `docs/oracle-stage-cljc.md`.
