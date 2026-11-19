@@ -185,11 +185,21 @@ explicitly includes hidden files; independent artifact readback verified all
 The dated receipt is `docs/evidence/native-site-linux-cloud-20261105.json`.
 
 These results qualify the bounded generation/validation observation, not the
-upstream compiler as a whole or a native automatic release controller. They
-do not establish Cloudflare integrated Builds compatibility: that environment
-has a separate [20-minute build limit](https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/).
-No Workers Builds configuration or production trigger is created by this
-workflow. The explicit local CLJK route remains unchanged.
+upstream compiler as a whole or a native automatic release controller.
+
+### Cloudflare 20-minute build qualification
+
+Cloudflare Workers Builds enforces a [20-minute build limit](https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/)
+(1200 seconds) in a Linux container with 8GB RAM and 4 vCPUs. To fit this envelope:
+
+- Native producer closures compile in parallel across `--jobs` workers via a thread pool, reducing closure compile time from ~240s to ~65s.
+- The native catalog summary is generated once per build. Locale producers verify its digest against the pinned catalog and taxonomy before using it. The shared rows, catalog summary, home script bundle and extra start pages can run concurrently within the configured worker limit.
+- Native runner executable hashes are cached across invocations, eliminating 680 redundant 2MB file hashing passes.
+- Locales are scheduled with the heavier English and Japanese articles first (LPT scheduling), keeping all four workers saturated.
+- `qualify_cloudflare_build.py` requires monotonic elapsed measurements for the 1200s total ceiling and the individual stages (fetch 60s, compile 300s, locales and site assembly 600s, docs 180s, qualification 180s). Cumulative native subprocess durations are reported separately.
+- The Linux workflow runs generation and verification in a cgroup with at most 8 GiB RAM, zero swap, and a four-CPU quota. The gate requires start and end snapshots of the same limits, including peak memory and OOM counters.
+- Negative controls exercise timeout refusal (both marginal 1200.5s and historical 1850s), stage budget refusal, memory limit refusal, and candidate drift.
+- Linux candidates remain observation-only; `publish_site.py` refuses Linux publication. The active Mac native deployment remains live in production. No Workers Builds production trigger is created by this slice. The explicit local CLJK route remains unchanged.
 
 ## Native Amu course Docs
 

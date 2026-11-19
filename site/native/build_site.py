@@ -5,7 +5,7 @@ Python stages bytes, hashes files, and observes child exit codes. Kotoba owns
 all authority parsing, localization, HTML/JSON rendering and composition.
 The new output directory is private until every native producer succeeds.
 """
-import argparse,concurrent.futures,hashlib,json,os,shutil
+import argparse,concurrent.futures,hashlib,json,os,shutil,time
 from pathlib import Path
 from build_support import Build,ROOT,TAGS,native_run,sha,write_bytes,program_image
 
@@ -21,8 +21,9 @@ class Job:
   data=json.loads((self.output/'data.json').read_text())
   for name,path in data.items():write_bytes(self.folder/name,Path(path).read_bytes())
   self.fragments={}
- def run(self,name,*args):
-  result=native_run(program_image(self.output/name),self.folder,args)
+ def run(self,name,*args,catalog_summary=False):
+  run_args=('--catalog-summary',args[-1]) if catalog_summary else args
+  result=native_run(program_image(self.output/name),self.folder,run_args)
   write_bytes(self.output/'fragments'/self.tag/(name+'-'+('-'.join(args) or 'data')+'.html'),result)
   return result
  def compose(self,name,parts,document=False,tag=None):
@@ -37,14 +38,16 @@ class Job:
   grid=self.compose('home_benchmark_cards',cards)
   tail=self.compose('home_benchmark_tail',{'domain':self.run('home_benchmark_domain_section',t),'evidence':self.run('home_benchmark_evidence',t)})
   bench=self.compose('home_benchmark_compose',{'intro':self.run('home_benchmark_intro','intro',t),'cards':grid,'scaling':self.run('home_benchmark_scaling_section',t),'runtime':self.run('home_benchmark_runtime_section',t),'compile':self.run('home_benchmark_compile_section',t),'remainder':tail})
-  chapters=self.compose('home_chapters_compose',{'opening':self.run('home_opening_chapters','opening',t),'evidence':self.run('home_evidence_template',t),'benchmark':bench,'developer':self.run('home_developer_template',t),'library':self.run('home_library','library',t),'closing':self.run('home_closing_chapter','closing',t)})
-  body=self.compose('home_body_compose',{'shell':self.run('home_body_shell',t),'hero':self.run('home_command','hero',t),'chapters':chapters,'scripts':self.run('home_script_bundle')})
+  chapters=self.compose('home_chapters_compose',{'opening':self.run('home_opening_chapters','opening',t),'evidence':self.run('home_evidence_template',t),'benchmark':bench,'developer':self.run('home_developer_template',t),'library':self.run('home_library','library',t,catalog_summary=True),'closing':self.run('home_closing_chapter','closing',t)})
+  scripts=(self.output/'home-scripts.html').read_bytes()
+  write_bytes(self.output/'fragments'/t/'home_script_bundle-data.html',scripts)
+  body=self.compose('home_body_compose',{'shell':self.run('home_body_shell',t),'hero':self.run('home_command','hero',t),'chapters':chapters,'scripts':scripts})
   doc=self.compose('home_document',{'head':self.run('home_head',t),'body':body},True)
   self.publish(('' if t=='en' else t+'/')+'index.html',doc)
   print(t,'home',len(doc),flush=True)
  def library(self):
   t=self.tag;write_bytes(self.folder/'rows.html',(self.output/'rows.html').read_bytes())
-  body=self.compose('library_body_compose',{'shell':self.run('library_body_shell',t),'hero':self.run('library_hero','top',t),'identity':self.run('library_static_section','identity',t),'publish':self.run('library_publish','publish',t),'catalog':self.run('library_catalog_section',t),'status':self.run('library_status','status',t),'compare':self.run('library_static_section','compare',t)})
+  body=self.compose('library_body_compose',{'shell':self.run('library_body_shell',t),'hero':self.run('library_hero','top',t),'identity':self.run('library_static_section','identity',t),'publish':self.run('library_publish','publish',t),'catalog':self.run('library_catalog_section',t,catalog_summary=True),'status':self.run('library_status','status',t),'compare':self.run('library_static_section','compare',t)})
   doc=self.compose('library_document',{'head':self.run('library_head',t),'body':body},True)
   self.publish(('' if t=='en' else t+'/')+'libraries/index.html',doc)
   print(t,'libraries',len(doc),flush=True)
@@ -60,10 +63,17 @@ class Job:
   if t=='en':self.publish('spec/org-identity/index.html',self.run('article_page','identity','en'))
   print(t,'sections complete',flush=True)
 
+ def start_pages(self):
+  for tag,path in [('en','start'),('ta','ta'),('uk','uk')]:
+   self.publish(path+'/index.html',self.compose('start_document',{'head':self.run('start_card_head',tag),'body':self.run('start_card_body',tag)},True,tag))
+
 def locale_job(output,tag):
- j=Job(output,tag);j.home();j.library();j.sections();return tag
+ j=Job(output,tag)
+ write_bytes(j.folder/'library-summary.tsv',(j.output/'library-summary.tsv').read_bytes())
+ j.home();j.library();j.sections();return tag
 
 def main():
+ start_time=time.monotonic()
  p=argparse.ArgumentParser(description=__doc__)
  for name in ['compiler','libraries','grammar','output']:p.add_argument('--'+name,type=Path,required=True)
  p.add_argument('--packager',type=Path);p.add_argument('--linux-inputs',type=Path)
@@ -77,13 +87,21 @@ def main():
  else:
   if not a.packager:raise ValueError('macOS profile requires --packager')
   b=Build(a.output,a.compiler,a.packager,a.libraries,a.grammar)
- for name in b.recipes:b.compile(name)
+ with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as pool:
+  for _ in pool.map(b.compile,b.recipes):pass
+ closures_done=time.monotonic()
  (b.output/'data.json').write_text(json.dumps({n:str(p) for n,p in b.data.items()},indent=2)+'\n')
- # Catalogue rows are rendered once natively and reused without translation.
- write_bytes(b.output/'rows.html',b.run('library_rows'))
+ ordered_tags=sorted(TAGS,key=lambda t:0 if t in ('en','ja') else 1)
+ j=Job(b.output,'extras')
  with concurrent.futures.ProcessPoolExecutor(max_workers=a.jobs) as pool:
-  pending={pool.submit(locale_job,str(b.output),t):t for t in TAGS[:a.jobs]}
-  rest=iter(TAGS[a.jobs:]);completed=[]
+  # These producers use independent input directories. The same worker limit
+  # applies to the shared preparation, start pages and locale rendering.
+  shared_outputs={'library_rows':'rows.html','library_summary':'library-summary.tsv','home_script_bundle':'home-scripts.html'}
+  prep={name:pool.submit(native_run,program_image(b.output/name),b.output/name) for name in shared_outputs}
+  start_pages=pool.submit(j.start_pages)
+  for name,filename in shared_outputs.items():write_bytes(b.output/filename,prep[name].result())
+  pending={pool.submit(locale_job,str(b.output),t):t for t in ordered_tags[:a.jobs]}
+  rest=iter(ordered_tags[a.jobs:]);completed=[]
   while pending:
    done,_=concurrent.futures.wait(pending,return_when=concurrent.futures.FIRST_COMPLETED)
    for future in done:
@@ -95,10 +113,8 @@ def main():
      raise
     following=next(rest,None)
     if following:pending[pool.submit(locale_job,str(b.output),following)]=following
+  start_pages.result()
  if set(completed)!=set(TAGS):raise ValueError('locale set mismatch')
- j=Job(b.output,'extras')
- for tag,path in [('en','start'),('ta','ta'),('uk','uk')]:
-  j.publish(path+'/index.html',j.compose('start_document',{'head':j.run('start_card_head',tag),'body':j.run('start_card_body',tag)},True,tag))
  static=json.loads((ROOT/'site/native/build-static-assets.json').read_text())
  for dest,source,pin in static:
   path=(ROOT/source).resolve(strict=True)
@@ -117,8 +133,14 @@ def main():
  b.finish()
  files={str(f.relative_to(b.output/'candidate')):sha(f) for f in sorted((b.output/'candidate').rglob('*')) if f.is_file()}
  if len(files)!=189 or len(pages)!=133:raise ValueError(('release route count',len(files),len(pages)))
- receipt={'status':'BUILT_NATIVE_SITE_CANDIDATE','files':files,'htmlPages':len(pages),'locales':list(TAGS),'compilerSha256':sha(b.compiler),'packagerSha256':sha(b.packager),'inputsSha256':sha(b.output/'inputs.json'),'cljkInvoked':False,'published':False,'profile':getattr(b,'profile','macOS-ARM64')}
+ receipt={'status':'BUILT_NATIVE_SITE_CANDIDATE','files':files,'htmlPages':len(pages),'locales':list(TAGS),'compilerSha256':sha(b.compiler),'packagerSha256':sha(b.packager),'inputsSha256':sha(b.output/'inputs.json'),'cljkInvoked':False,'published':False,'profile':getattr(b,'profile','macOS-ARM64'),'elapsedSeconds':round(time.monotonic()-start_time,2)}
  (b.output/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(receipt['status'],len(files),flush=True)
+ site_done=time.monotonic()
  from docs_build import extend
  extend(b.output,a.compiler,a.packager,a.libraries,a.grammar,a.linux_inputs)
+ (b.output/'builder-timing.json').write_text(json.dumps({
+  'closure_compilation':closures_done-start_time,
+  'locale_generation':site_done-closures_done,
+  'docs_generation':time.monotonic()-site_done,
+ },indent=2)+'\n')
 if __name__=='__main__':main()

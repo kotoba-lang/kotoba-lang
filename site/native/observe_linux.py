@@ -15,6 +15,7 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 import time
 from build_support import ALIASES, ROOT, sha, write_bytes
 
@@ -36,6 +37,7 @@ class Observation:
     def __init__(self, out, compiler, explicit_caps):
         self.out, self.compiler, self.explicit_caps = out, compiler, explicit_caps
         self.calls = []
+        self._lock = threading.Lock()
 
     def invoke(self, name, image, folder, argv=(), allow='35,37,38,39', structured=False):
         env = dict(PATH='/nonexistent', LANG='C', KEXE_ALLOW=allow,
@@ -57,8 +59,9 @@ class Observation:
                    stdoutSha256=hashlib.sha256(stdout).hexdigest(),
                    stderrSha256=hashlib.sha256(stderr).hexdigest(), stderrTail=stderr[-600:].decode(errors='replace'),
                    PATH=env['PATH'], allow=allow, scope=str(folder))
-        self.calls.append(row)
-        (self.out / 'calls.json').write_text(json.dumps(self.calls, indent=2) + '\n')
+        with self._lock:
+            self.calls.append(row)
+            (self.out / 'calls.json').write_text(json.dumps(self.calls, indent=2) + '\n')
         return row, stdout, stderr
 
     def compile(self, name, sources, entry, capabilities='35,37,38,39'):
