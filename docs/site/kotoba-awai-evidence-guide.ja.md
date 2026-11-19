@@ -1,6 +1,6 @@
 # KotobaとAwaiを試す前に：使い方、測定、経済圏を区別する
 
-更新：2026年11月18日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
+更新：2026年11月19日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
 
 ## 読み方と索引
 
@@ -66,6 +66,18 @@ PCガイドの対象は固定Ryzen 7 7735HS Desktopです。他PCや以前の660
 
 ## 成長、課題解決、社会的価値をどう測るか
 
+### 手元で整理する仕事から始める
+
+Android READMEにある開発用アプリを使うなら、まず自分の入力と判断を整理する小さな課題を選べます。次の使い方は編集上の提案で、利用者の成果を測った実績ではありません。Storeへの登録条件や開発APKの記述は、全端末への一般配布・実運用の合格とは別です。[E6]
+
+| 課題の例 | 資料が記述する機能と試す範囲 | 境界 |
+|---|---|---|
+| 面談の準備 | Deaiに自分で入力した候補を整理し、比較理由を言葉にする | 端末内のdraft/rankingで、利用者間の連絡を提供しない。 |
+| 自分の応募・自社採用の確認 | Hiringでdraftの内容とbody digestを照合し、承認か理由付き差戻しを判断する | appは外部応募・求人投稿・送信を実行しない。採用成果の保証ではない。 |
+| 公開情報の見直し | Kumadeの宣言済みCommon Crawl読取りと、端末内index/searchで根拠を探す | 読取りごとに同意が必要。capture service停止中は任意URL取得・crawlが無効。 |
+
+アプリのsource・Android host・build・test・package identity・releaseは各owning repository、Awai OSはOS統合、発見、Store catalogと署名検証を担うという責務分担です。リンク先やsource移動だけからAPK配布・既存データを保つupgradeの完了を推測しません。[E15]
+
 個人の学習では、出力42→43の変化と拒否理由を自分の言葉で説明することを小さな課題にできます。「再現可能な入力・出力・権限を確認する練習が理解を助ける」は編集上の仮説です。前後の正答率、再現までの時間、拒否理由の説明の正確性で確かめます。改善率の実績は今回の資料からは確認できません。
 
 組織では定型処理一件の所要時間と修正時間、失敗・unknown・重複作用の件数、追跡可能なreceiptの割合を導入前後で比較します。分散化の社会的価値も、可用性、参加機器費、電力、運用負担、アクセス格差を同時に測る必要があります。ノード数だけを社会貢献の証明にしません。これらは評価提案で、製品が既に達成した効果ではありません。
@@ -90,6 +102,19 @@ Murakumo READMEには11月15〜16日のMetal推論測定が加わりました。
 **実装の記述と残る信頼基盤：** Amu入門はdigest照合、mainの型、再生成比較、子プロセス期限を記述しますが、一般package/resolver/Darwin runtime互換は未完了です。runtime、OS、鍵管理、artifact配布は信頼基盤に残ります。AOSPの権限機構、Storeの署名確認、ユーザーの操作ごとの同意も異なる境界です。debug署名を本番の鍵回転・失効運用と同一視しません。[S3,E6]
 
 画面付きdappをMCP Apps型iframe・postMessage JSON-RPCと操作別同意で取り込む方針はありますが、取り込み実装は公開方針で未完了です。agent向けtoolのHermes mcp_servers経路とも区別します。これらから速度や安全性を絶対保証できません。[E4]
+
+### 「静けさ」は、証拠条件を持つ製品原則
+
+11月19日確認のAwai READMEは、Awai OS・Awai Network・Murakumoの共通原則として「静けさ」を掲げています。同じREADMEは明示的に、これらを証拠gateのある方向性であり、release済み保証ではないとします。以下の確認案は編集上の評価提案で、ここで実施した試験ではありません。[S2]
+
+| READMEが掲げる方向 | 何を区別して確認するか |
+|---|---|
+| private message/mail/post/fileのE2E暗号化 | 送受信端末での鍵管理、平文を扱う境界、復旧・失効、metadata漏えいをそれぞれ試験する。暗号化blockの保存だけで全通信のE2E完成としない。 |
+| OSとdefault appの広告・広告追跡なし | 対象buildのSDK、広告identifier、実際の通信を調べる。OS/default appの原則を、関連する全サイトや外部サービスに広げない。 |
+| 他の参加者には仮名、home IPを非開示 | 相手peer・relay・運用者・攻撃者の観測範囲を分け、IP/metadataを試験する。責任主体を限定case processで追跡する方向は、無条件の匿名性とは別。 |
+| 端末内state・local inference既定と外部操作別同意 | 使用したapp/model/経路で、拒否時の通信ゼロ、同意対象の限定、外部providerへ渡すデータを確認する。local既定だけから全操作offlineとはしない。 |
+
+公開storage契約は、AwaiFS/WNFSのprivate snapshot、Kotobaseの関係・派生index、Yataverseの暗号化block、Networkの転送・保持を別の責務として記述します。CID照合は内容の整合性、操作権限は誰が何をできるか、復号鍵は誰が平文を読めるか、保持・復元は後で取り出せるかという別の確認です。受領receiptを独立replicaや災害復旧の完成へ読み替えません。現行bounded owner-storeとWNFS移行も別のwire profile・readback/release証拠を持ちます。これは公開契約を読んだ説明で、リンク先のprivate実装を検証したものではありません。[E16]
 
 ## トークンの用途と価値の成立条件
 
@@ -126,17 +151,23 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 ### AIOは学習・検索掲載を保証する？
 ここでのAIOは、定義、短い回答、条件、更新日、固定出典を読みやすく整える編集です。APIへ資料を送ることはupstreamモデルの学習、検索掲載、推薦を保証しません。非公開資料や秘密を送ってよいという意味でもありません。
 
+### 「静けさ」があれば誰にも追跡されない？
+いいえ。READMEは証拠gateのある設計方向です。仮名、peerへのIP非開示、責任主体を追跡する限定case process、運用者や端末侵害に対する保護は別です。全経路の匿名性やE2E完成を保証しません。[S2]
+
+### 検索結果はいつのファイルを見ている？
+公開storage契約ではindexを開いたsnapshotとKotobase basisに対応づけます。新root取込み中の古いindexを「最新結果」として返さず、既知basisか利用不能を示す方針です。実appがその契約を満たすかはsnapshot readback・index再構築・通信拒否・復元の受入で確かめます。[E16]
+
 ## 固定出典索引
 
 基本の公開6資料はモデル用入力と同じ構成です。E資料は編集校閲のみで、free-model runnerの入力に追加していません。private cloud-itonamiは使用していません。Itonamiの説明は公開Murakumo資料の範囲であり、非公開guideを読んだものではありません。
 
-- **S1** [kotoba-lang/kotoba/README.md](https://github.com/kotoba-lang/kotoba/blob/1c9564cb79ca5d2f1e0f39b3d5c7bdf1a7ed1f9b/README.md)
+- **S1** [kotoba-lang/kotoba/README.md](https://github.com/kotoba-lang/kotoba/blob/44c9df8e83d1d00fbe4e91e5ae86bd7851420614/README.md)
 
-  commit `1c9564cb79ca5d2f1e0f39b3d5c7bdf1a7ed1f9b`; SHA256 `9834361249aa4e357bef8da5f08e86911e70a8af97c1f9feaf98813ecc346574`
+  commit `44c9df8e83d1d00fbe4e91e5ae86bd7851420614`; SHA256 `9834361249aa4e357bef8da5f08e86911e70a8af97c1f9feaf98813ecc346574`
 
-- **S2** [network-awai/awai-os/README.md](https://github.com/network-awai/awai-os/blob/91edfa94de2ae7d48ca93a7958d47a4951c157a8/README.md)
+- **S2** [network-awai/awai-os/README.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/README.md)
 
-  commit `91edfa94de2ae7d48ca93a7958d47a4951c157a8`; SHA256 `96eb64c7ee9a1f36ff5ceaf20d4c9d5c29e4f72eed58cdb4f1943e2e44729ed9`
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `fd96b165957dd308f5ad674f36057187bc7855d2432c49e593d6136cd6bbe1f1`
 
 - **S3** [kotoba-lang/amu/examples/foundation-starter/MACOS-ARM64.md](https://github.com/kotoba-lang/amu/blob/d121f176c2ff92b5699fa11e0ae891dca6fd7576/examples/foundation-starter/MACOS-ARM64.md)
 
@@ -150,9 +181,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `cf6c7ebb5c3c5759e4caf7d27fdee8309987b052`; SHA256 `d2dfd1d50ae1ee27611ff99e65accf575a93e1e973edfcf6b106b66ecc0c7ddd`
 
-- **S6** [kotoba-lang/kotoba/lib/kotoba.aiueos/90-docs/adr/0274-awai-os-is-an-aiueos-distribution.md](https://github.com/kotoba-lang/kotoba/blob/1c9564cb79ca5d2f1e0f39b3d5c7bdf1a7ed1f9b/lib/kotoba.aiueos/90-docs/adr/0274-awai-os-is-an-aiueos-distribution.md)
+- **S6** [kotoba-lang/kotoba/lib/kotoba.aiueos/90-docs/adr/0274-awai-os-is-an-aiueos-distribution.md](https://github.com/kotoba-lang/kotoba/blob/44c9df8e83d1d00fbe4e91e5ae86bd7851420614/lib/kotoba.aiueos/90-docs/adr/0274-awai-os-is-an-aiueos-distribution.md)
 
-  commit `1c9564cb79ca5d2f1e0f39b3d5c7bdf1a7ed1f9b`; SHA256 `26c071fcb25ec17bca352e7583846ab715b87922f99b5369c02c9e8f56f4cadb`
+  commit `44c9df8e83d1d00fbe4e91e5ae86bd7851420614`; SHA256 `26c071fcb25ec17bca352e7583846ab715b87922f99b5369c02c9e8f56f4cadb`
 
 - **E1** [network-awai/awai-os/docs/otehon/install-guide-ja.md](https://github.com/network-awai/awai-os/blob/ea69f795c7bbbc0f0eba436f41c4f4b8423a34ee/docs/otehon/install-guide-ja.md)
 
@@ -162,21 +193,21 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `ea69f795c7bbbc0f0eba436f41c4f4b8423a34ee`; SHA256 `4c9bde66113afc3bd6e65cc12612cb38b5823e5b74fc4bbd8b492d9ba5f37802`
 
-- **E3** [network-awai/awai-os/docs/evidence/otehon-installer-release-0.7.3.json](https://github.com/network-awai/awai-os/blob/91edfa94de2ae7d48ca93a7958d47a4951c157a8/docs/evidence/otehon-installer-release-0.7.3.json)
+- **E3** [network-awai/awai-os/docs/evidence/otehon-installer-release-0.7.3.json](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/evidence/otehon-installer-release-0.7.3.json)
 
-  commit `91edfa94de2ae7d48ca93a7958d47a4951c157a8`; SHA256 `76f51bb160eb3063797dc841e23e6af3fd7a14e84a99fbfd2dbe92144e3677a7`
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `76f51bb160eb3063797dc841e23e6af3fd7a14e84a99fbfd2dbe92144e3677a7`
 
-- **E4** [network-awai/awai-os/AGENTS.md](https://github.com/network-awai/awai-os/blob/91edfa94de2ae7d48ca93a7958d47a4951c157a8/AGENTS.md)
+- **E4** [network-awai/awai-os/AGENTS.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/AGENTS.md)
 
-  commit `91edfa94de2ae7d48ca93a7958d47a4951c157a8`; SHA256 `fec4b18101cee9a08dea8008ce866e389f56e6430075f7d93642d6fcab059976`
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `c0fc2c282c2241758c1b25ac75583014274e36a2c87cd1048fc510c57b3b914b`
 
-- **E5** [network-awai/awai-os/docs/otehon/aosp-platform-decision-20261117.md](https://github.com/network-awai/awai-os/blob/91edfa94de2ae7d48ca93a7958d47a4951c157a8/docs/otehon/aosp-platform-decision-20261117.md)
+- **E5** [network-awai/awai-os/docs/otehon/aosp-platform-decision-20261117.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/otehon/aosp-platform-decision-20261117.md)
 
-  commit `91edfa94de2ae7d48ca93a7958d47a4951c157a8`; SHA256 `0299ceaeb5b07e2623c2f22b5f055570de2a5427d833379115c413d792ea8cb9`
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `0299ceaeb5b07e2623c2f22b5f055570de2a5427d833379115c413d792ea8cb9`
 
-- **E6** [network-awai/awai-os/android/README.md](https://github.com/network-awai/awai-os/blob/91edfa94de2ae7d48ca93a7958d47a4951c157a8/android/README.md)
+- **E6** [network-awai/awai-os/android/README.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/android/README.md)
 
-  commit `91edfa94de2ae7d48ca93a7958d47a4951c157a8`; SHA256 `b23a43d1e79a4e395062b2645cb8b3aa0146b1596a0def9b62fa91a9d2369d87`
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `14caab3e7d2a5efb33cbf3248d7acfef8e5df2dadebf903da8bb00d074fbacf2`
 
 - **E7** [kotoba-lang/murakumo/bench/results/2026-11-15-e2-decode/README.md](https://github.com/kotoba-lang/murakumo/blob/69927a5f67f9641f81e3d27065dbf27d9c3fd026/bench/results/2026-11-15-e2-decode/README.md)
 
@@ -190,17 +221,17 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `5c9aa0254bab5a23326823fcead72ec510e5715d`; SHA256 `c69f17ea0c5fd08fec7497f981c23b405de1d6282464c5af1d5a6feb8e3b33ed`
 
-- **E10** [network-awai/awai-os/release.json](https://github.com/network-awai/awai-os/blob/91edfa94de2ae7d48ca93a7958d47a4951c157a8/release.json)
+- **E10** [network-awai/awai-os/release.json](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/release.json)
 
-  commit `91edfa94de2ae7d48ca93a7958d47a4951c157a8`; SHA256 `9eb9fd3c70c9192c74a36890e2d74de2076d5648f92c13c3b868d3d79d6f3753`
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `9eb9fd3c70c9192c74a36890e2d74de2076d5648f92c13c3b868d3d79d6f3753`
 
-- **E11** [network-awai/awai-os/android/BOOT.md](https://github.com/network-awai/awai-os/blob/91edfa94de2ae7d48ca93a7958d47a4951c157a8/android/BOOT.md)
+- **E11** [network-awai/awai-os/android/BOOT.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/android/BOOT.md)
 
-  commit `91edfa94de2ae7d48ca93a7958d47a4951c157a8`; SHA256 `9500f37e2ec1a81741b9de0b888a49a7672ed83885b1963d54206ce4d46a84e3`
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `9500f37e2ec1a81741b9de0b888a49a7672ed83885b1963d54206ce4d46a84e3`
 
-- **E12** [network-awai/awai-os/docs/otehon/nixos-route-deprecation-20261117.md](https://github.com/network-awai/awai-os/blob/91edfa94de2ae7d48ca93a7958d47a4951c157a8/docs/otehon/nixos-route-deprecation-20261117.md)
+- **E12** [network-awai/awai-os/docs/otehon/nixos-route-deprecation-20261117.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/otehon/nixos-route-deprecation-20261117.md)
 
-  commit `91edfa94de2ae7d48ca93a7958d47a4951c157a8`; SHA256 `d0a2b84586ab9f49e56e008ca03969e022f1ca0555da2e1fc353857062506dd3`
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `d0a2b84586ab9f49e56e008ca03969e022f1ca0555da2e1fc353857062506dd3`
 
 - **E13** [kotoba-lang/murakumo/bench/results/2026-11-17-qwen35-dhead/README.md](https://github.com/kotoba-lang/murakumo/blob/69927a5f67f9641f81e3d27065dbf27d9c3fd026/bench/results/2026-11-17-qwen35-dhead/README.md)
 
@@ -209,3 +240,11 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 - **E14** [kotoba-lang/murakumo/bench/results/2026-11-17-qwen35-dflash-2/README.md](https://github.com/kotoba-lang/murakumo/blob/69927a5f67f9641f81e3d27065dbf27d9c3fd026/bench/results/2026-11-17-qwen35-dflash-2/README.md)
 
   commit `69927a5f67f9641f81e3d27065dbf27d9c3fd026`; SHA256 `ac35ad244981676b4fde98d4a736d17d5152d6bf6bff194ef3f805e010fd1955`
+
+- **E15** [network-awai/awai-os/docs/app-ownership.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/app-ownership.md)
+
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `cef6375544202bd06606e4551f7d4392b3187f5120aab1238d5032df9763d541`
+
+- **E16** [network-awai/awai-os/docs/otehon/app-storage.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/otehon/app-storage.md)
+
+  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `307964393c72da0ca544c3826d859d5142424e26361f060c5ad21e03921a42e0`
