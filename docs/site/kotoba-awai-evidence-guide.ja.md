@@ -1,6 +1,6 @@
 # KotobaとAwaiを試す前に：使い方、測定、経済圏を区別する
 
-更新：2026年11月19日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
+更新：2026年11月20日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
 
 ## 読み方と索引
 
@@ -77,6 +77,8 @@ Android READMEにある開発用アプリを使うなら、まず自分の入力
 | 公開情報の見直し | Kumadeの宣言済みCommon Crawl読取りと、端末内index/searchで根拠を探す | 読取りごとに同意が必要。capture service停止中は任意URL取得・crawlが無効。 |
 
 アプリのsource・Android host・build・test・package identity・releaseは各owning repository、Awai OSはOS統合、発見、Store catalogと署名検証を担うという責務分担です。リンク先やsource移動だけからAPK配布・既存データを保つupgradeの完了を推測しません。[E15]
+
+11月20日確認の所有権資料では、Yoteiの製品側は `network-awai/app-yotei`、Android IDは `network.itonami.yotei`。Awai OS側にはHome agenda consumerとStore検証が残ります。旧in-tree buildを退役させる条件は、互換性のある署名済みAPKのStore readbackと、同じsignerでの更新が既存agenda・Home表示を保つ受入です。リポジトリ移動を理由に手元のカレンダーを消したり、移行完了と判断したりしません。この資料は移行条件であり、この記事による端末受入の結果ではありません。[E15]
 
 個人の学習では、出力42→43の変化と拒否理由を自分の言葉で説明することを小さな課題にできます。「再現可能な入力・出力・権限を確認する練習が理解を助ける」は編集上の仮説です。前後の正答率、再現までの時間、拒否理由の説明の正確性で確かめます。改善率の実績は今回の資料からは確認できません。
 
@@ -156,6 +158,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
 ### 検索結果はいつのファイルを見ている？
 公開storage契約ではindexを開いたsnapshotとKotobase basisに対応づけます。新root取込み中の古いindexを「最新結果」として返さず、既知basisか利用不能を示す方針です。実appがその契約を満たすかはsnapshot readback・index再構築・通信拒否・復元の受入で確かめます。[E16]
+
+### Yoteiが別リポジトリへ移れば、予定は自動で引き継がれる？
+リポジトリ移動だけでは証明できません。package ID・signer・storage互換、Store readback、同じsignerでの更新、既存agendaとHome projectionの保持を確認します。公開所有権資料は旧build退役前の条件としてこれらを挙げています。[E15]
 
 ## 固定出典索引
 
@@ -241,10 +246,11 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `69927a5f67f9641f81e3d27065dbf27d9c3fd026`; SHA256 `ac35ad244981676b4fde98d4a736d17d5152d6bf6bff194ef3f805e010fd1955`
 
-- **E15** [network-awai/awai-os/docs/app-ownership.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/app-ownership.md)
+- **E15** [network-awai/awai-os/docs/app-ownership.md](https://github.com/network-awai/awai-os/blob/0497dc6d8dafc0cf7a701ae3b8ddb4cdf0b2c192/docs/app-ownership.md)
 
-  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `cef6375544202bd06606e4551f7d4392b3187f5120aab1238d5032df9763d541`
+  commit `0497dc6d8dafc0cf7a701ae3b8ddb4cdf0b2c192`; SHA256 `e271e4a96d9e8abff8bc98c5dd37c5e43989b6e29fc4dd1564a608ef55c7cd50`
 
 - **E16** [network-awai/awai-os/docs/otehon/app-storage.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/otehon/app-storage.md)
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `307964393c72da0ca544c3826d859d5142424e26361f060c5ad21e03921a42e0`
+
