@@ -24,7 +24,10 @@ HARD_CEILING_SECONDS = 1200.0
 DEFAULT_STAGE_BUDGETS = {
     'fetch': 60.0,
     'closure_compilation': 300.0,
-    'locale_generation': 600.0,
+    # Stopgap (Dev decision 2026-11-22, reversible): the stage measured 600-1015s on
+    # main and on unrelated branches, so 600s failed every run. The real fix
+    # (cache or runner size) is JUN-1443: https://linear.app/kotobalabs/issue/JUN-1443
+    'locale_generation': 900.0,
     'docs_generation': 180.0,
     'post_qualification': 180.0,
 }
@@ -236,7 +239,7 @@ def exercise_negative_controls():
          'FAIL_CLOUDFLARE_20M_TIMEOUT_EXCEEDED'),
         ('timeout-refusal-historical-overrun-1850s', 1850.0, 2.0, MAX_MEMORY_BYTES,
          'FAIL_CLOUDFLARE_20M_TIMEOUT_EXCEEDED'),
-        ('stage-budget-refusal', 700.0, DEFAULT_STAGE_BUDGETS['locale_generation'] + 1.0,
+        ('stage-budget-refusal', 1000.0, DEFAULT_STAGE_BUDGETS['locale_generation'] + 1.0,
          MAX_MEMORY_BYTES, 'FAIL_STAGE_BUDGET_EXCEEDED'),
         ('memory-ceiling-refusal', 500.0, 2.0, MAX_MEMORY_BYTES * 2,
          'FAIL_CLOUDFLARE_MEMORY_EXCEEDED'),
