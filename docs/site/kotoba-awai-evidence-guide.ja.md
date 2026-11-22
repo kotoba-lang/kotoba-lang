@@ -112,7 +112,7 @@ Murakumo READMEには11月15〜16日のMetal推論測定が加わりました。
 
 公開READMEは自動更新を段階実装中とし、現在は適格性の判定のみ、呼出し接続はまだなく、各installは人へ確認すると説明します。`UpdatePolicy`もI/Oやinstallを行わない判定で、同じpackage/signer、新しい版、検証済みcatalog/digest、新権限・外部操作なし、予算・承認期限などを確認します。判定が真でも、更新が実際に自動適用された証拠ではありません。[E6,E19]
 
-署名側にはnon-debuggableのrelease buildと、rootが署名するcatalog/pointer鍵リストの経路が加わりました。現行buildコードはAPK鍵とcatalog鍵の一致を拒否し、catalogは列挙された役割鍵、通常の同梱APKは設定されたAPK signerを照合します。これは本番鍵の発行・保管・rotationや端末更新受入が完了した意味ではありません。別signerのStoreを既存development Storeへそのまま更新できるとも考えません。[E6,E20]
+署名側にはnon-debuggableのrelease buildと、rootが署名するcatalog/pointer鍵リストの経路が加わりました。現行buildコードはAPKとcatalogに同じkeystoreパス・aliasを設定することを拒否し、catalogは列挙された役割鍵、通常の同梱APKは設定されたAPK signerを照合します。これは本番鍵の発行・保管・rotationや端末更新受入が完了した意味ではありません。別signerのStoreを既存development Storeへそのまま更新できるとも考えません。[E6,E20]
 
 鍵リスト設計には、一覧を受信できない間は失効が伝わらないこと、端末時計への依存、埋込rootを一覧だけでは更新できないことが残ります。Java/JSのvector一致やthrowaway-key testの記録は、その条件の実装検証であり、全端末・本番配布・紛失復旧の保証ではありません。この編集では秘密鍵へのアクセス、署名、APK buildや配布を実行していません。[E18]
 
@@ -229,9 +229,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `0299ceaeb5b07e2623c2f22b5f055570de2a5427d833379115c413d792ea8cb9`
 
-- **E6** [network-awai/awai-os/android/README.md](https://github.com/network-awai/awai-os/blob/0cb3e215c5b53737f67fb7b8e284062fb3d7f38a/android/README.md)
+- **E6** [network-awai/awai-os/android/README.md](https://github.com/network-awai/awai-os/blob/77511fac443f8bd6a9b96d8f0db6fdda766a2b2b/android/README.md)
 
-  commit `0cb3e215c5b53737f67fb7b8e284062fb3d7f38a`; SHA256 `9b08e0fe06df8c45516e9a7fcfb3db62a412d738e0410e98156d75e2b8c76f25`
+  commit `77511fac443f8bd6a9b96d8f0db6fdda766a2b2b`; SHA256 `6fcc4b3bbb41b66d9f4f9aba64292f27e5f5da1a9e5aa3e01056a19323ac40d4`
 
 - **E7** [kotoba-lang/murakumo/bench/results/2026-11-15-e2-decode/README.md](https://github.com/kotoba-lang/murakumo/blob/69927a5f67f9641f81e3d27065dbf27d9c3fd026/bench/results/2026-11-15-e2-decode/README.md)
 
