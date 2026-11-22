@@ -1,6 +1,6 @@
 # KotobaとAwaiを試す前に：使い方、測定、経済圏を区別する
 
-更新：2026年11月20日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
+更新：2026年11月22日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
 
 ## 読み方と索引
 
@@ -14,7 +14,10 @@
 |---|---|
 | Kotoba | 開発中の現代的なLisp machineの中心となる言語。プログラムをデータとして扱い、組み合わせて理解できるシステムを目指す。Amuがコンパイル、Kototamaが実行契約、AIUEOSがOSの方向を担う。統合機械全体の出荷完了を意味しない。[S1] |
 | Awai Network / Awai Node | ネットワークと参加ホスト。ノード登録は承認、ジョブ配置、有料実行、報酬の保証ではない。[S4] |
-| Itonami | 業務意図、tenant、安定したjob ID、期限と予算を扱う層。Murakumoが配置・計算を担う。公開job契約にはItonamiの期限が渡らず、その期限だけで計算は停止しない。[S4] |
+| Itonami（営） | 11月22日の公開方針ではbot実行基盤と、その上のbots。既存Murakumo資料の業務意図・tenant・安定job ID・予算/期限という役割も、個別job契約の範囲で読む。Murakumoの公開job契約にはItonami期限が渡らない。[E4,E17,S4] |
+| Manimani / Awai Home | Manimaniは営の上の既定bot、Homeは対話を中心とするOS入口という方針。Home内の対話表示方式やOS操作権限の分離には提案・未検証事項が残る。音声/記憶/推論やapp間MCPが全て接続済みという意味ではない。[E4,E17] |
+| Itonami dapp | bot profileを持ち、wallet・DID・自律稼働の要件を満たすという公開用語上の区分。名称だけで、そのbotの常駐・権限・wallet・実稼働を証明しない。[E4] |
+| Awai app | botを持たないTauri app。MCP/APIを出しても、それだけではItonami dappにならない。区分変更は操作同意や鍵保管の契約を緩めず、既存package IDやItonami Store名を一括改名する指示でもない。[E4] |
 | Awai OSの現在の製品方向 | 電話とデスクトップPCの主基盤はAndroid AOSP。Meijiは製品codename。NixOS desktop導入経路はdeprecatedで、過去資料はarchive。独自の署名済みAOSP ROMやOTAの公開完了とは別。[S2,E5,E10,E11,E12] |
 | Itonami OS / AIUEOS Native | 既存ADRはAIUEOSのAwai distributionをItonami OSと命名する。これは独立したselfhost適格化の方向であり、新しいAOSP製品方針や既存NixOSメディアと区別する。[S6,E5] |
 
@@ -25,6 +28,8 @@ AIUEOSの旧リポジトリはshellで、本体・資料はKotobaの `lib/kotoba
 **設計目標：** OSのライフサイクル、権限、通信、画面ロック、Keystore、ファイル暗号化はAOSP側、機器固有対応はBSP、Awai UIはローカル側、ItonamiはAndroid adapterを持つアプリ側という境界です。GMS/Playの利用権は自動的には得られません。[E5]
 
 **実装の記述：** Android開発用APKにはHome、Store、Yoteiがあります。HomeのHOME roleは既存launcherへ戻せます。Storeは署名済み同梱・オフラインを既定とし、package/version/signerの検査とAndroid自身のインストール確認を分けます。Yoteiはローカル永続カレンダーで、同期やremote inference、通知の完成を意味しません。[E6]
+
+11月22日の責務整理では、旧Core / Apps / System構成を今後も必ず保持するという方針が撤回され、OS設定はAndroid/Awai OS、個別appはHome/Storeから扱う方向です。責務文書全体は提案を含み、同日追記のowner整理と未決定の実装案を分けて読みます。Homeへの対話画面の埋込み、端末内MCP transport、権限分離やAndroid実機動作の案を、完成した利用手順へ置き換えません。[E4,E17]
 
 **未検証・未実装：** APK/VM/Liveの記録は本番ROM、署名OTA、全機種での永続導入、実アカウント移行の合格証ではありません。HomeとItonamiのWebViewストアは別で、共通sign-in、暗号化profile転送、同期は未実装です。PINは本人性や操作権限の根拠ではありません。Nix desktopの旧ファイル整理方針も、partition初期化や鍵・現Androidデータの消去許可ではありません。既存Node/fleetの運用とは別です。[E5,E6,E12]
 
@@ -103,6 +108,14 @@ Murakumo READMEには11月15〜16日のMetal推論測定が加わりました。
 
 **実装の記述と残る信頼基盤：** Amu入門はdigest照合、mainの型、再生成比較、子プロセス期限を記述しますが、一般package/resolver/Darwin runtime互換は未完了です。runtime、OS、鍵管理、artifact配布は信頼基盤に残ります。AOSPの権限機構、Storeの署名確認、ユーザーの操作ごとの同意も異なる境界です。debug署名を本番の鍵回転・失効運用と同一視しません。[S3,E6]
 
+### Storeの更新判定・署名実装と、本番運用を分ける
+
+公開READMEは自動更新を段階実装中とし、現在は適格性の判定のみ、呼出し接続はまだなく、各installは人へ確認すると説明します。`UpdatePolicy`もI/Oやinstallを行わない判定で、同じpackage/signer、新しい版、検証済みcatalog/digest、新権限・外部操作なし、予算・承認期限などを確認します。判定が真でも、更新が実際に自動適用された証拠ではありません。[E6,E19]
+
+署名側にはnon-debuggableのrelease buildと、rootが署名するcatalog/pointer鍵リストの経路が加わりました。現行buildコードはAPK鍵とcatalog鍵の一致を拒否し、catalogは列挙された役割鍵、通常の同梱APKは設定されたAPK signerを照合します。これは本番鍵の発行・保管・rotationや端末更新受入が完了した意味ではありません。別signerのStoreを既存development Storeへそのまま更新できるとも考えません。[E6,E20]
+
+鍵リスト設計には、一覧を受信できない間は失効が伝わらないこと、端末時計への依存、埋込rootを一覧だけでは更新できないことが残ります。Java/JSのvector一致やthrowaway-key testの記録は、その条件の実装検証であり、全端末・本番配布・紛失復旧の保証ではありません。この編集では秘密鍵へのアクセス、署名、APK buildや配布を実行していません。[E18]
+
 画面付きdappをMCP Apps型iframe・postMessage JSON-RPCと操作別同意で取り込む方針はありますが、取り込み実装は公開方針で未完了です。agent向けtoolのHermes mcp_servers経路とも区別します。これらから速度や安全性を絶対保証できません。[E4]
 
 ### 「静けさ」は、証拠条件を持つ製品原則
@@ -153,6 +166,12 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 ### AIOは学習・検索掲載を保証する？
 ここでのAIOは、定義、短い回答、条件、更新日、固定出典を読みやすく整える編集です。APIへ資料を送ることはupstreamモデルの学習、検索掲載、推薦を保証しません。非公開資料や秘密を送ってよいという意味でもありません。
 
+### Itonami dappとAwai appは何が違う？
+公開用語の基準はbot profileの有無です。Itonami dappにはwallet・DID・自律稼働の要件が加わります。Awai appはbotなしのTauri appで、MCP/APIを持つ場合もあります。名称やcatalog登録は実稼働・権限の証拠ではありません。[E4]
+
+### Storeの更新判定やrelease署名があれば自動更新・本番配布も完成？
+いいえ。判定とinstallへの接続、署名役割と本番鍵運用、署名済みartifactと実端末更新は別です。公開READMEは自動更新判定の未接続と、人によるinstall確認を明記しています。[E6,E18,E19,E20]
+
 ### 「静けさ」があれば誰にも追跡されない？
 いいえ。READMEは証拠gateのある設計方向です。仮名、peerへのIP非開示、責任主体を追跡する限定case process、運用者や端末侵害に対する保護は別です。全経路の匿名性やE2E完成を保証しません。[S2]
 
@@ -202,17 +221,17 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `76f51bb160eb3063797dc841e23e6af3fd7a14e84a99fbfd2dbe92144e3677a7`
 
-- **E4** [network-awai/awai-os/AGENTS.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/AGENTS.md)
+- **E4** [network-awai/awai-os/AGENTS.md](https://github.com/network-awai/awai-os/blob/be937cdae28b93046a47d939cb5263647fe457c7/AGENTS.md)
 
-  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `c0fc2c282c2241758c1b25ac75583014274e36a2c87cd1048fc510c57b3b914b`
+  commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `90c052fbb50d9262dcf5fd0f3bbf5048c69c234cfe16eb61a1ec1d8050555caa`
 
 - **E5** [network-awai/awai-os/docs/otehon/aosp-platform-decision-20261117.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/otehon/aosp-platform-decision-20261117.md)
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `0299ceaeb5b07e2623c2f22b5f055570de2a5427d833379115c413d792ea8cb9`
 
-- **E6** [network-awai/awai-os/android/README.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/android/README.md)
+- **E6** [network-awai/awai-os/android/README.md](https://github.com/network-awai/awai-os/blob/0cb3e215c5b53737f67fb7b8e284062fb3d7f38a/android/README.md)
 
-  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `14caab3e7d2a5efb33cbf3248d7acfef8e5df2dadebf903da8bb00d074fbacf2`
+  commit `0cb3e215c5b53737f67fb7b8e284062fb3d7f38a`; SHA256 `9b08e0fe06df8c45516e9a7fcfb3db62a412d738e0410e98156d75e2b8c76f25`
 
 - **E7** [kotoba-lang/murakumo/bench/results/2026-11-15-e2-decode/README.md](https://github.com/kotoba-lang/murakumo/blob/69927a5f67f9641f81e3d27065dbf27d9c3fd026/bench/results/2026-11-15-e2-decode/README.md)
 
@@ -254,3 +273,18 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `307964393c72da0ca544c3826d859d5142424e26361f060c5ad21e03921a42e0`
 
+- **E17** [network-awai/awai-os/docs/otehon/home-itonami-manimani-responsibilities-20261122.md](https://github.com/network-awai/awai-os/blob/be937cdae28b93046a47d939cb5263647fe457c7/docs/otehon/home-itonami-manimani-responsibilities-20261122.md)
+
+  commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `84c5c979974a6a799e1629006ec3fccbfb6edab52de62b4387a6c18b581f50fd`
+
+- **E18** [network-awai/awai-os/docs/otehon/itonami-store-key-list-design-20261122.md](https://github.com/network-awai/awai-os/blob/be937cdae28b93046a47d939cb5263647fe457c7/docs/otehon/itonami-store-key-list-design-20261122.md)
+
+  commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `1bccf8ebecb5175a047b7680b241aa523c181de0ed1c860da3252862e39dbb6a`
+
+- **E19** [network-awai/awai-os/android/shared/src/network/awai/platform/UpdatePolicy.java](https://github.com/network-awai/awai-os/blob/be937cdae28b93046a47d939cb5263647fe457c7/android/shared/src/network/awai/platform/UpdatePolicy.java)
+
+  commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `8de6a73caf8f6814ae1b78d399fb1494ad701275f3df0f54dc8e6fac756151e2`
+
+- **E20** [network-awai/awai-os/android/build.py](https://github.com/network-awai/awai-os/blob/be937cdae28b93046a47d939cb5263647fe457c7/android/build.py)
+
+  commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `85fb01419bea20dcb3fd09b48d63b57b3d9db7bb611fcfc4f387c5eef1af3c15`
