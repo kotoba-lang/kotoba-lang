@@ -1,6 +1,6 @@
 # KotobaとAwaiを試す前に：使い方、測定、経済圏を区別する
 
-更新：2026年11月22日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
+更新：2026年11月23日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
 
 ## 読み方と索引
 
@@ -80,8 +80,14 @@ Android READMEにある開発用アプリを使うなら、まず自分の入力
 | 面談の準備 | Deaiに自分で入力した候補を整理し、比較理由を言葉にする | 端末内のdraft/rankingで、利用者間の連絡を提供しない。 |
 | 自分の応募・自社採用の確認 | Hiringでdraftの内容とbody digestを照合し、承認か理由付き差戻しを判断する | appは外部応募・求人投稿・送信を実行しない。採用成果の保証ではない。 |
 | 公開情報の見直し | Kumadeの宣言済みCommon Crawl読取りと、端末内index/searchで根拠を探す | 読取りごとに同意が必要。capture service停止中は任意URL取得・crawlが無効。 |
+| 自分の送金指示の事前確認 | Payment Draftsで自分の指示を下書きし、XML previewと対象subsetのL1構文検査を確認する | 端末内の下書き・レビュー。銀行への送信・署名・支払いを行わず、銀行の受理は未検証。[E21] |
+| 自分の証券決済・保有記録の確認 | Securities Draftsで自分の決済指示を下書きし、読込んだ保管明細と自分の保有数量を照合する | 発注・送信・署名・資産移動を行わない。照合結果は入力された記録の比較で、残高や決済完了の証明ではない。[E22] |
 
 アプリのsource・Android host・build・test・package identity・releaseは各owning repository、Awai OSはOS統合、発見、Store catalogと署名検証を担うという責務分担です。リンク先やsource移動だけからAPK配布・既存データを保つupgradeの完了を推測しません。[E15]
+
+11月23日のStore buildにはPayment Drafts／Securities DraftsのAPK取込み入口が加わっています。package・signer・40 MiB上限と権限を検査し、INTERNETを要求するものを拒否するコードを確認しました。取込みコードの存在を、署名済み一般配布や全端末の受入とは扱いません。[E6,E20]
+
+両appでの `approved` は利用者が下書きをレビューしたという状態です。取引実行を意味しません。公開資料が記述する検査は、モデル化されたXML subsetのL1までで、業務慣行・usage guidelineのL2、銀行・保管機関・決済システムの受理のL3は別です。読めない保存データをread-onlyにする保護も記述されていますが、この編集では実データの入力、下書き承認、金融機関への送信、署名や資産移動を実行していません。[E21,E22]
 
 11月20日確認の所有権資料では、Yoteiの製品側は `network-awai/app-yotei`、Android IDは `network.itonami.yotei`。Awai OS側にはHome agenda consumerとStore検証が残ります。旧in-tree buildを退役させる条件は、互換性のある署名済みAPKのStore readbackと、同じsignerでの更新が既存agenda・Home表示を保つ受入です。リポジトリ移動を理由に手元のカレンダーを消したり、移行完了と判断したりしません。この資料は移行条件であり、この記事による端末受入の結果ではありません。[E15]
 
@@ -172,6 +178,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 ### Storeの更新判定やrelease署名があれば自動更新・本番配布も完成？
 いいえ。判定とinstallへの接続、署名役割と本番鍵運用、署名済みartifactと実端末更新は別です。公開READMEは自動更新判定の未接続と、人によるinstall確認を明記しています。[E6,E18,E19,E20]
 
+### Payment DraftsのapprovedやL1合格は、送金・決済完了？
+いいえ。approvedは端末内のレビュー記録、L1は対象XML subsetの構文検査です。両Drafts appは外部操作を宣言せず、送金・発注・署名・資産移動を行いません。L2の業務慣行とL3の金融機関受理は別の検証です。[E21,E22]
+
 ### 「静けさ」があれば誰にも追跡されない？
 いいえ。READMEは証拠gateのある設計方向です。仮名、peerへのIP非開示、責任主体を追跡する限定case process、運用者や端末侵害に対する保護は別です。全経路の匿名性やE2E完成を保証しません。[S2]
 
@@ -221,17 +230,17 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `76f51bb160eb3063797dc841e23e6af3fd7a14e84a99fbfd2dbe92144e3677a7`
 
-- **E4** [network-awai/awai-os/AGENTS.md](https://github.com/network-awai/awai-os/blob/be937cdae28b93046a47d939cb5263647fe457c7/AGENTS.md)
+- **E4** [network-awai/awai-os/AGENTS.md](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/AGENTS.md)
 
-  commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `90c052fbb50d9262dcf5fd0f3bbf5048c69c234cfe16eb61a1ec1d8050555caa`
+  commit `747614b769ad70f5e5cdb24cec634393c591c761`; SHA256 `6d8cd1247efa376c2415c8c6975bb215ed723693bd9024cb161d338023bbb229`
 
 - **E5** [network-awai/awai-os/docs/otehon/aosp-platform-decision-20261117.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/otehon/aosp-platform-decision-20261117.md)
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `0299ceaeb5b07e2623c2f22b5f055570de2a5427d833379115c413d792ea8cb9`
 
-- **E6** [network-awai/awai-os/android/README.md](https://github.com/network-awai/awai-os/blob/77511fac443f8bd6a9b96d8f0db6fdda766a2b2b/android/README.md)
+- **E6** [network-awai/awai-os/android/README.md](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/android/README.md)
 
-  commit `77511fac443f8bd6a9b96d8f0db6fdda766a2b2b`; SHA256 `6fcc4b3bbb41b66d9f4f9aba64292f27e5f5da1a9e5aa3e01056a19323ac40d4`
+  commit `747614b769ad70f5e5cdb24cec634393c591c761`; SHA256 `ea3e6b9ee3a4f82246dbe5f5b527395cde797cf673c31d5d5779049008258669`
 
 - **E7** [kotoba-lang/murakumo/bench/results/2026-11-15-e2-decode/README.md](https://github.com/kotoba-lang/murakumo/blob/69927a5f67f9641f81e3d27065dbf27d9c3fd026/bench/results/2026-11-15-e2-decode/README.md)
 
@@ -285,6 +294,14 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `8de6a73caf8f6814ae1b78d399fb1494ad701275f3df0f54dc8e6fac756151e2`
 
-- **E20** [network-awai/awai-os/android/build.py](https://github.com/network-awai/awai-os/blob/be937cdae28b93046a47d939cb5263647fe457c7/android/build.py)
+- **E20** [network-awai/awai-os/android/build.py](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/android/build.py)
 
-  commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `85fb01419bea20dcb3fd09b48d63b57b3d9db7bb611fcfc4f387c5eef1af3c15`
+  commit `747614b769ad70f5e5cdb24cec634393c591c761`; SHA256 `d40224550f0a385e855b2520f566d1b16eeab677ddbdfd15b2644a8288b0109a`
+
+- **E21** [network-awai/awai-os/apps/payment-drafts/README.md](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/apps/payment-drafts/README.md)
+
+  commit `747614b769ad70f5e5cdb24cec634393c591c761`; SHA256 `e273dc3b164b3891c12473c452782de84d676ddfe07d86aa6a0261ee63d75a3f`
+
+- **E22** [network-awai/awai-os/apps/securities-drafts/README.md](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/apps/securities-drafts/README.md)
+
+  commit `747614b769ad70f5e5cdb24cec634393c591c761`; SHA256 `ed770a7e1d66468ccd72b5589cd5d1b2d048159d560054770312c14b518ac3f1`
