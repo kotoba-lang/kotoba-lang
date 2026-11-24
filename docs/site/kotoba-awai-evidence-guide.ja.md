@@ -1,6 +1,6 @@
 # KotobaとAwaiを試す前に：使い方、測定、経済圏を区別する
 
-更新：2026年11月23日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
+更新：2026年11月24日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
 
 ## 読み方と索引
 
@@ -31,7 +31,21 @@ AIUEOSの旧リポジトリはshellで、本体・資料はKotobaの `lib/kotoba
 
 11月22日の責務整理では、旧Core / Apps / System構成を今後も必ず保持するという方針が撤回され、OS設定はAndroid/Awai OS、個別appはHome/Storeから扱う方向です。責務文書全体は提案を含み、同日追記のowner整理と未決定の実装案を分けて読みます。Homeへの対話画面の埋込み、端末内MCP transport、権限分離やAndroid実機動作の案を、完成した利用手順へ置き換えません。[E4,E17]
 
-**未検証・未実装：** APK/VM/Liveの記録は本番ROM、署名OTA、全機種での永続導入、実アカウント移行の合格証ではありません。HomeとItonamiのWebViewストアは別で、共通sign-in、暗号化profile転送、同期は未実装です。PINは本人性や操作権限の根拠ではありません。Nix desktopの旧ファイル整理方針も、partition初期化や鍵・現Androidデータの消去許可ではありません。既存Node/fleetの運用とは別です。[E5,E6,E12]
+**未検証・未実装：** APK/VM/Liveの記録は本番ROM、署名OTA、全機種での永続導入、実アカウント移行の合格証ではありません。HomeとItonamiのWebViewストアは別です。短命challengeと暗号化profile転送のコードは追加されていますが、現在のSetupは従来のaccount linkを呼び、PCのprofile転送は利用不能と表示する段階です。共通ストア同期や実アカウント移行の完成とは扱いません。[E23,E24,E30] PINは本人性や操作権限の根拠ではありません。Nix desktopの旧ファイル整理方針も、partition初期化や鍵・現Androidデータの消去許可ではありません。既存Node/fleetの運用とは別です。[E5,E6,E12]
+
+### アカウント承認とデータ引継ぎを分ける
+
+**実装の記述：** 11月23日の公開sourceには、端末・有効期限・選択scopeを結び付ける短命challenge、署名の検証、ECDH/HKDF/AES-GCMによる転送envelopeが加わりました。資格情報の名前を持つfieldを拒否する契約もあります。QR・Passkeyによる承認だけで、profileや認証情報がコピーされるわけではありません。[E23,E25]
+
+**接続と未検証の範囲：** `profile:settings` / `profile:home-state` のready判定は、要求scopeが列挙集合に含まれるかの判定です。Androidの転送entryは復号後にcompletedを設定しますが、ここにはprofileを永続storeへ適用する処理を確認できません。Setupはまだ`createIdentity`を使い、転送entryを呼んでいません。ready/completedという内部状態だけを、利用者データの復元成功と読み替えません。WNFS snapshotとYotei eventsは利用不能扱いで、Home APK全体・実電話承認・再起動後の持続・機器ごとのhardware custodyは残る受入です。[E23,E24,E25,E30]
+
+利用するときはaccount link、選択データの転送、転送先への適用、再起動後のreadbackを別々に確認します。現時点のPC設定画面では「あとで設定」の経路を使える設計ですが、これもこの原稿で実機を操作した結果ではありません。[E23,E30]
+
+### PC用OTAの応答と、OS更新の成功を分ける
+
+公開記録は11月24日のOTA feed Worker配置とHTTP 200の`[]`応答を報告しています。現行の`INDEXES`も空で、対象pathへ200が返ることは更新packageの提供・署名検証・適用成功の証拠になりません。この編集環境からの同じpathのGETはHTTP 403で、記録された200を追認できていません。source実装、他sessionの配置記録、今回のreadbackを区別します。[E27,E28,E31]
+
+PCのRAM Live、既存diskへの永続install、A/B OTAは別の受入です。11月24日追記のowner方針は既存NVMeを消去・切詰めず、512-byte logical sector・64 GiB以上の第2diskを使うものです。これは準備条件で、導入完了の記録ではありません。既存データを破壊する旧手順を通常の試用コマンドとして実行しません。[E26]
 
 ## 小さく試す
 
@@ -122,6 +136,8 @@ Murakumo READMEには11月15〜16日のMetal推論測定が加わりました。
 
 鍵リスト設計には、一覧を受信できない間は失効が伝わらないこと、端末時計への依存、埋込rootを一覧だけでは更新できないことが残ります。Java/JSのvector一致やthrowaway-key testの記録は、その条件の実装検証であり、全端末・本番配布・紛失復旧の保証ではありません。この編集では秘密鍵へのアクセス、署名、APK buildや配布を実行していません。[E18]
 
+11月23日のdevelopment Storeはrootをsequence 2へ入れ替え、新catalog r114とpointer sequence 5を記録しています。旧rootを埋め込んだbuildは新しい一覧を`keys-signature`で拒否し、同梱の旧一覧を使い続けるため、development buildの再構築・再installが必要と説明されています。これは既存installが新rootを自動信頼するという意味ではありません。APK署名の互換性やデータ保持を含む実端末更新は別途確かめます。developmentの再root化を本番rotationの受入証拠にもしません。[E29]
+
 画面付きdappをMCP Apps型iframe・postMessage JSON-RPCと操作別同意で取り込む方針はありますが、取り込み実装は公開方針で未完了です。agent向けtoolのHermes mcp_servers経路とも区別します。これらから速度や安全性を絶対保証できません。[E4]
 
 ### 「静けさ」は、証拠条件を持つ製品原則
@@ -152,7 +168,7 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 主製品方針は電話/PCのAOSP。NixOS desktop導入経路はdeprecated、旧資料はarchiveです。鍵や現Androidデータの保持、既存Node/fleet運用、AIUEOS Native資格は別の境界です。[S2,S6,E5,E12]
 
 ### Android APKがあれば本番ROMも使える？
-いいえ。APK、VM、Live、永続導入、署名OTA、物理機器、実アカウント移行は別の受入です。Home/Itonami共通sign-inや暗号化profile同期も未実装です。[E5,E6]
+いいえ。APK、VM、Live、永続導入、署名OTA、物理機器、実アカウント移行は別の受入です。引継ぎの暗号処理・検証コードは加わりましたが、Setupへの転送接続、storeへの適用、実機受入、Home/Itonami同期の完成は別です。[E5,E6,E23,E24,E30]
 
 ### Itonamiの期限でMurakumoは必ず停止する？
 公開job契約にはItonami期限が渡りません。resident/job設定のtimeoutとの違いを確認します。[S4]
@@ -177,6 +193,15 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
 ### Storeの更新判定やrelease署名があれば自動更新・本番配布も完成？
 いいえ。判定とinstallへの接続、署名役割と本番鍵運用、署名済みartifactと実端末更新は別です。公開READMEは自動更新判定の未接続と、人によるinstall確認を明記しています。[E6,E18,E19,E20]
+
+### 引継ぎのready/completedなら、全データを復元できた？
+いいえ。scopeの適格判定、暗号envelopeの復号、永続storeへの適用、再起動後の確認は別です。現行Setupは転送entryに未接続で、WNFS/Yotei scopeも利用不能です。実機での復元完了は確認されていません。[E23,E24,E25,E30]
+
+### OTA feedが200ならOS更新を受け取れる？
+いいえ。現行sourceのindexは空で、`[]`は提供offerがない応答です。適合する署名済みpackage、実端末での検証・適用・再起動・rollbackの受入が必要です。[E27,E28,E31]
+
+### 古いdevelopment Storeは新rootへ自動移行する？
+公開資料では旧rootのbuildはsequence 2を拒否します。新rootを含む互換buildへの更新が必要で、catalogだけで信頼rootを差し替えることはできません。[E29]
 
 ### Payment DraftsのapprovedやL1合格は、送金・決済完了？
 いいえ。approvedは端末内のレビュー記録、L1は対象XML subsetの構文検査です。両Drafts appは外部操作を宣言せず、送金・発注・署名・資産移動を行いません。L2の業務慣行とL3の金融機関受理は別の検証です。[E21,E22]
@@ -230,9 +255,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `76f51bb160eb3063797dc841e23e6af3fd7a14e84a99fbfd2dbe92144e3677a7`
 
-- **E4** [network-awai/awai-os/AGENTS.md](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/AGENTS.md)
+- **E4** [network-awai/awai-os/AGENTS.md](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/AGENTS.md)
 
-  commit `747614b769ad70f5e5cdb24cec634393c591c761`; SHA256 `6d8cd1247efa376c2415c8c6975bb215ed723693bd9024cb161d338023bbb229`
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `f355a88004df226a7e819325fb7797863d0cafda03fdb20be6be5780da86c848`
 
 - **E5** [network-awai/awai-os/docs/otehon/aosp-platform-decision-20261117.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/otehon/aosp-platform-decision-20261117.md)
 
@@ -294,9 +319,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `8de6a73caf8f6814ae1b78d399fb1494ad701275f3df0f54dc8e6fac756151e2`
 
-- **E20** [network-awai/awai-os/android/build.py](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/android/build.py)
+- **E20** [network-awai/awai-os/android/build.py](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/android/build.py)
 
-  commit `747614b769ad70f5e5cdb24cec634393c591c761`; SHA256 `d40224550f0a385e855b2520f566d1b16eeab677ddbdfd15b2644a8288b0109a`
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `71c11cb4ca48a0163bdd08aa763b85071881fafbc92a99e83ceed0436b69dce1`
 
 - **E21** [network-awai/awai-os/apps/payment-drafts/README.md](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/apps/payment-drafts/README.md)
 
@@ -305,3 +330,39 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 - **E22** [network-awai/awai-os/apps/securities-drafts/README.md](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/apps/securities-drafts/README.md)
 
   commit `747614b769ad70f5e5cdb24cec634393c591c761`; SHA256 `ed770a7e1d66468ccd72b5589cd5d1b2d048159d560054770312c14b518ac3f1`
+
+- **E23** [network-awai/awai-os/docs/otehon/account-handover-awai4071.md](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/docs/otehon/account-handover-awai4071.md)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `8275b52fa39dc93c4e1375d039af9646ceabe7001a8162286d9caf1c2e9383a7`
+
+- **E24** [network-awai/awai-os/android/client/handover-entry.js](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/android/client/handover-entry.js)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `ddffd531e653638ce829d1afee9fbb1fd9a945bf7a6727f773487e46f9d4cd9e`
+
+- **E25** [network-awai/awai-os/otehon/shell/src/identity/handover.js](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/otehon/shell/src/identity/handover.js)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `cfb9e74df82cb005e4864f64714dfc6049cab5f2e311b14ad8ca20016993880e`
+
+- **E26** [network-awai/awai-os/docs/otehon/7735h-measured-status-20261123.md](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/docs/otehon/7735h-measured-status-20261123.md)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `5c38eac464b0d6da400635552aaae90f7f3bc267323a91bffbf01257b778813b`
+
+- **E27** [network-awai/awai-os/deploy/ota-feed/README.md](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/deploy/ota-feed/README.md)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `874db06db0fc209e0e6b8fa50d954680c01bda033f9d7b6341d674aa8cbf100e`
+
+- **E28** [network-awai/awai-os/deploy/ota-feed/src/indexes.js](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/deploy/ota-feed/src/indexes.js)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `88aced9f3c0c8fc17f1a79ef9640e559a699389fb3864967ec4c6d0d54609fd1`
+
+- **E29** [network-awai/awai-os/store/keys/README.md](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/store/keys/README.md)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `937304b4f94dd9722fc49f7e167a87dcfd183edecd401e40ff0063323ee253f5`
+
+- **E30** [network-awai/awai-os/android/client/setup.js](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/android/client/setup.js)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `47214b77eca9c570862268deb45ad9fa80f188162b8369393716dd8460a6c6f7`
+
+- **E31** [network-awai/awai-os/deploy/ota-feed/src/worker.js](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/deploy/ota-feed/src/worker.js)
+
+  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `9249f4d3b44741399918628b6320bec930cf85ab65165c4b7a2086b4a509d550`
