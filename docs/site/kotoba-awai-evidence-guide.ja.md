@@ -1,6 +1,6 @@
 # KotobaとAwaiを試す前に：使い方、測定、経済圏を区別する
 
-更新：2026年11月24日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
+更新：2026年11月25日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
 
 ## 読み方と索引
 
@@ -109,6 +109,14 @@ Android READMEにある開発用アプリを使うなら、まず自分の入力
 
 組織では定型処理一件の所要時間と修正時間、失敗・unknown・重複作用の件数、追跡可能なreceiptの割合を導入前後で比較します。分散化の社会的価値も、可用性、参加機器費、電力、運用負担、アクセス格差を同時に測る必要があります。ノード数だけを社会貢献の証明にしません。これらは評価提案で、製品が既に達成した効果ではありません。
 
+### x402 Payで、支払条件の下書きを確かめる
+
+**実装：** x402 PayはBase Sepoliaの支払条件JSONを端末内で作るアプリです。金額は小数6桁・1,000 USDまで、保存は50下書きまで。`PLANNED_OPERATIONS`の受信・wallet署名・verify/settleは将来項目で、runtimeの外部operationは空です。JSONができても実際の請求・USDC送金・収益は発生しません。[E37,E38,E39]
+
+**資料に残る実機観測：** 11月25日のmoto g05記録はdebug署名APKについて、保存した3下書きがforce-stop後も残り、未保存formのreloadが保存済み下書きを壊さず、金額・桁数・resource・保存数の4上限に理由を表示したと報告しています。入力はADB/CDP経由で、物理tapの試験ではありません。起動失敗を実機で発生させた証拠はなく、正常起動の記録を障害表示の合格にはしません。本番署名、Store配布、全端末、TalkBack、実決済の受入とも別です。この編集では実機やwalletを操作していません。[E36]
+
+学習や業務設計には、同じ条件をJSONに表し、拒否理由と保存状態を説明できるか確認する用途があります。これは提案する使い方で、利用者の成長・売上改善を測った結果ではありません。[E37,E38]
+
 ## 速度と安全性を条件付きで読む
 
 **資料に残る実測：** Kotobaの10月15日Apple M4 Embench観測は19 workload、各一回、特定compiler snapshotでC実行時間の0.80倍。監査済みのアルゴリズム置換を含み、現行release全体や全機種の順位ではありません。[S1]
@@ -127,6 +135,19 @@ Murakumo READMEには11月15〜16日のMetal推論測定が加わりました。
 小モデルの結果を4Bへ移したり、greedyとspeculativeを同じ順位表に並べたりしません。誤tokenを出すstubの時間も正しい推論速度ではありません。手書きMSL、未完成の/v1 serving、静穏ホストclaim gateは残ります。実験decodeの追加は、全serving pathへの統合やrelease資格を意味しません。[S4,E7,E8,E13,E14]
 
 **実装の記述と残る信頼基盤：** Amu入門はdigest照合、mainの型、再生成比較、子プロセス期限を記述しますが、一般package/resolver/Darwin runtime互換は未完了です。runtime、OS、鍵管理、artifact配布は信頼基盤に残ります。AOSPの権限機構、Storeの署名確認、ユーザーの操作ごとの同意も異なる境界です。debug署名を本番の鍵回転・失効運用と同一視しません。[S3,E6]
+
+### CID・重複排除は、必ず容量や通信を節約するわけではない
+
+11月24日の公開測定は、macOS 26.3.1/arm64・Python 3.9.6・10 CPUのホストで、repositoryの120 JSON・4,027,805 bytesを処理した記録です。ネットワーク通信を行った試験ではなく、保存バイトとgit履歴からの差分転送量の計算です。[E32,E33,E34]
+
+| 観測対象 | 資料に残る値 | 読み取れる限界 |
+|---|---|---|
+| 同じJSONのkey順・indent変更 | 240/240 digest一致 | このcanonicalizerの対象入力での観測。全Kotoba formや全実行環境の同値性ではない。[E33] |
+| corpus重複排除 | 固定4 KiBで0.51%、content-defined chunkingで2.42%削減 | 資料の20%削減目標には未達。CIDを持つだけでは容量削減を保証しない。[E32,E33] |
+| 約52 KBのbuild.py、15版、512-byte固定blockとの比較 | 各履歴差分のfull比率の平均：固定73.1%、content-defined 12.5% | ファイル・変更内容・分割方式に依存する。総量比率や実ネットワーク速度と混同しない。[E34] |
+| 約5.7 KBの設定JSON、8版、4 KiB block | 同じ平均比率：固定100.0%、content-defined99.9% | 小さい文書ではほぼ節約がない。[E33] |
+
+この4軸の観測は研究draftで、独立reviewer・human research-lead admissionはpendingです。候補数学体系の実装性能、CPU/GPU性能、全体の安全性、社会効果の測定ではありません。未測定軸をsimulatorの順位で埋めません。この原稿でも追試していません。[E32,E35]
 
 ### Storeの更新判定・署名実装と、本番運用を分ける
 
@@ -203,6 +224,12 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 ### 古いdevelopment Storeは新rootへ自動移行する？
 公開資料では旧rootのbuildはsequence 2を拒否します。新rootを含む互換buildへの更新が必要で、catalogだけで信頼rootを差し替えることはできません。[E29]
 
+### x402 Payの実機記録は、決済の成功を示す？
+いいえ。記録はdebug APKの下書き保存・拒否表示などです。外部operationはなく、送信・署名・settleは将来項目。保存済み下書きの保持と実際の資金移動を区別します。[E36,E37,E38,E39]
+
+### CIDと分散保存なら、通信費・保存費を必ず減らせる？
+いいえ。今回の120 JSONでは削減は最大2.42%。差分転送量も小文書ではほぼfullのままです。実データ、分割方式、履歴、保持・復元の費用を測って判断します。[E32,E33,E34]
+
 ### Payment DraftsのapprovedやL1合格は、送金・決済完了？
 いいえ。approvedは端末内のレビュー記録、L1は対象XML subsetの構文検査です。両Drafts appは外部操作を宣言せず、送金・発注・署名・資産移動を行いません。L2の業務慣行とL3の金融機関受理は別の検証です。[E21,E22]
 
@@ -219,9 +246,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
 基本の公開6資料はモデル用入力と同じ構成です。E資料は編集校閲のみで、free-model runnerの入力に追加していません。private cloud-itonamiは使用していません。Itonamiの説明は公開Murakumo資料の範囲であり、非公開guideを読んだものではありません。
 
-- **S1** [kotoba-lang/kotoba/README.md](https://github.com/kotoba-lang/kotoba/blob/44c9df8e83d1d00fbe4e91e5ae86bd7851420614/README.md)
+- **S1** [kotoba-lang/kotoba/README.md](https://github.com/kotoba-lang/kotoba/blob/bab28344825c8a3f179f3d6217572eb778edf4e6/README.md)
 
-  commit `44c9df8e83d1d00fbe4e91e5ae86bd7851420614`; SHA256 `9834361249aa4e357bef8da5f08e86911e70a8af97c1f9feaf98813ecc346574`
+  commit `bab28344825c8a3f179f3d6217572eb778edf4e6`; SHA256 `82c85bb4cba20afa640f5c1511b08ffcbaec8ee18b8187590ca86df50c51255e`
 
 - **S2** [network-awai/awai-os/README.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/README.md)
 
@@ -366,3 +393,36 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 - **E31** [network-awai/awai-os/deploy/ota-feed/src/worker.js](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/deploy/ota-feed/src/worker.js)
 
   commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `9249f4d3b44741399918628b6320bec930cf85ab65165c4b7a2086b4a509d550`
+
+
+- **E32** [network-awai/awai-os/docs/research/measured-baseline.md](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/docs/research/measured-baseline.md)
+
+  commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `8a1065f85c5d13b94c2b093a4a42db7697a45c68f1e24e0f54fd3cbeaa587ce2`
+
+- **E33** [network-awai/awai-os/docs/research/measurement/measure-out-b4096.json](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/docs/research/measurement/measure-out-b4096.json)
+
+  commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `d1bf64254eea297deace1c15f7a5b7a79a9beefeb1db6be0b11f7bb08994fa4d`
+
+- **E34** [network-awai/awai-os/docs/research/measurement/measure-out-b512.json](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/docs/research/measurement/measure-out-b512.json)
+
+  commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `a2ef67fc1dc2d1a47a623a8621145a7d97e9dbbea00540ce282c7de7881ab34e`
+
+- **E35** [network-awai/awai-os/docs/research/measurement-draft-claims.md](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/docs/research/measurement-draft-claims.md)
+
+  commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `b887070f09e6ebace4a64a1cc644c79d2f519b1ec86db5e131922ae5aebdd6a1`
+
+- **E36** [network-awai/awai-os/docs/evidence/x402-20261125/README.md](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/docs/evidence/x402-20261125/README.md)
+
+  commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `dc8f85a9e5f65ae6e9a1c53cfb55e4d310b735251cfdcd40a69900499e802847`
+
+- **E37** [network-awai/awai-os/apps/x402/README.md](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/apps/x402/README.md)
+
+  commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `d10f4b3ec2b59272e41ddc3a90d7bae0be1506bcb28372984b18f4eb6c3234ee`
+
+- **E38** [network-awai/awai-os/apps/x402/src/model.js](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/apps/x402/src/model.js)
+
+  commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `4bdd1e1544960f80937de553eae4ee390cb5d78ae2a4949d96c654d791935068`
+
+- **E39** [network-awai/awai-os/apps/x402/src/app.js](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/apps/x402/src/app.js)
+
+  commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `4c40a63422e1f2ab85d623191c078003e75294224a6dafca7efd315c20206a4d`
