@@ -8,8 +8,8 @@ not a second design authority, and not a published site route. The
 normative design and migration register is owned separately.
 
 Open `preview.html` in any modern browser. The page is `lang="ja"`, uses
-only the local stylesheet, contains no script, makes no network requests,
-and submits nothing.
+only the local stylesheet, contains no script, makes no requests to
+external origins, and submits nothing.
 
 ## Shared palette and roles
 
@@ -44,15 +44,15 @@ interactive examples keep `min-block-size: 44px` with no fixed text heights.
   animates layout properties. Under `prefers-reduced-motion: reduce` all
   animation and transition is disabled.
 - **Disabled.** Disabled controls keep their label, switch to a muted color
-  with a dashed `--line` border and `not-allowed` cursor, and remain
-  focusable-adjacent but inert. Disabled styling is never the only signal —
-  the control's text states what it is.
+  with a dashed `--line` border and `not-allowed` cursor, and are skipped in
+  sequential keyboard navigation and remain inert. Disabled styling is never
+  the only signal — the control's text states what it is.
 - **Error.** Errors use the warm `--focus` accent plus an explicit text
-  label (`エラー`) inside a `role="alert"` notice — never color alone.
-- **Status notices.** Informational and success notices use `role="status"`
-  with a text label (`情報`, `成功`) and a colored inline-start border;
-  errors use `role="alert"`. Every notice carries a written label so state
-  is conveyed without relying on hue.
+  label (`エラー`), never color alone. Use `role="alert"` for newly
+  presented, urgent errors only.
+- **Status notices.** Every notice has a written label. Use `role="status"`
+  for non-urgent dynamic updates that need announcement. The static examples
+  intentionally have no live-region roles.
 - **Disclosure.** Status detail uses a native `<details>/<summary>` element,
   so keyboard (Enter/Space) and assistive-technology behavior come from the
   platform, not from script.
