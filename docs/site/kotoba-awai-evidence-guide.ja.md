@@ -1,6 +1,6 @@
 # KotobaとAwaiを試す前に：使い方、測定、経済圏を区別する
 
-更新：2026年11月25日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
+更新：2026年11月26日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
 
 ## 読み方と索引
 
@@ -46,6 +46,16 @@ AIUEOSの旧リポジトリはshellで、本体・資料はKotobaの `lib/kotoba
 公開記録は11月24日のOTA feed Worker配置とHTTP 200の`[]`応答を報告しています。現行の`INDEXES`も空で、対象pathへ200が返ることは更新packageの提供・署名検証・適用成功の証拠になりません。この編集環境からの同じpathのGETはHTTP 403で、記録された200を追認できていません。source実装、他sessionの配置記録、今回のreadbackを区別します。[E27,E28,E31]
 
 PCのRAM Live、既存diskへの永続install、A/B OTAは別の受入です。11月24日追記のowner方針は既存NVMeを消去・切詰めず、512-byte logical sector・64 GiB以上の第2diskを使うものです。これは準備条件で、導入完了の記録ではありません。既存データを破壊する旧手順を通常の試用コマンドとして実行しません。[E26]
+
+### Androidローカル推論の取消は、受付と停止を分ける
+
+`network.awai.murakumo`はAndroid Otehonアプリで、Kotoba/Amu NativeのMurakumo engineとは別です。`packages/awai-inference`には呼出し元へrequest IDと結果Promiseを直ちに返す`startGeneration(options)`、同じclientからの`cancel(requestId)`が加わりました。利用には対応するnative adapter、package/signatureの適格性、生成ごとの確認が必要です。appのinstallやreadiness応答だけでモデルload済みとは判断しません。[E40,E41]
+
+**実装の記述：** SDKの`cancelled:true`は取消を受け付けた応答です。結果Promiseの`inference-cancelled`拒否まで待って、Activityの終了と次の生成を扱う契約です。未開始・終了済み・他request・再取消は`not-running`として区別します。Android adapterは保持中のrequest IDを検査し、Activityはworkerの結果を確定してからbusyを解放します。受付応答を、即時のworker停止やメモリ解放の証拠と読み替えません。[E41,E42,E44]
+
+**制約・未検証：** 画像経路のhash読取は最大1 MiB単位で取消を確認しますが、blockしたread自体の戻りは待ちます。固定engineの`sd_ctx_create`は初期化完了までcontextを公開しないため、その最中の取消はreturn後に生成を飛ばしてcleanupする経路です。生成開始後の協調取消と同じ遅延上限にはしません。Androidでのphase別取消時間と、取消後の次生成成功は公開READMEでpendingです。この編集でも実行・追試していません。画像backendや全consumerのrelease適格化を、このAPI追加だけから主張しません。[E40,E43]
+
+ローカル推論、外部からのモデル取得、別appへの結果受渡し、画像保存・分散同期は別の経路です。INTERNET権限がないという条件だけで、他appへのIPCや端末侵害も含めた情報流出ゼロを保証しません。機密情報を扱う場合はrelease artifact、ログ・画面保護、許可された受渡し先を、その経路で確認する必要があります。[E40,E41]
 
 ## 小さく試す
 
@@ -191,6 +201,12 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 ### Android APKがあれば本番ROMも使える？
 いいえ。APK、VM、Live、永続導入、署名OTA、物理機器、実アカウント移行は別の受入です。引継ぎの暗号処理・検証コードは加わりましたが、Setupへの転送接続、storeへの適用、実機受入、Home/Itonami同期の完成は別です。[E5,E6,E23,E24,E30]
 
+### ローカル推論でcancelled:trueなら、すでに計算が止まった？
+いいえ。取消受付の応答と、worker cleanup後の結果Promise拒否は別です。画像初期化の同期call中はreturnを待つため、即時停止や一定秒数以内の停止を保証しません。request IDを保ち、結果の終端を確認します。[E40,E41,E42,E43,E44]
+
+### AwaiのPC installerやA/B OTAは全く存在しない？
+現行BOOT資料はUSB/PXE installerとtest-keyのKVM/VM A/B記録を区別して掲載しています。release鍵のROM/OTA、永続installの起動成功、SettingsのAwai OS表示は未完了です。RAM Liveを永続導入、test-key記録をreleaseと読み替えません。[E11]
+
 ### Itonamiの期限でMurakumoは必ず停止する？
 公開job契約にはItonami期限が渡りません。resident/job設定のtimeoutとの違いを確認します。[S4]
 
@@ -310,9 +326,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `9eb9fd3c70c9192c74a36890e2d74de2076d5648f92c13c3b868d3d79d6f3753`
 
-- **E11** [network-awai/awai-os/android/BOOT.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/android/BOOT.md)
+- **E11** [network-awai/awai-os/android/BOOT.md](https://github.com/network-awai/awai-os/blob/e0b6e7689b9ebaee106fec39d2dc13863b834647/android/BOOT.md)
 
-  commit `f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13`; SHA256 `9500f37e2ec1a81741b9de0b888a49a7672ed83885b1963d54206ce4d46a84e3`
+  commit `e0b6e7689b9ebaee106fec39d2dc13863b834647`; SHA256 `64da6d1a2242678693e793efdd727988f810c032ef66d1a61b50349f436bb9bf`
 
 - **E12** [network-awai/awai-os/docs/otehon/nixos-route-deprecation-20261117.md](https://github.com/network-awai/awai-os/blob/f5b3fbe6f9d83ea2642a6f8b02f94b1edabf2b13/docs/otehon/nixos-route-deprecation-20261117.md)
 
@@ -426,3 +442,24 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 - **E39** [network-awai/awai-os/apps/x402/src/app.js](https://github.com/network-awai/awai-os/blob/531e754e5b7dbf1962003e9a492dbcce37641e07/apps/x402/src/app.js)
 
   commit `531e754e5b7dbf1962003e9a492dbcce37641e07`; SHA256 `4c40a63422e1f2ab85d623191c078003e75294224a6dafca7efd315c20206a4d`
+
+
+- **E40** [network-awai/awai-os/apps/murakumo/README.md](https://github.com/network-awai/awai-os/blob/e0b6e7689b9ebaee106fec39d2dc13863b834647/apps/murakumo/README.md)
+
+  commit `e0b6e7689b9ebaee106fec39d2dc13863b834647`; SHA256 `2d50fc59db0983b28ccad48deaf4a45a20886d0abe47a4e6ec39b1fd2cf03e04`
+
+- **E41** [network-awai/awai-os/packages/awai-inference/README.md](https://github.com/network-awai/awai-os/blob/e0b6e7689b9ebaee106fec39d2dc13863b834647/packages/awai-inference/README.md)
+
+  commit `e0b6e7689b9ebaee106fec39d2dc13863b834647`; SHA256 `516d19eb522aabbcfc7af067cd026043667ab64dc8513cec5ea9e031f5b6bab0`
+
+- **E42** [network-awai/awai-os/packages/awai-inference/android/network/awai/inference/InferenceClientPlugin.kt](https://github.com/network-awai/awai-os/blob/e0b6e7689b9ebaee106fec39d2dc13863b834647/packages/awai-inference/android/network/awai/inference/InferenceClientPlugin.kt)
+
+  commit `e0b6e7689b9ebaee106fec39d2dc13863b834647`; SHA256 `1bf17b3988b9f1e20a4f580e45cf66250881298a72de0e1b359fb06aa44f24df`
+
+- **E43** [network-awai/awai-os/apps/murakumo/native/image/image.cpp](https://github.com/network-awai/awai-os/blob/e0b6e7689b9ebaee106fec39d2dc13863b834647/apps/murakumo/native/image/image.cpp)
+
+  commit `e0b6e7689b9ebaee106fec39d2dc13863b834647`; SHA256 `96f5b9fe7e7bbfabce5e4d4a76a04e8425160412705b0cb6a73b4480259019b7`
+
+- **E44** [network-awai/awai-os/apps/murakumo/src-tauri/gen/android/app/src/main/java/network/awai/murakumo/InferenceRequestActivity.kt](https://github.com/network-awai/awai-os/blob/e0b6e7689b9ebaee106fec39d2dc13863b834647/apps/murakumo/src-tauri/gen/android/app/src/main/java/network/awai/murakumo/InferenceRequestActivity.kt)
+
+  commit `e0b6e7689b9ebaee106fec39d2dc13863b834647`; SHA256 `bbc8f41f7fb17d412bb232307fe3933604220b21634077aa7330a81654e690d7`
