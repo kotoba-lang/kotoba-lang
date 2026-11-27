@@ -33,7 +33,7 @@ Representing syntax as data grants no permission to call unrestricted host `eval
 
 ## From a Unix pipe to Kotoba function calls
 
-Kernighan and Pike use `tr | sort | uniq -c | sort -n | tail` to find the ten most frequent words in an input. The Kotoba version in [wordfreq.kotoba](examples/wordfreq.kotoba) passes the positions of words between functions. See [The Unix Programming Environment, chapter 4](https://eecs.wsu.edu/~cs224/UPE.pdf#page=120).
+Kernighan and Pike use `tr | sort | uniq -c | sort -n | tail` to find the ten most frequent words in an input. The Kotoba version in [wordfreq.kotoba](examples/wordfreq.kotoba) passes the positions of words between functions. See [The Unix Programming Environment, chapter 4](https://eecs.wsu.edu/~cs224/UPE.pdf#page=119).
 
 ```clojure
 (defn- wordfreq [text :string limit :i64] :i64

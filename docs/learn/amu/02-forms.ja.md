@@ -49,7 +49,7 @@ quote、desugar、typed eval はそれぞれ許される位置と入力が定ま
 
 ## Unix のパイプを Kotoba の関数呼び出しで表す
 
-Kernighan と Pike は、入力から頻出単語を10件取り出す例に `tr | sort | uniq -c | sort -n | tail` を使っている。Kotoba で書いた [wordfreq.kotoba](examples/wordfreq.kotoba) では、単語の開始位置を関数間で渡す。 [The Unix Programming Environment 第4章](https://eecs.wsu.edu/~cs224/UPE.pdf#page=120)
+Kernighan と Pike は、入力から頻出単語を10件取り出す例に `tr | sort | uniq -c | sort -n | tail` を使っている。Kotoba で書いた [wordfreq.kotoba](examples/wordfreq.kotoba) では、単語の開始位置を関数間で渡す。 [The Unix Programming Environment 第4章](https://eecs.wsu.edu/~cs224/UPE.pdf#page=119)
 
 ```clojure
 (defn- wordfreq [text :string limit :i64] :i64
