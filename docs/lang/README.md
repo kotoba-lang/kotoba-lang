@@ -17,6 +17,10 @@ effect analysis, authority enforcement, and target-specific termination limits.
 **Physical model and IPLD:** [`physical-model-and-ipld.md`](./physical-model-and-ipld.md)
 ([日本語](./physical-model-and-ipld.ja.md)) — data movement, persistence, reuse,
 verification, and logical identity versus execution layout.
+**Language problem matrix:** [`language-problem-matrix.md`](./language-problem-matrix.md)
+([日本語](./language-problem-matrix.ja.md)) — design assessment across 14 software
+engineering problem domains and 11 major languages, separating implemented,
+partial, designed, and intentionally excluded capabilities.
 **Content-addressed incidence:** [`incidence.md`](./incidence.md) — immutable
 role relations, organization projection, and DID/VC/UCAN/ZCAP adapter boundary.
 
