@@ -47,6 +47,22 @@ canonical `.kotoba` と CLJK／EDN の reader sugar は、言語契約上、同�
 構文がデータだからといって、任意の式を host `eval` に渡す権限は得られない。
 quote、desugar、typed eval はそれぞれ許される位置と入力が定まっている。
 
+## Unix のパイプを Kotoba の関数呼び出しで表す
+
+Kernighan と Pike は、入力から頻出単語を10件取り出す例に `tr | sort | uniq -c | sort -n | tail` を使っている。Kotoba で書いた [wordfreq.kotoba](examples/wordfreq.kotoba) では、単語の開始位置を関数間で渡す。 [The Unix Programming Environment 第4章](https://eecs.wsu.edu/~cs224/UPE.pdf#page=119)
+
+```clojure
+(defn- wordfreq [text :string limit :i64] :i64
+  (let [lower (string-fold-case text)]
+    (->> lower
+         (word-starts)
+         (top-n lower limit))))
+```
+
+`->>` は各段の結果を次の呼び出しの最後の引数に渡す。この例は `(top-n lower limit (word-starts lower))` に展開される。`top-n` は単語の開始位置を有限のベクターとして受け取り、出現回数を数え、上位の単語を `:io/write` で標準出力に書く。
+
+言語リポジトリのルートから `/path/to/amu/bin/amu run docs/learn/amu/examples/wordfreq.kotoba` を実行する。macOS ARM64 のネイティブ実行では、出力の先頭が `3 to`、`3 be` になった。末尾の `0` は `main` の返り値。この例はソース内の短い ASCII 文字列を使い、大文字と小文字を同一視する。出現回数の多い順に出力し、同数なら初出順に並べる。単語ごとにベクターを走査して数えるため、短い入力向けの実装である。 [実行に使った Amu のリビジョン](https://github.com/kotoba-lang/amu/tree/87ec570aff47a0a21b4876fcda4fa9d4e3b934fb)
+
 ## 背景となる一次資料: S式
 
 John McCarthy の [1960年の Lisp 論文](https://www-formal.stanford.edu/jmc/recursive.html)は、記号式と再帰的な計算を学ぶ一次資料である。上の式の木と対応付けて読むとよい。Kotoba の typed form、表現の契約、effect の admission は Kotoba 自身の仕様で定める。

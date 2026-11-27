@@ -31,6 +31,22 @@ The language contract requires canonical `.kotoba` and its CLJK/EDN reader sugar
 
 Representing syntax as data grants no permission to call unrestricted host `eval`. Quote, desugaring, and typed eval each have their own permitted positions and inputs.
 
+## From a Unix pipe to Kotoba function calls
+
+Kernighan and Pike use `tr | sort | uniq -c | sort -n | tail` to find the ten most frequent words in an input. The Kotoba version in [wordfreq.kotoba](examples/wordfreq.kotoba) passes the positions of words between functions. See [The Unix Programming Environment, chapter 4](https://eecs.wsu.edu/~cs224/UPE.pdf#page=119).
+
+```clojure
+(defn- wordfreq [text :string limit :i64] :i64
+  (let [lower (string-fold-case text)]
+    (->> lower
+         (word-starts)
+         (top-n lower limit))))
+```
+
+`->>` puts each result in the last argument of the next call. Here the calls expand to `(top-n lower limit (word-starts lower))`. The input to `top-n` is a finite vector of word positions. It counts occurrences and prints the most common words to stdout through `:io/write`.
+
+Run `/path/to/amu/bin/amu run docs/learn/amu/examples/wordfreq.kotoba` from the language repository. The native macOS ARM64 run begins with `3 to` and `3 be`. The final `0` is the value returned by `main`. This example uses a small ASCII string in the source, folds case, orders counts from highest to lowest, and breaks ties by the word's first appearance. Counting scans the vector for each distinct word, so the example is sized for short inputs. See the [Amu revision used for the run](https://github.com/kotoba-lang/amu/tree/87ec570aff47a0a21b4876fcda4fa9d4e3b934fb).
+
 ## Background reference: S-expressions
 
 John McCarthy's [Recursive Functions of Symbolic Expressions and Their Computation by Machine, Part I](https://www-formal.stanford.edu/jmc/recursive.html), published in 1960, is a primary source for Lisp's symbolic expressions and recursive computation. Read it alongside the tree above. Kotoba's typed forms, representation contracts, and effect admission are defined by Kotoba's own specifications.
