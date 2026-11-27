@@ -1,6 +1,6 @@
 # Native static site build
 
-`build_site.py` generates the current 229-file site (161 HTML files, including
+`build_site.py` generates the current 230-file site (161 HTML files, including
 2 authored static anatomy pages) on macOS ARM64. All authority parsing,
 localization, CSS/script extraction, JSON rendering and HTML composition run
 in compiled Kotoba programs. Python stages bytes, computes digests and observes
@@ -225,7 +225,7 @@ rewrite HTML, or derive the sitemap. The new native program rewrites only exact
 Docs href attributes in existing pages; the existing native sitemap program
 then derives the complete sitemap from actual page canonicals. Shared example
 files and `docs-course.css` are copied as static assets with input hashes.
-The complete candidate has 229 files and 161 HTML pages; existing native locale
+The complete candidate has 230 files and 161 HTML pages; existing native locale
 and page gates still cover their original 119 pages and 16 catalogs.
 
 Run the additional observer and real native refusal controls before publication:

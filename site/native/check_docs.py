@@ -69,7 +69,7 @@ def expected_lines(md):
 def observe_pages(build):
  candidate=build/'candidate';receipt=json.loads((build/'receipt.json').read_text())
  expected=[route(t,s)+'index.html' for t in ('en','ja') for s in SLUGS]
- if receipt.get('docsPages')!=expected or len(receipt.get('docsFiles',[]))!=40:raise ValueError('Docs route set mismatch')
+ if receipt.get('docsPages')!=expected or len(receipt.get('docsFiles',[]))!=41:raise ValueError('Docs route set mismatch')
  for tag in ('en','ja'):
   for slug in SLUGS:
    name=route(tag,slug)+'index.html';source=ROOT/'docs/learn/amu'/source_name(tag,slug)
