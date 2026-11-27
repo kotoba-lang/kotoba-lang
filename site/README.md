@@ -13,8 +13,12 @@ are outside the local generator code and are not established by this description
 The Amu compiler course is served directly on the site: [English](https://kotoba-lang.org/docs/amu/)
 (default) and [日本語](https://kotoba-lang.org/ja/docs/amu/). Each of the 12
 chapters, the index and examples guide links to its matching language version.
-`docs/learn/amu` remains the shared Markdown source. The native renderer and
-publication checks are documented in [native/BUILD.md](native/BUILD.md).
+`docs/learn/amu` remains the shared Markdown source. The bilingual Kotoba
+language problem matrix is served alongside it at
+[English](https://kotoba-lang.org/docs/language-problem-matrix/) and
+[日本語](https://kotoba-lang.org/ja/docs/language-problem-matrix/) from
+`docs/lang/language-problem-matrix.md` and `docs/lang/language-problem-matrix.ja.md`.
+The native renderer and publication checks are documented in [native/BUILD.md](native/BUILD.md).
 
 ## What makes this page different from a README
 

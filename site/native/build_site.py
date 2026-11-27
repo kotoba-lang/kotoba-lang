@@ -87,8 +87,11 @@ def main():
  else:
   if not a.packager:raise ValueError('macOS profile requires --packager')
   b=Build(a.output,a.compiler,a.packager,a.libraries,a.grammar)
- with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as pool:
-  for _ in pool.map(b.compile,b.recipes):pass
+ if a.linux_inputs:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as pool:
+   for _ in pool.map(b.compile,b.recipes):pass
+ else:
+  for name in b.recipes:b.compile(name)
  closures_done=time.monotonic()
  (b.output/'data.json').write_text(json.dumps({n:str(p) for n,p in b.data.items()},indent=2)+'\n')
  ordered_tags=sorted(TAGS,key=lambda t:0 if t in ('en','ja') else 1)

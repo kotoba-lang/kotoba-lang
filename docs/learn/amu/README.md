@@ -58,4 +58,6 @@ These primary sources explain the ideas used in the course. Each chapter connect
 
 The reference date is 6 November 2026. Amu implementation links are pinned to [`a4c16e7c`](https://github.com/kotoba-lang/amu/tree/a4c16e7c47005d2235dc48d3f69569773a1606e7), and Kototama links to [`b7bbcc44`](https://github.com/kotoba-lang/kototama/tree/b7bbcc44d08913fee69074ad70f92d341df2be92). Relative links lead to language contracts in this repository. Pinned links keep the explanation reproducible when files later move. Check the owning contracts, manifests, and execution evidence when using a newer version.
 
+For a broader design assessment across 14 software engineering problem domains and 11 major languages, see the [Kotoba language problem matrix](../../lang/language-problem-matrix.md).
+
 [Back to the language documentation](../../README.md).

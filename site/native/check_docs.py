@@ -4,11 +4,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit
 from build_support import ROOT,native_run,program_image,sha,write_bytes
-from docs_build import SLUGS,source_name,route,stage
+from docs_build import SLUGS,source_name,source_path,route,stage
 
 class Page(HTMLParser):
  def __init__(self):
-  super().__init__(convert_charrefs=True);self.stack=[];self.main=False;self.pre=False;self.maintext=[];self.h1=[];self.h1open=False;self.codes=[];self.code=[];self.links=[];self.meta=[];self.lang='';self.scripts=[]
+  super().__init__(convert_charrefs=True);self.stack=[];self.main=False;self.pre=False;self.maintext=[];self.h1=[];self.h1open=False;self.codes=[];self.code=[];self.links=[];self.meta=[];self.lang='';self.scripts=[];self.tables=[];self._table=None;self._row=None
  def handle_starttag(self,tag,attrs):
   a=dict(attrs)
   if tag=='html':self.lang=a.get('lang','')
@@ -18,10 +18,15 @@ class Page(HTMLParser):
   if tag=='a':self.links.append(a)
   if tag=='link':self.meta.append(a)
   if tag=='script':self.scripts.append(a)
+  if tag=='table':self._table=[]
+  if tag=='tr' and self._table is not None:self._row=0
+  if tag in ('th','td') and self._row is not None:self._row+=1
  def handle_endtag(self,tag):
   if tag=='main':self.main=False
   if tag=='h1':self.h1open=False
   if tag=='pre':self.pre=False;self.codes.append(''.join(self.code))
+  if tag=='tr' and self._table is not None and self._row is not None:self._table.append(self._row);self._row=None
+  if tag=='table' and self._table is not None:self.tables.append(self._table);self._table=None
  def handle_data(self,data):
   if self.main:self.maintext.append(data)
   if self.h1open:self.h1.append(data)
@@ -60,19 +65,21 @@ def expected_lines(md):
  for line in md.splitlines():
   if line.startswith('```'):
    fence=not fence;fence_kind=line[3:];continue
-  if fence or not line.strip() or line.startswith('**English** |') or line.startswith('[English](') or line.startswith('|---'):continue
-  line=re.sub(r'^#{1,2} ','',line)
+  if fence or not line.strip() or line.strip()=='---' or line.startswith('**English** |') or line.startswith('[English](') or line.startswith('|---'):continue
+  line=re.sub(r'^#{1,3} ','',line)
   line=re.sub(r'^(?:- |\d+\. )','',line)
   line=re.sub(r'\[([^\]]+)\]\([^)]+\)',r'\1',line)
-  line=line.replace('**','').replace('`','').replace('|','')
+  if line.startswith('|'):
+   line=line.replace(r'\|','\x00').replace('|','').replace('\x00','|')
+  line=line.replace('**','').replace('`','')
   if compact(line):yield compact(line)
 def observe_pages(build):
  candidate=build/'candidate';receipt=json.loads((build/'receipt.json').read_text())
  expected=[route(t,s)+'index.html' for t in ('en','ja') for s in SLUGS]
- if receipt.get('docsPages')!=expected or len(receipt.get('docsFiles',[]))!=40:raise ValueError('Docs route set mismatch')
+ if receipt.get('docsPages')!=expected or len(receipt.get('docsFiles',[]))!=42:raise ValueError('Docs route set mismatch')
  for tag in ('en','ja'):
   for slug in SLUGS:
-   name=route(tag,slug)+'index.html';source=ROOT/'docs/learn/amu'/source_name(tag,slug)
+   name=route(tag,slug)+'index.html';source=source_path(tag,slug)
    md=source.read_text();p=Page();html=(candidate/name).read_text();p.feed(html);p.close()
    if p.lang!=tag or ''.join(p.h1)!=md.splitlines()[0][2:] or html.count('<h1>')!=1:raise ValueError('Docs heading/lang '+name)
    canonical='https://kotoba-lang.org/'+route(tag,slug)
@@ -86,6 +93,9 @@ def observe_pages(build):
    visible=compact(''.join(p.maintext))
    for line in expected_lines(md):
     if line not in visible:raise ValueError(('lost Markdown content',name,line[:100]))
+   if slug=='language-problem-matrix':
+    if '&lt;br&gt;' in html or r'\|' in ''.join(p.maintext):raise ValueError('Docs matrix raw markup '+name)
+    if not p.tables or any(not rows or any(cols!=rows[0] for cols in rows) for rows in p.tables):raise ValueError('Docs matrix uneven table columns '+name)
    blocks=[body for kind,body in re.findall(r'```([^\n]+)\n(.*?)```',md,re.S) if kind!='mermaid']
    if blocks!=p.codes:raise ValueError('Docs code bytes '+name)
    graphs=re.findall(r'```mermaid\n(.*?)```',md,re.S)
@@ -100,15 +110,20 @@ def observe_pages(build):
      if path.endswith('/'):dest=dest/'index.html'
      if path!='/' and not dest.is_file():raise ValueError(('Docs broken route',name,target))
    index=SLUGS.index(slug)
-   for rel,step in [('prev',-1),('next',1)]:
-    nxt=index+step
-    if 0<=nxt<len(SLUGS) and not any(x.get('rel')==rel and x.get('href')=='/'+route(tag,SLUGS[nxt]) for x in p.links):raise ValueError('Docs pager '+name)
+   if slug=='language-problem-matrix':
+    if not any(x.get('rel')=='prev' and x.get('href')=='/'+route(tag,'') for x in p.links) or any(x.get('rel')=='next' for x in p.links):raise ValueError('Docs pager '+name)
+   else:
+    course=SLUGS[:14]
+    for rel,step in [('prev',-1),('next',1)]:
+     nxt=index+step
+     if 0<=nxt<len(course) and not any(x.get('rel')==rel and x.get('href')=='/'+route(tag,course[nxt]) for x in p.links):raise ValueError('Docs pager '+name)
+     if not (0<=nxt<len(course)) and any(x.get('rel')==rel for x in p.links):raise ValueError('Docs pager '+name)
  # The site's actual entry links must now lead to same-origin Docs.
  for tag in ('','ja/'):
   p=Page();p.feed((candidate/tag/'index.html').read_text())
   if not any(x.get('href')=='/'+route('ja' if tag else 'en','') for x in p.links):raise ValueError('home Docs entry missing')
  integrated=observe_integration(build,receipt)
- return {'existingPagesPreserved':integrated,'pages':len(expected),'languagePairs':14,'markdownContentPreserved':True,'executableCodeBytesPreserved':True,'sameOriginNavigation':True}
+ return {'existingPagesPreserved':integrated,'pages':len(expected),'languagePairs':15,'markdownContentPreserved':True,'executableCodeBytesPreserved':True,'sameOriginNavigation':True}
 def controls(build):
  folder=build/'docs-controls';shutil.copytree(build/'docs_page',folder)
  image=program_image(folder);results=[]

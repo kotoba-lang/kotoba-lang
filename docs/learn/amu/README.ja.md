@@ -77,4 +77,6 @@ Kototama は [`b7bbcc44`](https://github.com/kotoba-lang/kototama/tree/b7bbcc44d
 コードの場所が後に移っても、固定した参照で同じ説明を読み直せる。
 新しい版を使うときは、所有者の正本・manifest・実行証拠を確かめる。
 
+ソフトウェア開発の 14 課題ドメインと主要 11 言語にわたる設計評価は、[Kotoba の課題解決対応表](../../lang/language-problem-matrix.ja.md)を参照。
+
 [言語 Docs の入口](../../README.md)へ戻る。

@@ -3,15 +3,20 @@ import argparse,concurrent.futures,json,shutil
 from pathlib import Path
 from build_support import Build,ROOT,native_run,sha,write_bytes,program_image
 
-SLUGS=('', '01-first-program','02-forms','03-reader-and-names','04-checking-and-ir','05-ipld','06-definition-identity','07-effects-and-authority','08-code-generation','09-kototama','10-runtime-performance','11-build-performance','12-reading-and-experiments','examples')
+SLUGS=('', '01-first-program','02-forms','03-reader-and-names','04-checking-and-ir','05-ipld','06-definition-identity','07-effects-and-authority','08-code-generation','09-kototama','10-runtime-performance','11-build-performance','12-reading-and-experiments','examples','language-problem-matrix')
 def source_name(tag,slug):
- stem='README' if not slug else ('examples/README' if slug=='examples' else slug)
+ stem='language-problem-matrix' if slug=='language-problem-matrix' else ('README' if not slug else ('examples/README' if slug=='examples' else slug))
  return stem+('.ja' if tag=='ja' else '')+'.md'
-def route(tag,slug):return ('ja/' if tag=='ja' else '')+'docs/amu/'+(slug+'/' if slug else '')
+def source_path(tag,slug):
+ base='docs/lang' if slug=='language-problem-matrix' else 'docs/learn/amu'
+ return ROOT/base/source_name(tag,slug)
+def route(tag,slug):
+ if slug=='language-problem-matrix':return ('ja/' if tag=='ja' else '')+'docs/language-problem-matrix/'
+ return ('ja/' if tag=='ja' else '')+'docs/amu/'+(slug+'/' if slug else '')
 def stage(folder,tag):
  pins=[]
  for slug in SLUGS:
-  name=source_name(tag,slug);p=ROOT/'docs/learn/amu'/name
+  name=source_name(tag,slug);p=source_path(tag,slug)
   write_bytes(folder/'docs-source'/name,p.read_bytes());pins.append(sha(p))
  (folder/'docs-pins.edn').write_text('['+' '.join(json.dumps(x) for x in pins)+']')
 def render_job(build,tag,group):
@@ -55,7 +60,7 @@ def extend(build,compiler,packager,libraries,grammar,linux_inputs=None):
  else:shutil.copytree(built,program)
  examples=tuple(p for p in sorted((ROOT/'docs/learn/amu/examples').iterdir()) if p.suffix in ('.kotoba','.py','.json'))
  # Bind source bytes before workers read them; finish rejects mid-build edits.
- for p in (*tuple((ROOT/'docs/learn/amu').rglob('*.md')),*examples,ROOT/'site/docs-course.css',ROOT/'site/native/docs_build.py',ROOT/'site/native/check_docs.py',ROOT/'site/native/build-components.json'):
+ for p in (*tuple((ROOT/'docs/learn/amu').rglob('*.md')),ROOT/'docs/lang/language-problem-matrix.md',ROOT/'docs/lang/language-problem-matrix.ja.md',*examples,ROOT/'site/docs-course.css',ROOT/'site/native/docs_build.py',ROOT/'site/native/check_docs.py',ROOT/'site/native/build-components.json'):
   b.inputs[str(p)]=sha(p)
  pages=[route(tag,slug)+'index.html' for tag in ('en','ja') for slug in SLUGS]
  extra=list(pages)
