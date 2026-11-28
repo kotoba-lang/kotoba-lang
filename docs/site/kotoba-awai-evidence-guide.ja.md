@@ -1,6 +1,6 @@
 # KotobaとAwaiを試す前に：使い方、測定、経済圏を区別する
 
-更新：2026年11月26日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
+更新：2026年11月28日。公開一次資料をAIが確認して編集したレビュー用原稿です。OpenRouter無料モデルによる生成ではありません。この編集作業では製品の実行、性能の追試、社会的効果の測定をしていません。
 
 ## 読み方と索引
 
@@ -32,6 +32,12 @@ AIUEOSの旧リポジトリはshellで、本体・資料はKotobaの `lib/kotoba
 11月22日の責務整理では、旧Core / Apps / System構成を今後も必ず保持するという方針が撤回され、OS設定はAndroid/Awai OS、個別appはHome/Storeから扱う方向です。責務文書全体は提案を含み、同日追記のowner整理と未決定の実装案を分けて読みます。Homeへの対話画面の埋込み、端末内MCP transport、権限分離やAndroid実機動作の案を、完成した利用手順へ置き換えません。[E4,E17]
 
 **未検証・未実装：** APK/VM/Liveの記録は本番ROM、署名OTA、全機種での永続導入、実アカウント移行の合格証ではありません。HomeとItonamiのWebViewストアは別です。短命challengeと暗号化profile転送のコードは追加されていますが、現在のSetupは従来のaccount linkを呼び、PCのprofile転送は利用不能と表示する段階です。共通ストア同期や実アカウント移行の完成とは扱いません。[E23,E24,E30] PINは本人性や操作権限の根拠ではありません。Nix desktopの旧ファイル整理方針も、partition初期化や鍵・現Androidデータの消去許可ではありません。既存Node/fleetの運用とは別です。[E5,E6,E12]
+
+### PCの事前導入と、既定Homeの復旧を分ける
+
+11月25日付の現行入力記録では、PCイメージへ事前導入するAwai appはHomeとStoreだけで、YoteiはStoreから導入する構成です。patchはoperatorが用意した両APKと期待signerを検査し、通常は欠落・不一致で止めます。開発用の検証省略・appなしbuildは明示指定で、release用には拒否する条件があります。入力コードの追加を、署名済みイメージの配布や実機事前導入の成功とはしません。[E45,E46]
+
+既定Homeの入力はHomeを通常appのままpriority 0、Launcher3のHOME filterを-1とするものです。資料は、Homeの無効化・削除と「install済みだが起動できない」を分け、後者ではrole holderが残るため自動復旧を期待せず、Settingsの既定Home選択からLauncherへ戻す経路を案内しています。これは資料に記録されたplatform挙動の説明で、この編集では当該固定platform sourceを取得できず独立確認していません。fresh dataでの選択、再起動後の保持、fallbackの実動作も未検証です。この原稿でもdevice・data partition・roleを操作していません。[E45,E47]
 
 ### アカウント承認とデータ引継ぎを分ける
 
@@ -207,6 +213,12 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 ### AwaiのPC installerやA/B OTAは全く存在しない？
 現行BOOT資料はUSB/PXE installerとtest-keyのKVM/VM A/B記録を区別して掲載しています。release鍵のROM/OTA、永続installの起動成功、SettingsのAwai OS表示は未完了です。RAM Liveを永続導入、test-key記録をreleaseと読み替えません。[E11]
 
+### PCイメージ入力にYoteiがないのは、不具合？
+現行の構成はHome・Storeだけを事前導入し、YoteiはStoreから扱います。ただしイメージ入力、実build、起動、Storeからのinstall受入は別で、まだ一括して合格とはされていません。[E45,E46]
+
+### Homeが起動しなければLauncher3へ自動で戻る？
+保証されません。公開入力記録の調査では、Homeが資格を失う場合と、資格を持ったまま起動に失敗する場合が異なります。後者の復旧案内はSettingsでの既定Home変更であり、対象イメージ・実機でのfallback確認は残っています。[E45,E47]
+
 ### Itonamiの期限でMurakumoは必ず停止する？
 公開job契約にはItonami期限が渡りません。resident/job設定のtimeoutとの違いを確認します。[S4]
 
@@ -362,9 +374,9 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 
   commit `be937cdae28b93046a47d939cb5263647fe457c7`; SHA256 `8de6a73caf8f6814ae1b78d399fb1494ad701275f3df0f54dc8e6fac756151e2`
 
-- **E20** [network-awai/awai-os/android/build.py](https://github.com/network-awai/awai-os/blob/1723881c81ba13f3d6fb74533c3440fc72c25cdd/android/build.py)
+- **E20** [network-awai/awai-os/android/build.py](https://github.com/network-awai/awai-os/blob/832599c9f640d9743075b6bcff6dc788afd9e3be/android/build.py)
 
-  commit `1723881c81ba13f3d6fb74533c3440fc72c25cdd`; SHA256 `71c11cb4ca48a0163bdd08aa763b85071881fafbc92a99e83ceed0436b69dce1`
+  commit `832599c9f640d9743075b6bcff6dc788afd9e3be`; SHA256 `8251dfdc6d9fc6869998466019f5500350ebebdcfce02394a4bd7b33bd545b4a`
 
 - **E21** [network-awai/awai-os/apps/payment-drafts/README.md](https://github.com/network-awai/awai-os/blob/747614b769ad70f5e5cdb24cec634393c591c761/apps/payment-drafts/README.md)
 
@@ -463,3 +475,16 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 - **E44** [network-awai/awai-os/apps/murakumo/src-tauri/gen/android/app/src/main/java/network/awai/murakumo/InferenceRequestActivity.kt](https://github.com/network-awai/awai-os/blob/e0b6e7689b9ebaee106fec39d2dc13863b834647/apps/murakumo/src-tauri/gen/android/app/src/main/java/network/awai/murakumo/InferenceRequestActivity.kt)
 
   commit `e0b6e7689b9ebaee106fec39d2dc13863b834647`; SHA256 `bbc8f41f7fb17d412bb232307fe3933604220b21634077aa7330a81654e690d7`
+
+
+- **E45** [network-awai/awai-os/android/desktop/pc-ab-device/home-default-20261125.md](https://github.com/network-awai/awai-os/blob/832599c9f640d9743075b6bcff6dc788afd9e3be/android/desktop/pc-ab-device/home-default-20261125.md)
+
+  commit `832599c9f640d9743075b6bcff6dc788afd9e3be`; SHA256 `22c8fcb5c6dcec8317bfb1191bf08850c7f70bd1f1270014943fd48affe72e80`
+
+- **E46** [network-awai/awai-os/android/desktop/pc-ab-device/patches/virtio-common-awai-apps.patch](https://github.com/network-awai/awai-os/blob/832599c9f640d9743075b6bcff6dc788afd9e3be/android/desktop/pc-ab-device/patches/virtio-common-awai-apps.patch)
+
+  commit `832599c9f640d9743075b6bcff6dc788afd9e3be`; SHA256 `e3065f0f09d25e93a7e4346be47f4ed4df29b3a60765432b4c0b5e14456cd071`
+
+- **E47** [network-awai/awai-os/android/desktop/pc-ab-device/patches/launcher3-home-priority-fallback.patch](https://github.com/network-awai/awai-os/blob/832599c9f640d9743075b6bcff6dc788afd9e3be/android/desktop/pc-ab-device/patches/launcher3-home-priority-fallback.patch)
+
+  commit `832599c9f640d9743075b6bcff6dc788afd9e3be`; SHA256 `855a9d85f2b1b561758ceddfd243c46b39d42d20c4c582cfcda8dfed4d4e1b9e`
