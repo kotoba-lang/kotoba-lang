@@ -37,7 +37,7 @@ AIUEOSの旧リポジトリはshellで、本体・資料はKotobaの `lib/kotoba
 
 11月25日付の現行入力記録では、PCイメージへ事前導入するAwai appはHomeとStoreだけで、YoteiはStoreから導入する構成です。patchはoperatorが用意した両APKと期待signerを検査し、通常は欠落・不一致で止めます。開発用の検証省略・appなしbuildは明示指定で、release用には拒否する条件があります。入力コードの追加を、署名済みイメージの配布や実機事前導入の成功とはしません。[E45,E46]
 
-既定Homeの入力はHomeを通常appのままpriority 0、Launcher3のHOME filterを-1とするものです。資料は、Homeの無効化・削除と「install済みだが起動できない」を分け、後者ではrole holderが残るため自動復旧を期待せず、Settingsの既定Home選択からLauncherへ戻す経路を案内しています。fresh dataでの選択、再起動後の保持、fallbackの実動作は未検証です。この原稿でもdevice・data partition・roleを操作していません。[E45,E47]
+既定Homeの入力はHomeを通常appのままpriority 0、Launcher3のHOME filterを-1とするものです。資料は、Homeの無効化・削除と「install済みだが起動できない」を分け、後者ではrole holderが残るため自動復旧を期待せず、Settingsの既定Home選択からLauncherへ戻す経路を案内しています。これは資料に記録されたplatform挙動の説明で、この編集では当該固定platform sourceを取得できず独立確認していません。fresh dataでの選択、再起動後の保持、fallbackの実動作も未検証です。この原稿でもdevice・data partition・roleを操作していません。[E45,E47]
 
 ### アカウント承認とデータ引継ぎを分ける
 
@@ -217,7 +217,7 @@ Mac ARM64の固定Amuガイドでcheck/compile/runを試し、期待出力と拒
 現行の構成はHome・Storeだけを事前導入し、YoteiはStoreから扱います。ただしイメージ入力、実build、起動、Storeからのinstall受入は別で、まだ一括して合格とはされていません。[E45,E46]
 
 ### Homeが起動しなければLauncher3へ自動で戻る？
-保証されません。公開source調査では、Homeが資格を失う場合と、資格を持ったまま起動に失敗する場合が異なります。後者の復旧案内はSettingsでの既定Home変更であり、対象イメージ・実機でのfallback確認は残っています。[E45,E47]
+保証されません。公開入力記録の調査では、Homeが資格を失う場合と、資格を持ったまま起動に失敗する場合が異なります。後者の復旧案内はSettingsでの既定Home変更であり、対象イメージ・実機でのfallback確認は残っています。[E45,E47]
 
 ### Itonamiの期限でMurakumoは必ず停止する？
 公開job契約にはItonami期限が渡りません。resident/job設定のtimeoutとの違いを確認します。[S4]
